@@ -20,6 +20,11 @@ go install .
 yagent
 ```
 
+LLMコマンドを使用する場合:
+```bash
+yagent llm --prompt "質問内容" --token "APIトークン"
+```
+
 ## 開発
 
 テストを実行:
@@ -39,5 +44,8 @@ go build -o yagent .
 ```bash
 # エージェントを実行
 yagent
+
+# LLMサーバーに質問を送信 (APIトークンが必要な場合)
+yagent llm --prompt "こんにちは" --token "your-api-token"
 ```
 
