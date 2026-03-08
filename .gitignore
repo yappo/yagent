@@ -1,0 +1,21 @@
+# Build binaries
+yagent
+
+# Go build cache
+go-build/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Test coverage reports
+coverage.out
+
+# Go generated files
+*.go.orig
