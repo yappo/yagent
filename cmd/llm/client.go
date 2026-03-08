@@ -86,8 +86,18 @@ func (c *LLMClient) SendChat(request ChatRequest) (*ChatResponse, error) {
 		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Debug: Read the raw response to see what we're getting
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Log the raw response for debugging
+	fmt.Printf("Raw response: %s\n", string(body))
+
+	// Try to parse as JSON
 	var chatResponse ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResponse); err != nil {
+	if err := json.Unmarshal(body, &chatResponse); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 

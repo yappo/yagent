@@ -4,17 +4,29 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
 )
 
 var (
-	model     string
-	server    string
-	stream    bool
-	prompt    string
-	maxTokens int
-	token     string
+	model      string
+	stream     bool
+	prompt     string
+	maxTokens  int
+	configFile string
 )
+
+// Config represents the configuration structure
+type Config struct {
+	Server struct {
+		Default string `toml:"default"`
+		Servers []struct {
+			Name  string `toml:"name"`
+			URL   string `toml:"url"`
+			Token string `toml:"token"`
+		} `toml:"servers"`
+	} `toml:"server"`
+}
 
 // Command represents the llm command
 var Command = &cobra.Command{
@@ -27,7 +39,39 @@ var Command = &cobra.Command{
 			os.Exit(1)
 		}
 
-		client := NewLLMClient(server, token)
+		var serverURL, token string
+
+		if configFile != "" {
+			// 設定ファイルから読み込み
+			config, err := loadConfig(configFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "設定ファイルの読み込みに失敗しました: %v\n", err)
+				os.Exit(1)
+			}
+
+			// デフォルトサーバーの設定を取得
+			defaultServer := config.Server.Default
+
+			// 指定されたサーバー名の設定を検索
+			for _, srv := range config.Server.Servers {
+				if srv.Name == defaultServer {
+					serverURL = srv.URL
+					token = srv.Token
+					break
+				}
+			}
+
+			if serverURL == "" {
+				fmt.Fprintf(os.Stderr, "指定されたサーバー '%s' が見つかりません\n", defaultServer)
+				os.Exit(1)
+			}
+		} else {
+			// 設定ファイルが指定されていない場合は、デフォルト値を使用
+			serverURL = "http://localhost:1234"
+			token = ""
+		}
+
+		client := NewLLMClient(serverURL, token)
 
 		request := ChatRequest{
 			Messages: []Message{
@@ -54,13 +98,28 @@ var Command = &cobra.Command{
 	},
 }
 
+// loadConfig loads the configuration from a TOML file
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("設定ファイルの読み込みに失敗しました: %w", err)
+	}
+
+	var config Config
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("設定ファイルのパースに失敗しました: %w", err)
+	}
+
+	return &config, nil
+}
+
 func init() {
+	Command.Flags().StringVar(&configFile, "config", "", "設定ファイルのパス")
 	Command.Flags().StringVar(&model, "model", "", "使用するモデル名")
-	Command.Flags().StringVar(&server, "server", "http://localhost:1234", "LLMサーバーのURL")
 	Command.Flags().BoolVar(&stream, "stream", false, "ストリーミング応答を有効にする")
 	Command.Flags().StringVar(&prompt, "prompt", "", "AIに送信するプロンプト")
 	Command.Flags().IntVar(&maxTokens, "max-tokens", 1000, "最大トークン数")
 
-	Command.Flags().StringVar(&token, "token", "", "APIトークン (オプション)")
+	// フラグの必須項目を設定
 	Command.MarkFlagRequired("prompt")
 }
