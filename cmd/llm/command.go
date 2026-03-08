@@ -43,7 +43,7 @@ var Command = &cobra.Command{
 
 		if configFile != "" {
 			// 設定ファイルから読み込み
-			config, err := loadConfig(configFile)
+			config, err := LoadConfig(configFile)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "設定ファイルの読み込みに失敗しました: %v\n", err)
 				os.Exit(1)
@@ -98,8 +98,8 @@ var Command = &cobra.Command{
 	},
 }
 
-// loadConfig loads the configuration from a TOML file
-func loadConfig(path string) (*Config, error) {
+// LoadConfig loads the configuration from a TOML file
+func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("設定ファイルの読み込みに失敗しました: %w", err)

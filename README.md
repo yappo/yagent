@@ -6,6 +6,7 @@ LM Studioと連携するためのCLIエージェントで、ローカルのAIモ
 
 - LM StudioとのCLIインターフェース
 - AIインタラクションのためのシンプルなコマンドラインインターフェース
+- インタラクティブなTUIモードでの対話
 
 ## インストール
 
@@ -18,6 +19,11 @@ go install .
 エージェントを実行:
 ```bash
 yagent
+```
+
+TUIモードを使用する場合:
+```bash
+yagent --config config.toml
 ```
 
 LLMコマンドを使用する場合:
@@ -54,46 +60,13 @@ go build -o yagent .
 ## 使用例
 
 ```bash
-# エージェントを実行
+# エージェントを実行 (TUIモード)
 yagent
 
 # LLMサーバーに質問を送信 (設定ファイルを使用)
 yagent llm --prompt "こんにちは" --config config.toml
-```
 
-## 使用方法
-
-エージェントを実行:
-```bash
-yagent
-```
-
-LLMコマンドを使用する場合:
-```bash
-yagent llm --prompt "質問内容" --token "APIトークン"
-```
-
-## 開発
-
-テストを実行:
-```bash
-go test ./...
-```
-
-ビルド方法:
-```bash
-./build.sh
-# または
-go build -o yagent .
-```
-
-## 使用例
-
-```bash
-# エージェントを実行
-yagent
-
-# LLMサーバーに質問を送信 (APIトークンが必要な場合)
-yagent llm --prompt "こんにちは" --token "your-api-token"
+# インタラクティブな対話 (TUIモード)
+yagent --config config.toml
 ```
 
