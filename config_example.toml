@@ -5,3 +5,8 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = "your-api-token"
+
+[file]
+# ファイル操作の許可範囲を設定
+# 例: allow_paths = ["/home/user/project", "/tmp"]
+allow_paths = []

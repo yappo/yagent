@@ -26,6 +26,9 @@ type Config struct {
 			Token string `toml:"token"`
 		} `toml:"servers"`
 	} `toml:"server"`
+	File struct {
+		AllowPaths []string `toml:"allow_paths"`
+	} `toml:"file"`
 }
 
 // Command represents the llm command
@@ -40,6 +43,7 @@ var Command = &cobra.Command{
 		}
 
 		var serverURL, token string
+		var client *LLMClient
 
 		if configFile != "" {
 			// 設定ファイルから読み込み
@@ -65,13 +69,15 @@ var Command = &cobra.Command{
 				fmt.Fprintf(os.Stderr, "指定されたサーバー '%s' が見つかりません\n", defaultServer)
 				os.Exit(1)
 			}
+
+			client = NewLLMClientWithConfig(serverURL, token, config)
 		} else {
 			// 設定ファイルが指定されていない場合は、デフォルト値を使用
 			serverURL = "http://localhost:1234"
 			token = ""
-		}
 
-		client := NewLLMClient(serverURL, token)
+			client = NewLLMClient(serverURL, token)
+		}
 
 		request := ChatRequest{
 			Messages: []Message{
