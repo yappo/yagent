@@ -10,15 +10,18 @@ import (
 
 // FileReadTool ファイル読み取りツール
 type FileReadTool struct {
-	allowPaths []string
-	confirm    bool
+	allowPaths    []string
+	confirm       bool
+	baseDirectory string
 }
 
 // NewFileReadTool ファイル読み取りツールを作成
 func NewFileReadTool(allowPaths []string, confirm bool) *FileReadTool {
+	baseDir, _ := os.Getwd()
 	return &FileReadTool{
-		allowPaths: allowPaths,
-		confirm:    confirm,
+		allowPaths:    allowPaths,
+		confirm:       confirm,
+		baseDirectory: baseDir,
 	}
 }
 
@@ -56,6 +59,16 @@ func (t *FileReadTool) Execute(ctx context.Context, args map[string]interface{})
 			Error:   "file_path パラメータが必要です",
 		}
 	}
+
+	// 相対パスを絶対パスに変換
+	absPath, err := t.resolvePath(filePath)
+	if err != nil {
+		return &ToolOutput{
+			Success: false,
+			Error:   fmt.Sprintf("パスの変換に失敗しました：%v", err),
+		}
+	}
+	filePath = absPath
 
 	if !t.isPathSafe(filePath) {
 		return &ToolOutput{
@@ -105,6 +118,14 @@ func (t *FileReadTool) Execute(ctx context.Context, args map[string]interface{})
 	}
 }
 
+// resolvePath 相対パスを絶対パスに変換
+func (t *FileReadTool) resolvePath(filePath string) (string, error) {
+	if filepath.IsAbs(filePath) {
+		return filePath, nil
+	}
+	return filepath.Join(t.baseDirectory, filePath), nil
+}
+
 // isPathSafe パスセキュリティチェック
 func (t *FileReadTool) isPathSafe(filePath string) bool {
 	cleanPath := filepath.Clean(filePath)
@@ -148,15 +169,18 @@ func (t *FileReadTool) isPathAllowed(filePath string) bool {
 
 // FileWriterTool ファイル書き込みツール
 type FileWriterTool struct {
-	allowPaths []string
-	confirm    bool
+	allowPaths    []string
+	confirm       bool
+	baseDirectory string
 }
 
 // NewFileWriterTool ファイル書き込みツールを作成
 func NewFileWriterTool(allowPaths []string, confirm bool) *FileWriterTool {
+	baseDir, _ := os.Getwd()
 	return &FileWriterTool{
-		allowPaths: allowPaths,
-		confirm:    confirm,
+		allowPaths:    allowPaths,
+		confirm:       confirm,
+		baseDirectory: baseDir,
 	}
 }
 
@@ -208,6 +232,16 @@ func (t *FileWriterTool) Execute(ctx context.Context, args map[string]interface{
 		}
 	}
 
+	// 相対パスを絶対パスに変換
+	absPath, err := t.resolvePath(filePath)
+	if err != nil {
+		return &ToolOutput{
+			Success: false,
+			Error:   fmt.Sprintf("パスの変換に失敗しました：%v", err),
+		}
+	}
+	filePath = absPath
+
 	if !t.isPathSafe(filePath) {
 		return &ToolOutput{
 			Success: false,
@@ -235,7 +269,7 @@ func (t *FileWriterTool) Execute(ctx context.Context, args map[string]interface{
 		}
 	}
 
-	err := os.WriteFile(filePath, []byte(content), 0644)
+	err = os.WriteFile(filePath, []byte(content), 0644)
 	if err != nil {
 		return &ToolOutput{
 			Success: false,
@@ -247,6 +281,14 @@ func (t *FileWriterTool) Execute(ctx context.Context, args map[string]interface{
 		Success: true,
 		Data:    fmt.Sprintf("ファイル %s に書き込みました", filePath),
 	}
+}
+
+// resolvePath 相対パスを絶対パスに変換
+func (t *FileWriterTool) resolvePath(filePath string) (string, error) {
+	if filepath.IsAbs(filePath) {
+		return filePath, nil
+	}
+	return filepath.Join(t.baseDirectory, filePath), nil
 }
 
 // isPathSafe パスセキュリティチェック
