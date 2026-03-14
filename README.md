@@ -7,19 +7,28 @@ LM Studio と連携するための CLI エージェントで、ローカルの A
 - LM Studio との CLI インターフェース
 - AI インタラクションのためのシンプルなコマンドラインインターフェース
 - インタラクティブな TUI モードでの対話
+- **Function Calling 対応** - OpenAI API の tools 機能に対応
 - **ファイル操作機能** - LLM の指示に応じてローカルファイルの読み書きを実行可能
 
 ## 特徴
 
-### ファイル操作機能
+### Function Calling (ツール機能)
 
-yagent は、TUI モードで LLM にファイル操作を依頼できます。LLM が `/file-read` または `/file-write` コマンドを返すと、自動的に以下の処理が行われます：
+yagent は OpenAI API の Function Calling に対応しています。LLM が自動的にツールを呼び出し、ファイル操作を実行できます：
 
-- **ファイル読み込み** (`/file-read <パス>`)
+- **ツール定義**: LLM に利用可能なツールを定義可能
+- **自動呼び出し**: LLM の判断でツールが自動的に呼び出される
+- **拡張可能**: クリーンアーキテクチャに基づき、簡単に新規ツールを追加可能
+
+### ファイル操作ツール
+
+ファイル操作は専用のツールとして実装されています：
+
+- **file_reader**: ファイル読み取りツール
   - 指定したファイルの内容を読み取り、LLM に送信
   - LLM の応答に基づいて追加の処理を実行
   
-- **ファイル書き込み** (`/file-write <パス>`)
+- **file_writer**: ファイル書き込みツール
   - LLM が生成した内容を Markdown コードブロックから抽出し、ファイルに保存
   - ユーザーの確認を得た後に実行
 
@@ -100,6 +109,24 @@ go test ./...
 ./build.sh
 # または
 go build -o yagent .
+```
+
+### 新規ツールの追加方法
+
+```go
+// ツールの実装
+type MyTool struct {}
+
+func (t *MyTool) Name() string { return "my_tool" }
+func (t *MyTool) Description() string { return "説明" }
+func (t *MyTool) Parameters() map[string]interface{} { return params }
+func (t *MyTool) Execute(ctx context.Context, args map[string]interface{}) *ToolOutput {
+    // 実装
+}
+
+// LLMClient に登録
+client := llm.NewLLMClient(baseURL, token)
+client.WithTools(&MyTool{})
 ```
 
 ### 実行例

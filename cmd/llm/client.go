@@ -8,17 +8,17 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
 // LLMClient represents a client for communicating with the LLM server
 type LLMClient struct {
-	baseURL    string
-	httpClient *http.Client
-	token      string
-	config     *Config
+	baseURL     string
+	httpClient  *http.Client
+	token       string
+	config      *Config
+	toolHandler *ToolHandler
 }
 
 // NewLLMClient creates a new LLM client instance
@@ -44,24 +44,47 @@ func NewLLMClientWithConfig(baseURL string, token string, config *Config) *LLMCl
 	}
 }
 
+// WithToolHandler ツールハンドラを設定
+func (c *LLMClient) WithToolHandler(handler *ToolHandler) *LLMClient {
+	c.toolHandler = handler
+	return c
+}
+
+// WithTools ツールを登録
+func (c *LLMClient) WithTools(tools ...ToolInterface) *LLMClient {
+	registry := NewToolRegistry()
+	for _, tool := range tools {
+		registry.Register(tool)
+	}
+	c.toolHandler = NewToolHandler(registry)
+	return c
+}
+
+// GetToolHandler ツールハンドラを取得
+func (c *LLMClient) GetToolHandler() *ToolHandler {
+	return c.toolHandler
+}
+
 // ChatRequest represents a chat request to the LLM server
 type ChatRequest struct {
-	Messages []Message `json:"messages"`
-	Model    string    `json:"model,omitempty"`
-	Stream   bool      `json:"stream,omitempty"`
+	Messages []Message        `json:"messages"`
+	Model    string           `json:"model,omitempty"`
+	Stream   bool             `json:"stream,omitempty"`
+	Tools    []ToolDefinition `json:"tools,omitempty"`
 }
 
 // Message represents a single message in the conversation
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string             `json:"role"`
+	Content   string             `json:"content"`
+	ToolCalls []ToolCallResponse `json:"tool_calls,omitempty"`
 }
 
 // ChatResponse represents a response from the LLM server
 type ChatResponse struct {
 	ID      string   `json:"id"`
 	Object  string   `json:"object"`
-	Created int64    `json:"created"` // Unix timestamp instead of time.Time
+	Created int64    `json:"created"`
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
 }
@@ -94,25 +117,20 @@ func (c *LLMClient) SendChat(request ChatRequest) (*ChatResponse, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("LLM サーバーとの通信に失敗しました: %w", err)
+		return nil, fmt.Errorf("LLM サーバーとの通信に失敗しました：%w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("サーバーがステータス %d を返しました: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("サーバーがステータス %d を返しました：%s", resp.StatusCode, string(body))
 	}
 
-	// Debug: Read the raw response to see what we're getting
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Log the raw response for debugging
-	fmt.Printf("Raw response: %s\n", string(body))
-
-	// Try to parse as JSON
 	var chatResponse ChatResponse
 	if err := json.Unmarshal(body, &chatResponse); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
@@ -121,101 +139,105 @@ func (c *LLMClient) SendChat(request ChatRequest) (*ChatResponse, error) {
 	return &chatResponse, nil
 }
 
-// ReadFile reads a file and returns its content
-func (c *LLMClient) ReadFile(filePath string) (string, error) {
-	// ファイルパスの安全チェック
-	if !c.isPathSafe(filePath) {
-		return "", fmt.Errorf("安全でないファイルパスです：%s", filePath)
+// SendChatWithTools sends a chat request with tool definitions and handles tool calls
+func (c *LLMClient) SendChatWithTools(request ChatRequest, maxIterations int) (string, error) {
+	if c.toolHandler == nil {
+		return "", fmt.Errorf("ツールハンドラが設定されていません")
 	}
 
-	// ファイルパスの制限チェック
-	if !c.isPathAllowed(filePath) {
-		return "", fmt.Errorf("アクセスが許可されていないファイルパスです：%s", filePath)
+	// ツール定義を取得
+	registry := c.toolHandler.GetRegistry()
+	toolDefinitions := registry.List()
+	if len(toolDefinitions) > 0 {
+		request.Tools = toolDefinitions
 	}
 
-	// ファイルが存在するかどうか確認
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return "", fmt.Errorf("ファイルが存在しません：%s", filePath)
+	messages := request.Messages
+	iteration := 0
+
+	for iteration < maxIterations {
+		iteration++
+
+		response, err := c.SendChat(request)
+		if err != nil {
+			return "", err
+		}
+
+		if len(response.Choices) == 0 {
+			return "", fmt.Errorf("LLM サーバーから応答がありません")
+		}
+
+		message := response.Choices[0].Message
+
+		// ツール呼び出しがあるか確認
+		if len(message.ToolCalls) > 0 || (message.Content == "" && response.Choices[0].FinishReason == "tool_calls") {
+			// ツール呼び出しを処理
+			toolCalls, err := parseToolCalls(message)
+			if err != nil {
+				return "", fmt.Errorf("ツール呼び出しの解析に失敗しました：%w", err)
+			}
+
+			if len(toolCalls) == 0 {
+				// ツール呼び出しが解析されなかった場合は通常応答として扱う
+				return message.Content, nil
+			}
+
+			results := c.toolHandler.HandleToolCalls(nil, toolCalls)
+
+			// ツール結果をメッセージに追加
+			for _, result := range results {
+				toolMessage := Message{
+					Role:    "tool",
+					Content: "",
+				}
+				if result.Success {
+					toolMessage.Content = fmt.Sprintf("%v", result.Data)
+				} else {
+					toolMessage.Content = fmt.Sprintf("エラー：%s", result.Error)
+				}
+				messages = append(messages, toolMessage)
+			}
+
+			request.Messages = messages
+			continue
+		}
+
+		// 通常応答
+		return message.Content, nil
 	}
 
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read file %s: %w", filePath, err)
-	}
-	return string(content), nil
+	return "", fmt.Errorf("最大反復回数 (%d) に達しました", maxIterations)
 }
 
-// WriteFile writes content to a file
-func (c *LLMClient) WriteFile(filePath string, content string) error {
-	err := os.WriteFile(filePath, []byte(content), 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write file %s: %w", filePath, err)
+// parseToolCalls メッセージからツール呼び出しを解析
+func parseToolCalls(message Message) ([]ToolCall, error) {
+	var toolCalls []ToolCall
+
+	// tool_calls フィールドから解析
+	for _, tc := range message.ToolCalls {
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			return toolCalls, fmt.Errorf("arguments の解析に失敗しました：%w", err)
+		}
+
+		toolCalls = append(toolCalls, ToolCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: args,
+		})
 	}
-	return nil
+
+	return toolCalls, nil
 }
 
 // ConfirmFileOperation asks the user for confirmation before file operation
 func (c *LLMClient) ConfirmFileOperation(operation, filePath string) bool {
-	fmt.Printf("LLM が %s を要求しました。ファイル: %s\n", operation, filePath)
-	fmt.Print("実行しますか? (y/n): ")
+	fmt.Printf("LLM が %s を要求しました。ファイル：%s\n", operation, filePath)
+	fmt.Print("実行しますか？ (y/n): ")
 	scanner := bufio.NewScanner(os.Stdin)
 	if scanner.Scan() {
 		input := strings.TrimSpace(scanner.Text())
 		return strings.ToLower(input) == "y"
 	}
-	return false
-}
-
-// isPathSafe checks if the file path is safe (no directory traversal)
-func (c *LLMClient) isPathSafe(filePath string) bool {
-	// パスを正規化
-	cleanPath := filepath.Clean(filePath)
-
-	// 正規化後のパスが相対パスの場合、".." が含まれていないか確認
-	if strings.HasPrefix(cleanPath, "..") {
-		return false
-	}
-
-	// 絶対パスに変換して確認
-	absPath, err := filepath.Abs(filePath)
-	if err != nil {
-		return false
-	}
-
-	// 正規化後の絶対パスも確認
-	cleanAbsPath := filepath.Clean(absPath)
-	if strings.HasPrefix(cleanAbsPath, "..") {
-		return false
-	}
-
-	return true
-}
-
-// isPathAllowed checks if the file path is allowed based on configuration
-func (c *LLMClient) isPathAllowed(filePath string) bool {
-	// 設定がなければすべて許可
-	if c.config == nil || len(c.config.File.AllowPaths) == 0 {
-		return true
-	}
-
-	// ファイルパスを絶対パスに変換
-	absFilePath, err := filepath.Abs(filePath)
-	if err != nil {
-		return false // 絶対パスに変換できない場合は許可しない
-	}
-
-	// 許可されたパスを確認
-	for _, allowedPath := range c.config.File.AllowPaths {
-		// 許可されたパスを絶対パスに変換
-		absAllowedPath, err := filepath.Abs(allowedPath)
-		if err != nil {
-			continue // 絶対パスに変換できない場合はスキップ
-		}
-
-		if strings.HasPrefix(absFilePath, absAllowedPath) {
-			return true
-		}
-	}
-
 	return false
 }
