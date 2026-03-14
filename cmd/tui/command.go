@@ -17,8 +17,8 @@ var Command = &cobra.Command{
 	Short: "TUI モードでの LLM インタラクティブな対話",
 	Long:  `LM Studio との連携を用いた TUI インターフェースによるインタラクティブな AI 対話機能`,
 	Run: func(cmd *cobra.Command, args []string) {
-		var serverURL, token string
-		var configFile string
+		var serverURL, token, configFile string
+		var allowPaths []string
 
 		if cmd.Flags().Changed("config") {
 			configFile, _ = cmd.Flags().GetString("config")
@@ -48,19 +48,22 @@ var Command = &cobra.Command{
 				fmt.Fprintf(os.Stderr, "指定されたサーバー '%s' が見つかりません\n", defaultServer)
 				os.Exit(1)
 			}
+
+			// ファイル操作の許可パスを取得
+			allowPaths = config.File.AllowPaths
 		} else {
 			// 設定ファイルが指定されていない場合は、デフォルト値を使用
 			serverURL = "http://localhost:1234"
 			token = ""
+			allowPaths = []string{}
 		}
 
 		client := llm.NewLLMClient(serverURL, token)
 
-		// ツールを登録
-		allowPaths := []string{} // 設定ファイルから取得可能
+		// ツールを登録（ユーザー確認あり）
 		client.WithTools(
-			llm.NewFileReadTool(allowPaths, false),
-			llm.NewFileWriterTool(allowPaths, false),
+			llm.NewFileReadTool(allowPaths, true),
+			llm.NewFileWriterTool(allowPaths, true),
 		)
 
 		fmt.Println("yagent TUI モードへようこそ！")

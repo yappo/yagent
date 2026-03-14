@@ -78,6 +78,19 @@ func (t *FileReadTool) Execute(ctx context.Context, args map[string]interface{})
 		}
 	}
 
+	// ユーザー確認
+	if t.confirm {
+		fmt.Printf("ファイル読み取りを実行しますか？ファイル：%s (y/n): ", filePath)
+		var input string
+		fmt.Scanln(&input)
+		if strings.ToLower(input) != "y" {
+			return &ToolOutput{
+				Success: false,
+				Error:   "ユーザーによってキャンセルされました",
+			}
+		}
+	}
+
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return &ToolOutput{
@@ -206,6 +219,19 @@ func (t *FileWriterTool) Execute(ctx context.Context, args map[string]interface{
 		return &ToolOutput{
 			Success: false,
 			Error:   fmt.Sprintf("アクセスが許可されていないファイルパスです：%s", filePath),
+		}
+	}
+
+	// ユーザー確認
+	if t.confirm {
+		fmt.Printf("ファイル書き込みを実行しますか？ファイル：%s (y/n): ", filePath)
+		var input string
+		fmt.Scanln(&input)
+		if strings.ToLower(input) != "y" {
+			return &ToolOutput{
+				Success: false,
+				Error:   "ユーザーによってキャンセルされました",
+			}
 		}
 	}
 
