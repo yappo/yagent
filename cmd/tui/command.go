@@ -19,6 +19,7 @@ var Command = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		var serverURL, token, configFile string
 		var allowPaths []string
+		pwd, _ := os.Getwd()
 
 		if cmd.Flags().Changed("config") {
 			configFile, _ = cmd.Flags().GetString("config")
@@ -57,6 +58,9 @@ var Command = &cobra.Command{
 			token = ""
 			allowPaths = []string{}
 		}
+
+		// 起動時のカレントディレクトリを許可パスの先頭に追加
+		allowPaths = append([]string{pwd}, allowPaths...)
 
 		client := llm.NewLLMClient(serverURL, token)
 
