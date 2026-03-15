@@ -20,6 +20,9 @@ func TestLoadDefault(t *testing.T) {
 	if server.URL != "http://localhost:1234" {
 		t.Fatalf("unexpected default URL: %s", server.URL)
 	}
+	if cfg.Agent.MaxIterations != 100 {
+		t.Fatalf("unexpected default max iterations: %d", cfg.Agent.MaxIterations)
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -33,9 +36,13 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = "secret"
+timeout = 1200
 
 [file]
 allow_paths = ["/tmp"]
+
+[agent]
+max_iterations = 42
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -53,5 +60,11 @@ allow_paths = ["/tmp"]
 
 	if server.Token != "secret" {
 		t.Fatalf("unexpected token: %s", server.Token)
+	}
+	if server.Timeout != 1200 {
+		t.Fatalf("unexpected server timeout: %d", server.Timeout)
+	}
+	if cfg.Agent.MaxIterations != 42 {
+		t.Fatalf("unexpected max iterations: %d", cfg.Agent.MaxIterations)
 	}
 }

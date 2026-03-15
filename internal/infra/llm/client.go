@@ -18,12 +18,15 @@ type Client struct {
 	httpClient *http.Client
 }
 
-func NewClient(baseURL, token string) *Client {
+func NewClient(baseURL, token string, timeoutSeconds int) *Client {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 900
+	}
 	return &Client{
 		baseURL: baseURL,
 		token:   token,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: time.Duration(timeoutSeconds) * time.Second,
 		},
 	}
 }

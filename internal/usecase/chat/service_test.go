@@ -25,6 +25,14 @@ func (fakeTools) Execute(context.Context, domain.ToolCall) domain.ToolResult {
 	return domain.ToolResult{Success: true, Output: "tool output"}
 }
 
+type recordingObserver struct {
+	events []ToolEvent
+}
+
+func (r *recordingObserver) OnToolEvent(_ context.Context, event ToolEvent) {
+	r.events = append(r.events, event)
+}
+
 func TestServiceRunWithoutTools(t *testing.T) {
 	service := NewService(&fakeClient{
 		responses: []domain.CompletionResponse{
@@ -45,6 +53,7 @@ func TestServiceRunWithoutTools(t *testing.T) {
 }
 
 func TestServiceRunWithTools(t *testing.T) {
+	observer := &recordingObserver{}
 	service := NewService(&fakeClient{
 		responses: []domain.CompletionResponse{
 			{
@@ -58,6 +67,7 @@ func TestServiceRunWithTools(t *testing.T) {
 			{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
 		},
 	}, fakeTools{}, 5)
+	service.SetObserver(observer)
 
 	result, err := service.Run(context.Background(), Input{
 		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hi"}},
@@ -68,5 +78,8 @@ func TestServiceRunWithTools(t *testing.T) {
 
 	if result.Message.Content != "done" {
 		t.Fatalf("unexpected content: %s", result.Message.Content)
+	}
+	if len(observer.events) != 2 || observer.events[0].Phase != "start" || observer.events[1].Phase != "finish" {
+		t.Fatalf("unexpected observer events: %+v", observer.events)
 	}
 }

@@ -16,7 +16,7 @@ func TestComplete(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "")
+	client := NewClient(server.URL, "", 900)
 	response, err := client.Complete(context.Background(), domain.CompletionRequest{
 		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hi"}},
 	})

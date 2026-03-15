@@ -11,9 +11,15 @@ const (
 )
 
 type PermissionRequest struct {
-	ToolName  string
-	Operation string
-	Resource  string
+	ToolName     string
+	Operation    string
+	Resource     string
+	Action       string
+	ResourceKind string
+	Risk         string
+	Scope        string
+	Summary      string
+	SideEffects  []string
 }
 
 type Approver interface {
