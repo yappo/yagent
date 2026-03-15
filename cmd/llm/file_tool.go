@@ -8,10 +8,25 @@ import (
 	"strings"
 )
 
+type ToolConfirmationDecision string
+
+const (
+	ConfirmAllowOnce    ToolConfirmationDecision = "allowOnce"
+	ConfirmAllowSession ToolConfirmationDecision = "allowSession"
+	ConfirmDeny         ToolConfirmationDecision = "deny"
+)
+
+type ToolConfirmationRequest struct {
+	ToolName  string
+	Operation string
+	FilePath  string
+}
+
 // FileReadTool ファイル読み取りツール
 type FileReadTool struct {
 	allowPaths    []string
 	confirm       bool
+	confirmFunc   func(request ToolConfirmationRequest) ToolConfirmationDecision
 	baseDirectory string
 }
 
@@ -23,6 +38,11 @@ func NewFileReadTool(allowPaths []string, confirm bool) *FileReadTool {
 		confirm:       confirm,
 		baseDirectory: baseDir,
 	}
+}
+
+func (t *FileReadTool) WithConfirmFunc(confirmFunc func(request ToolConfirmationRequest) ToolConfirmationDecision) *FileReadTool {
+	t.confirmFunc = confirmFunc
+	return t
 }
 
 // Name ツール名
@@ -93,10 +113,7 @@ func (t *FileReadTool) Execute(ctx context.Context, args map[string]interface{})
 
 	// ユーザー確認
 	if t.confirm {
-		fmt.Printf("ファイル読み取りを実行しますか？ファイル：%s (y/n): ", filePath)
-		var input string
-		fmt.Scanln(&input)
-		if strings.ToLower(input) != "y" {
+		if t.confirmOperation(filePath) == ConfirmDeny {
 			return &ToolOutput{
 				Success: false,
 				Error:   "ユーザーによってキャンセルされました",
@@ -171,6 +188,7 @@ func (t *FileReadTool) isPathAllowed(filePath string) bool {
 type FileWriterTool struct {
 	allowPaths    []string
 	confirm       bool
+	confirmFunc   func(request ToolConfirmationRequest) ToolConfirmationDecision
 	baseDirectory string
 }
 
@@ -182,6 +200,11 @@ func NewFileWriterTool(allowPaths []string, confirm bool) *FileWriterTool {
 		confirm:       confirm,
 		baseDirectory: baseDir,
 	}
+}
+
+func (t *FileWriterTool) WithConfirmFunc(confirmFunc func(request ToolConfirmationRequest) ToolConfirmationDecision) *FileWriterTool {
+	t.confirmFunc = confirmFunc
+	return t
 }
 
 // Name ツール名
@@ -258,10 +281,7 @@ func (t *FileWriterTool) Execute(ctx context.Context, args map[string]interface{
 
 	// ユーザー確認
 	if t.confirm {
-		fmt.Printf("ファイル書き込みを実行しますか？ファイル：%s (y/n): ", filePath)
-		var input string
-		fmt.Scanln(&input)
-		if strings.ToLower(input) != "y" {
+		if t.confirmOperation(filePath) == ConfirmDeny {
 			return &ToolOutput{
 				Success: false,
 				Error:   "ユーザーによってキャンセルされました",
@@ -330,4 +350,45 @@ func (t *FileWriterTool) isPathAllowed(filePath string) bool {
 	}
 
 	return false
+}
+
+func (t *FileReadTool) confirmOperation(filePath string) ToolConfirmationDecision {
+	request := ToolConfirmationRequest{
+		ToolName:  t.Name(),
+		Operation: "ファイル読み取り",
+		FilePath:  filePath,
+	}
+	if t.confirmFunc != nil {
+		return t.confirmFunc(request)
+	}
+
+	return confirmOperationFromStdin(request)
+}
+
+func (t *FileWriterTool) confirmOperation(filePath string) ToolConfirmationDecision {
+	request := ToolConfirmationRequest{
+		ToolName:  t.Name(),
+		Operation: "ファイル書き込み",
+		FilePath:  filePath,
+	}
+	if t.confirmFunc != nil {
+		return t.confirmFunc(request)
+	}
+
+	return confirmOperationFromStdin(request)
+}
+
+func confirmOperationFromStdin(request ToolConfirmationRequest) ToolConfirmationDecision {
+	fmt.Printf("%sを実行しますか？ファイル：%s\n", request.Operation, request.FilePath)
+	fmt.Print("[1] 今回だけ許可  [2] このセッションで許可  [3] 拒否: ")
+	var input string
+	fmt.Scanln(&input)
+	switch strings.TrimSpace(strings.ToLower(input)) {
+	case "1":
+		return ConfirmAllowOnce
+	case "2":
+		return ConfirmAllowSession
+	default:
+		return ConfirmDeny
+	}
 }

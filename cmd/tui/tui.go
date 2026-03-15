@@ -20,31 +20,66 @@ type message struct {
 
 type loadingTickMsg struct{}
 
+type toolConfirmationMsg struct {
+	request  llm.ToolConfirmationRequest
+	response chan llm.ToolConfirmationDecision
+}
+
+type pendingConfirmation struct {
+	request       llm.ToolConfirmationRequest
+	response      chan llm.ToolConfirmationDecision
+	selectedIndex int
+}
+
+type permissionOption struct {
+	label    string
+	decision llm.ToolConfirmationDecision
+}
+
 type model struct {
-	messages     []llm.Message
-	output       []string
-	loading      bool
-	loadingFrame int
-	client       *llm.LLMClient
-	style        styles
-	textarea     textarea.Model
-	history      []string
-	histIdx      int
+	messages         []llm.Message
+	output           []string
+	loading          bool
+	loadingFrame     int
+	width            int
+	confirming       *pendingConfirmation
+	sessionApprovals map[string]bool
+	client           *llm.LLMClient
+	style            styles
+	textarea         textarea.Model
+	history          []string
+	histIdx          int
 }
 
 var loadingFrames = []string{"◐", "◓", "◑", "◒"}
 
+const userOutputLabel = "__USER__"
+const assistantOutputLabel = "__ASSISTANT__"
+
+var permissionOptions = []permissionOption{
+	{label: "今回だけ許可", decision: llm.ConfirmAllowOnce},
+	{label: "このセッションで許可", decision: llm.ConfirmAllowSession},
+	{label: "拒否", decision: llm.ConfirmDeny},
+}
+
 const loadingTickInterval = 100 * time.Millisecond
+const maxTextareaHeight = 6
 
 type styles struct {
-	prompt    lipgloss.Style
-	user      lipgloss.Style
-	assistant lipgloss.Style
-	tool      lipgloss.Style
-	system    lipgloss.Style
-	separator lipgloss.Style
-	error     lipgloss.Style
-	hint      lipgloss.Style
+	prompt             lipgloss.Style
+	user               lipgloss.Style
+	assistant          lipgloss.Style
+	tool               lipgloss.Style
+	system             lipgloss.Style
+	separator          lipgloss.Style
+	error              lipgloss.Style
+	hint               lipgloss.Style
+	permissionCard     lipgloss.Style
+	permissionTitle    lipgloss.Style
+	permissionPath     lipgloss.Style
+	permissionHelp     lipgloss.Style
+	permissionOption   lipgloss.Style
+	permissionSelected lipgloss.Style
 }
 
 func (m styles) init() {
@@ -75,6 +110,31 @@ func (m styles) init() {
 	m.hint = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("99")).
 		Italic(true)
+
+	m.permissionCard = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1)
+
+	m.permissionTitle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("230")).
+		Bold(true)
+
+	m.permissionPath = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252"))
+
+	m.permissionHelp = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("244"))
+
+	m.permissionOption = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("250")).
+		Padding(0, 1)
+
+	m.permissionSelected = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("232")).
+		Background(lipgloss.Color("221")).
+		Bold(true).
+		Padding(0, 1)
 }
 
 func NewModel(client *llm.LLMClient) model {
@@ -85,14 +145,24 @@ func NewModel(client *llm.LLMClient) model {
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行，Enter で送信，/exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
 	ta.ShowLineNumbers = false
+	ta.SetPromptFunc(2, func(line int) string {
+		if line == 0 {
+			return "❯ "
+		}
+		return "  "
+	})
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
 	ta.Focus()
+	ta.SetHeight(1)
 
 	return model{
-		history:  []string{},
-		messages: []llm.Message{},
-		client:   client,
-		style:    s,
-		textarea: ta,
+		history:          []string{},
+		messages:         []llm.Message{},
+		sessionApprovals: map[string]bool{},
+		client:           client,
+		style:            s,
+		textarea:         ta,
 	}
 }
 
@@ -106,20 +176,154 @@ func loadingTick() tea.Cmd {
 	})
 }
 
+func (m *model) syncTextareaSize() {
+	height := strings.Count(m.textarea.Value(), "\n") + 1
+	if height < 1 {
+		height = 1
+	}
+	if height > maxTextareaHeight {
+		height = maxTextareaHeight
+	}
+	m.textarea.SetHeight(height)
+
+	if m.width <= 0 {
+		return
+	}
+
+	m.textarea.SetWidth(m.width)
+}
+
+func (m model) nextPermissionIndex(step int) int {
+	if m.confirming == nil {
+		return 0
+	}
+
+	count := len(permissionOptions)
+	return (m.confirming.selectedIndex + step + count) % count
+}
+
+func permissionDecisionLabel(decision llm.ToolConfirmationDecision) string {
+	switch decision {
+	case llm.ConfirmAllowOnce:
+		return "今回だけ許可"
+	case llm.ConfirmAllowSession:
+		return "このセッションで許可"
+	default:
+		return "拒否"
+	}
+}
+
+func renderPermissionOptions(selectedIndex int, selectedStyle lipgloss.Style, baseStyle lipgloss.Style) string {
+	parts := make([]string, 0, len(permissionOptions))
+	for i, option := range permissionOptions {
+		label := fmt.Sprintf("%d. %s", i+1, option.label)
+		if i == selectedIndex {
+			parts = append(parts, selectedStyle.Render("[ "+label+" ]"))
+			continue
+		}
+		parts = append(parts, baseStyle.Render("  "+label+"  "))
+	}
+
+	return strings.Join(parts, "  ")
+}
+
+func trimPathFromEnd(path string, width int) string {
+	if width <= 0 || lipgloss.Width(path) <= width {
+		return path
+	}
+
+	runes := []rune(path)
+	for len(runes) > 0 && lipgloss.Width("..."+string(runes)) > width {
+		runes = runes[1:]
+	}
+
+	return "..." + string(runes)
+}
+
+func (m model) resolveConfirmation(decision llm.ToolConfirmationDecision) (model, tea.Cmd) {
+	if m.confirming == nil {
+		return m, nil
+	}
+
+	request := m.confirming.request
+	if decision == llm.ConfirmAllowSession {
+		m.sessionApprovals[approvalKey(request)] = true
+	}
+
+	m.output = append(m.output, m.style.tool.Render(fmt.Sprintf("%s %s を%s", request.Operation, request.FilePath, permissionDecisionLabel(decision))))
+	m.confirming.response <- decision
+	close(m.confirming.response)
+	m.confirming = nil
+
+	return m, nil
+}
+
+func approvalKey(request llm.ToolConfirmationRequest) string {
+	return request.ToolName + "\x00" + request.FilePath
+}
+
+func appendOutputBlock(output []string, label string, content string) []string {
+	output = append(output, label)
+	output = append(output, strings.Split(content, "\n")...)
+	output = append(output, "───────────────────────────────────────────────────────────────────────")
+	return output
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.confirming != nil {
+			if msg.Type == tea.KeyCtrlC {
+				m, _ = m.resolveConfirmation(llm.ConfirmDeny)
+				fmt.Println("さようなら！")
+				return m, tea.Quit
+			}
+
+			switch msg.Type {
+			case tea.KeyLeft, tea.KeyShiftTab:
+				m.confirming.selectedIndex = m.nextPermissionIndex(-1)
+				return m, nil
+			case tea.KeyRight, tea.KeyTab:
+				m.confirming.selectedIndex = m.nextPermissionIndex(1)
+				return m, nil
+			case tea.KeyEnter:
+				return m.resolveConfirmation(permissionOptions[m.confirming.selectedIndex].decision)
+			case tea.KeyEsc:
+				return m.resolveConfirmation(llm.ConfirmDeny)
+			}
+
+			switch strings.ToLower(msg.String()) {
+			case "h":
+				m.confirming.selectedIndex = m.nextPermissionIndex(-1)
+				return m, nil
+			case "l":
+				m.confirming.selectedIndex = m.nextPermissionIndex(1)
+				return m, nil
+			case "1", "2", "3":
+				idx := int(msg.String()[0] - '1')
+				if idx >= 0 && idx < len(permissionOptions) {
+					m.confirming.selectedIndex = idx
+					return m.resolveConfirmation(permissionOptions[idx].decision)
+				}
+			case "y":
+				m.confirming.selectedIndex = 0
+				return m.resolveConfirmation(llm.ConfirmAllowOnce)
+			case "n":
+				return m.resolveConfirmation(llm.ConfirmDeny)
+			}
+
+			return m, nil
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			fmt.Println("さようなら！")
 			return m, tea.Quit
 		case tea.KeyCtrlJ:
-			// Ctrl+J で改行
 			m.textarea.InsertString("\n")
+			m.syncTextareaSize()
 			return m, nil
 		case tea.KeyEnter:
-			// Enter で送信
-
 			if m.textarea.Value() == "" {
 				return m, nil
 			}
@@ -135,15 +339,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.output = append(m.output, "  /help - このヘルプを表示")
 					m.output = append(m.output, "  /clear - チャット履歴をクリア")
 					m.textarea.Reset()
+					m.syncTextareaSize()
 					return m, nil
 				case "/clear":
 					m.messages = m.messages[:1]
 					m.output = append(m.output, "チャット履歴をクリアしました")
 					m.textarea.Reset()
+					m.syncTextareaSize()
 					return m, nil
 				default:
 					m.output = append(m.output, "不明なコマンドです。/help でヘルプを表示します")
 					m.textarea.Reset()
+					m.syncTextareaSize()
 					return m, nil
 				}
 			}
@@ -154,7 +361,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Role:    "user",
 				Content: trimmed,
 			})
+			m.output = appendOutputBlock(m.output, userOutputLabel, trimmed)
 			m.textarea.Reset()
+			m.syncTextareaSize()
 			m.loading = true
 			m.loadingFrame = 0
 
@@ -175,22 +384,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.histIdx > 0 {
 				m.histIdx--
 				m.textarea.SetValue(m.history[m.histIdx])
+				m.syncTextareaSize()
 			}
 			return m, nil
 		case tea.KeyDown:
 			if m.histIdx < len(m.history)-1 {
 				m.histIdx++
 				m.textarea.SetValue(m.history[m.histIdx])
+				m.syncTextareaSize()
 			} else {
 				m.histIdx = len(m.history)
 				m.textarea.Reset()
+				m.syncTextareaSize()
 			}
 			return m, nil
 		}
 
-		// textarea の更新
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
+		m.syncTextareaSize()
 		return m, cmd
 
 	case loadingTickMsg:
@@ -209,15 +421,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.output = append(m.output, "yagent")
-		m.output = append(m.output, msg.content)
-		m.output = append(m.output, "───────────────────────────────────────────────────────────────────────")
+		m.output = appendOutputBlock(m.output, assistantOutputLabel, msg.content)
 		m.messages = append(m.messages, llm.Message{
 			Role:    "assistant",
 			Content: msg.content,
 		})
 
+	case toolConfirmationMsg:
+		if m.sessionApprovals[approvalKey(msg.request)] {
+			msg.response <- llm.ConfirmAllowSession
+			close(msg.response)
+			return m, nil
+		}
+
+		m.confirming = &pendingConfirmation{
+			request:       msg.request,
+			response:      msg.response,
+			selectedIndex: 0,
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.syncTextareaSize()
 		return m, nil
 	}
 
@@ -233,8 +459,10 @@ func (m model) View() string {
 	sb.WriteString("\n\n")
 
 	for _, line := range m.output {
-		if line == "yagent" {
-			sb.WriteString(m.style.assistant.Render(line))
+		if line == userOutputLabel {
+			sb.WriteString(m.style.user.Render("You"))
+		} else if line == assistantOutputLabel {
+			sb.WriteString(m.style.assistant.Render("yagent"))
 		} else if strings.HasPrefix(line, "────────") {
 			sb.WriteString(m.style.separator.Render(line))
 		} else {
@@ -243,15 +471,30 @@ func (m model) View() string {
 		sb.WriteString("\n")
 	}
 
-	if m.loading {
+	if m.loading && m.confirming == nil {
 		frame := loadingFrames[m.loadingFrame%len(loadingFrames)]
 		sb.WriteString(m.style.tool.Render(frame + " 処理中..."))
 		sb.WriteString("\n")
 	}
 
+	if m.confirming != nil {
+		cardWidth := m.width - 2
+		if cardWidth < 32 {
+			cardWidth = 32
+		}
+
+		path := trimPathFromEnd(m.confirming.request.FilePath, cardWidth-4)
+		card := strings.Join([]string{
+			m.style.permissionTitle.Render(m.confirming.request.Operation),
+			m.style.permissionPath.Render(path),
+			renderPermissionOptions(m.confirming.selectedIndex, m.style.permissionSelected, m.style.permissionOption),
+			m.style.permissionHelp.Render("←/→ または Tab で選択 • Enter で確定 • Esc で拒否"),
+		}, "\n")
+		sb.WriteString(m.style.permissionCard.Width(cardWidth).Render(card))
+		sb.WriteString("\n")
+	}
+
 	sb.WriteString("\n")
-	sb.WriteString(m.style.prompt.Render("❯"))
-	sb.WriteString(" ")
 	sb.WriteString(m.textarea.View())
 
 	return sb.String()
@@ -260,6 +503,26 @@ func (m model) View() string {
 func Run(client *llm.LLMClient) {
 	m := NewModel(client)
 	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	confirmFunc := func(request llm.ToolConfirmationRequest) llm.ToolConfirmationDecision {
+		response := make(chan llm.ToolConfirmationDecision, 1)
+		p.Send(toolConfirmationMsg{
+			request:  request,
+			response: response,
+		})
+
+		return <-response
+	}
+
+	if handler := client.GetToolHandler(); handler != nil {
+		if tool, ok := handler.GetRegistry().Get("file_reader").(*llm.FileReadTool); ok {
+			tool.WithConfirmFunc(confirmFunc)
+		}
+		if tool, ok := handler.GetRegistry().Get("file_writer").(*llm.FileWriterTool); ok {
+			tool.WithConfirmFunc(confirmFunc)
+		}
+	}
+
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "エラー：%v\n", err)
 		os.Exit(1)
