@@ -36,6 +36,72 @@ func TestPermissionRequestState(t *testing.T) {
 	}
 }
 
+func TestToolEventShowsActiveToolCard(t *testing.T) {
+	m := newTestModel(t)
+	modelValue, _ := m.Update(toolEventMsg{event: chatusecase.ToolEvent{
+		Phase: "start",
+		Call: domain.ToolCall{
+			Name: "fs_read",
+			Arguments: map[string]any{
+				"path":        "/tmp/a.txt",
+				"limit_bytes": 100.0,
+			},
+		},
+	}})
+
+	next := modelValue.(model)
+	if next.activeTool == nil {
+		t.Fatalf("active tool was not set")
+	}
+	card := next.renderToolCard()
+	if !strings.Contains(card, "fs_read") || !strings.Contains(card, "/tmp/a.txt") || !strings.Contains(card, "limit_bytes=100") {
+		t.Fatalf("unexpected tool card: %q", card)
+	}
+}
+
+func TestToolEventFinishAppendsToolLog(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.height = 30
+
+	modelValue, _ := m.Update(toolEventMsg{event: chatusecase.ToolEvent{
+		Phase: "finish",
+		Call: domain.ToolCall{
+			Name: "task_run",
+			Arguments: map[string]any{
+				"task_id": "go:test",
+			},
+		},
+		Result: domain.ToolResult{
+			Name:    "task_run",
+			Success: true,
+			Output:  "ok\n[stderr]\nwarn",
+		},
+	}})
+
+	next := modelValue.(model)
+	if !next.hasToolLogs() {
+		t.Fatalf("expected tool logs to be present")
+	}
+	card := next.renderToolLogCard()
+	if !strings.Contains(card, "Tool Logs") || !strings.Contains(card, "task_run") || !strings.Contains(card, "[stderr]") {
+		t.Fatalf("unexpected tool log card: %q", card)
+	}
+}
+
+func TestToolLogViewportHeightIsBounded(t *testing.T) {
+	m := newTestModel(t)
+	m.height = 18
+	if got := m.toolLogViewportHeight(); got < 6 {
+		t.Fatalf("expected minimum bounded height, got %d", got)
+	}
+
+	m.height = 80
+	if got := m.toolLogViewportHeight(); got > 14 {
+		t.Fatalf("expected maximum bounded height, got %d", got)
+	}
+}
+
 func TestViewportScrollKey(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 80

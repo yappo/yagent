@@ -10,6 +10,7 @@ import (
 type Config struct {
 	Server ServerConfig `toml:"server"`
 	File   FileConfig   `toml:"file"`
+	Agent  AgentConfig  `toml:"agent"`
 }
 
 type ServerConfig struct {
@@ -18,13 +19,18 @@ type ServerConfig struct {
 }
 
 type ServerTarget struct {
-	Name  string `toml:"name"`
-	URL   string `toml:"url"`
-	Token string `toml:"token"`
+	Name    string `toml:"name"`
+	URL     string `toml:"url"`
+	Token   string `toml:"token"`
+	Timeout int    `toml:"timeout"`
 }
 
 type FileConfig struct {
 	AllowPaths []string `toml:"allow_paths"`
+}
+
+type AgentConfig struct {
+	MaxIterations int `toml:"max_iterations"`
 }
 
 func Load(path string) (Config, error) {
@@ -51,13 +57,17 @@ func Default() Config {
 			Default: "default",
 			Servers: []ServerTarget{
 				{
-					Name: "default",
-					URL:  "http://localhost:1234",
+					Name:    "default",
+					URL:     "http://localhost:1234",
+					Timeout: 900,
 				},
 			},
 		},
 		File: FileConfig{
 			AllowPaths: []string{},
+		},
+		Agent: AgentConfig{
+			MaxIterations: 100,
 		},
 	}
 }
