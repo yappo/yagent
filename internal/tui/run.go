@@ -9,8 +9,8 @@ import (
 	chatusecase "yagent/internal/usecase/chat"
 )
 
-func Run(runner *chatusecase.Service, approver *ApproverBridge) error {
-	m := newModel(runner)
+func Run(runner *chatusecase.Service, approver *ApproverBridge, workingDir string) error {
+	m := newModel(runner, workingDir)
 	program := tea.NewProgram(m, tea.WithAltScreen())
 	approver.Attach(program)
 	if _, err := program.Run(); err != nil {

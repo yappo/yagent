@@ -12,5 +12,5 @@ func runTUI(configPath string) error {
 		return err
 	}
 
-	return tui.Run(container.ChatService, bridge)
+	return tui.Run(container.ChatService, bridge, container.WorkingDir)
 }

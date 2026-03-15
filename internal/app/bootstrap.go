@@ -15,6 +15,7 @@ import (
 type Container struct {
 	Config      config.Config
 	ChatService *chatusecase.Service
+	WorkingDir  string
 }
 
 func Build(configPath string, approver domain.Approver) (*Container, error) {
@@ -45,5 +46,6 @@ func Build(configPath string, approver domain.Approver) (*Container, error) {
 	return &Container{
 		Config:      cfg,
 		ChatService: chatusecase.NewService(client, tools, 20),
+		WorkingDir:  pwd,
 	}, nil
 }

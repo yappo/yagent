@@ -41,6 +41,8 @@ type slashCommand struct {
 
 type model struct {
 	runner           *chatusecase.Service
+	workingDir       string
+	selectedRefs     map[string]string
 	messages         []domain.Message
 	output           []string
 	loading          bool
@@ -94,7 +96,7 @@ const (
 	maxComposerHeight    = 6
 )
 
-func newModel(runner *chatusecase.Service) model {
+func newModel(runner *chatusecase.Service, workingDir string) model {
 	ta := textarea.New()
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行, Enter で送信, /exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
@@ -112,6 +114,8 @@ func newModel(runner *chatusecase.Service) model {
 
 	m := model{
 		runner:           runner,
+		workingDir:       workingDir,
+		selectedRefs:     map[string]string{},
 		viewport:         viewport.New(0, 0),
 		textarea:         ta,
 		history:          []string{},
@@ -176,8 +180,8 @@ func (m *model) syncLayout() {
 	}
 
 	footerHeight := lipgloss.Height(m.textarea.View()) + 1
-	if m.hasCommandCandidates() {
-		footerHeight += m.commandSuggestionsHeight()
+	if m.hasCompletionCandidates() {
+		footerHeight += m.completionSuggestionsHeight()
 	}
 	if m.permission != nil {
 		footerHeight += m.permissionCardHeight()
@@ -241,64 +245,6 @@ func approvalKey(request domain.PermissionRequest) string {
 
 func (m model) currentInput() string {
 	return strings.TrimSpace(m.textarea.Value())
-}
-
-func (m model) commandCandidates() []slashCommand {
-	input := m.currentInput()
-	if !strings.HasPrefix(input, "/") {
-		return nil
-	}
-
-	candidates := make([]slashCommand, 0, len(slashCommands))
-	for _, command := range slashCommands {
-		if strings.HasPrefix(command.name, input) {
-			candidates = append(candidates, command)
-		}
-	}
-
-	return candidates
-}
-
-func (m model) hasCommandCandidates() bool {
-	return len(m.commandCandidates()) > 0
-}
-
-func (m *model) applyCommandCompletion() {
-	candidates := m.commandCandidates()
-	if len(candidates) == 0 {
-		return
-	}
-
-	m.textarea.SetValue(candidates[0].name)
-	m.syncLayout()
-}
-
-func (m model) renderCommandSuggestions() string {
-	candidates := m.commandCandidates()
-	if len(candidates) == 0 {
-		return ""
-	}
-
-	lines := make([]string, 0, len(candidates)+1)
-	lines = append(lines, m.styles.commandHint.Render("候補コマンド: Tab で補完"))
-	for index, candidate := range candidates {
-		label := fmt.Sprintf("%s  %s", candidate.name, candidate.description)
-		if index == 0 {
-			lines = append(lines, m.styles.commandSelected.Render(label))
-			continue
-		}
-		lines = append(lines, m.styles.commandCandidate.Render(label))
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func (m model) commandSuggestionsHeight() int {
-	suggestions := m.renderCommandSuggestions()
-	if suggestions == "" {
-		return 0
-	}
-	return lipgloss.Height(suggestions)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -401,8 +347,8 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
 	case tea.KeyTab:
-		if m.hasCommandCandidates() {
-			m.applyCommandCompletion()
+		if m.hasCompletionCandidates() {
+			m.applyCompletion()
 			return m, nil
 		}
 		return m, nil
@@ -420,6 +366,7 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.historyIndex > 0 {
 			m.historyIndex--
 			m.textarea.SetValue(m.history[m.historyIndex])
+			m.reconcileSelectedRefs()
 			m.syncLayout()
 		}
 		return m, nil
@@ -435,10 +382,12 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.historyIndex = len(m.history)
 			m.textarea.Reset()
 		}
+		m.reconcileSelectedRefs()
 		m.syncLayout()
 		return m, nil
 	case tea.KeyCtrlJ:
 		m.textarea.InsertString("\n")
+		m.reconcileSelectedRefs()
 		m.syncLayout()
 		return m, nil
 	case tea.KeyEnter:
@@ -454,6 +403,7 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
+	m.reconcileSelectedRefs()
 	m.syncLayout()
 	return m, cmd
 }
@@ -492,12 +442,14 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 	m.history = append(m.history, input)
 	m.historyIndex = len(m.history)
+	normalized := normalizePromptReferences(input, m.selectedRefs)
 	m.messages = append(m.messages, domain.Message{
 		Role:    domain.RoleUser,
-		Content: input,
+		Content: normalized,
 	})
 	m.output = appendOutputBlock(m.output, userOutputLabel, input)
 	m.textarea.Reset()
+	m.selectedRefs = map[string]string{}
 	m.loading = true
 	m.loadingFrame = 0
 	m.syncLayout()
@@ -630,8 +582,8 @@ func (m model) View() string {
 		sb.WriteString(m.renderPermissionCard())
 		sb.WriteString("\n")
 	}
-	if m.hasCommandCandidates() {
-		sb.WriteString(m.renderCommandSuggestions())
+	if m.hasCompletionCandidates() {
+		sb.WriteString(m.renderCompletionSuggestions())
 		sb.WriteString("\n")
 	}
 	sb.WriteString("\n")
