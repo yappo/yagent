@@ -74,7 +74,7 @@ func NewModel(client *llm.LLMClient) model {
 	s.init()
 
 	ta := textarea.New()
-	ta.Placeholder = "質問を入力... (Ctrl+J で改行，Enter で送信)"
+	ta.Placeholder = "質問を入力... (Ctrl+J で改行，Enter で送信，/exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
 	ta.ShowLineNumbers = false
 	ta.Focus()
@@ -96,7 +96,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		case tea.KeyCtrlC:
+			fmt.Println("さようなら！")
 			return m, tea.Quit
 		case tea.KeyCtrlJ:
 			// Ctrl+J で改行
@@ -112,14 +113,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			trimmed := strings.TrimSpace(m.textarea.Value())
 			if strings.HasPrefix(trimmed, "/") {
 				switch trimmed {
-				case "/quit", "/exit":
+				case "/exit":
 					fmt.Println("さようなら！")
 					return m, tea.Quit
 				case "/help":
 					m.output = append(m.output, "コマンド:")
 					m.output = append(m.output, "  /help - このヘルプを表示")
 					m.output = append(m.output, "  /clear - チャット履歴をクリア")
-					m.output = append(m.output, "  /quit - 終了")
 					m.textarea.Reset()
 					return m, nil
 				case "/clear":
@@ -132,11 +132,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.textarea.Reset()
 					return m, nil
 				}
-			}
-
-			if strings.ToLower(trimmed) == "quit" || strings.ToLower(trimmed) == "exit" {
-				fmt.Println("さようなら！")
-				return m, tea.Quit
 			}
 
 			m.history = append(m.history, m.textarea.Value())
