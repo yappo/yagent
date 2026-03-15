@@ -34,6 +34,11 @@ type permissionOption struct {
 	decision domain.PermissionDecision
 }
 
+type slashCommand struct {
+	name        string
+	description string
+}
+
 type model struct {
 	runner           *chatusecase.Service
 	messages         []domain.Message
@@ -63,6 +68,9 @@ type styles struct {
 	permissionHelp     lipgloss.Style
 	permissionOption   lipgloss.Style
 	permissionSelected lipgloss.Style
+	commandHint        lipgloss.Style
+	commandCandidate   lipgloss.Style
+	commandSelected    lipgloss.Style
 }
 
 var loadingFrames = []string{"◐", "◓", "◑", "◒"}
@@ -71,6 +79,12 @@ var permissionOptions = []permissionOption{
 	{label: "今回だけ許可", decision: domain.PermissionAllowOnce},
 	{label: "このセッションで許可", decision: domain.PermissionAllowSession},
 	{label: "拒否", decision: domain.PermissionDeny},
+}
+
+var slashCommands = []slashCommand{
+	{name: "/help", description: "ヘルプを表示"},
+	{name: "/clear", description: "会話ログをクリア"},
+	{name: "/exit", description: "yagent を終了"},
 }
 
 const (
@@ -127,6 +141,13 @@ func defaultStyles() styles {
 			Background(lipgloss.Color("221")).
 			Bold(true).
 			Padding(0, 1),
+		commandHint:      lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
+		commandCandidate: lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		commandSelected: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("232")).
+			Background(lipgloss.Color("110")).
+			Bold(true).
+			Padding(0, 1),
 	}
 }
 
@@ -155,6 +176,9 @@ func (m *model) syncLayout() {
 	}
 
 	footerHeight := lipgloss.Height(m.textarea.View()) + 1
+	if m.hasCommandCandidates() {
+		footerHeight += m.commandSuggestionsHeight()
+	}
 	if m.permission != nil {
 		footerHeight += m.permissionCardHeight()
 	}
@@ -213,6 +237,68 @@ func appendOutputBlock(output []string, label, content string) []string {
 
 func approvalKey(request domain.PermissionRequest) string {
 	return request.ToolName + "\x00" + request.Resource
+}
+
+func (m model) currentInput() string {
+	return strings.TrimSpace(m.textarea.Value())
+}
+
+func (m model) commandCandidates() []slashCommand {
+	input := m.currentInput()
+	if !strings.HasPrefix(input, "/") {
+		return nil
+	}
+
+	candidates := make([]slashCommand, 0, len(slashCommands))
+	for _, command := range slashCommands {
+		if strings.HasPrefix(command.name, input) {
+			candidates = append(candidates, command)
+		}
+	}
+
+	return candidates
+}
+
+func (m model) hasCommandCandidates() bool {
+	return len(m.commandCandidates()) > 0
+}
+
+func (m *model) applyCommandCompletion() {
+	candidates := m.commandCandidates()
+	if len(candidates) == 0 {
+		return
+	}
+
+	m.textarea.SetValue(candidates[0].name)
+	m.syncLayout()
+}
+
+func (m model) renderCommandSuggestions() string {
+	candidates := m.commandCandidates()
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	lines := make([]string, 0, len(candidates)+1)
+	lines = append(lines, m.styles.commandHint.Render("候補コマンド: Tab で補完"))
+	for index, candidate := range candidates {
+		label := fmt.Sprintf("%s  %s", candidate.name, candidate.description)
+		if index == 0 {
+			lines = append(lines, m.styles.commandSelected.Render(label))
+			continue
+		}
+		lines = append(lines, m.styles.commandCandidate.Render(label))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m model) commandSuggestionsHeight() int {
+	suggestions := m.renderCommandSuggestions()
+	if suggestions == "" {
+		return 0
+	}
+	return lipgloss.Height(suggestions)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -314,6 +400,12 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
+	case tea.KeyTab:
+		if m.hasCommandCandidates() {
+			m.applyCommandCompletion()
+			return m, nil
+		}
+		return m, nil
 	case tea.KeyPgUp:
 		m.viewport.PageUp()
 		return m, nil
@@ -367,13 +459,22 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
-	switch input {
+	command, ok := findSlashCommand(input)
+	if !ok {
+		m.output = append(m.output, "不明なコマンドです。/help でヘルプを表示します")
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	}
+
+	switch command.name {
 	case "/exit":
 		return m, tea.Quit
 	case "/help":
 		m.output = append(m.output, "コマンド:")
-		m.output = append(m.output, "  /help - このヘルプを表示")
-		m.output = append(m.output, "  /clear - チャット履歴をクリア")
+		for _, slashCommand := range slashCommands {
+			m.output = append(m.output, fmt.Sprintf("  %s - %s", slashCommand.name, slashCommand.description))
+		}
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
@@ -383,12 +484,9 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
-	default:
-		m.output = append(m.output, "不明なコマンドです。/help でヘルプを表示します")
-		m.textarea.Reset()
-		m.syncLayout()
-		return m, nil
 	}
+
+	return m, nil
 }
 
 func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
@@ -511,6 +609,15 @@ func loadingTick() tea.Cmd {
 	})
 }
 
+func findSlashCommand(name string) (slashCommand, bool) {
+	for _, command := range slashCommands {
+		if command.name == name {
+			return command, true
+		}
+	}
+	return slashCommand{}, false
+}
+
 func (m model) View() string {
 	var sb strings.Builder
 	sb.WriteString(m.styles.hint.Render("入力： コマンド：/help, /clear, /exit | Alt+↑/↓ と PgUp/PgDn でログ"))
@@ -521,6 +628,10 @@ func (m model) View() string {
 	sb.WriteString("\n")
 	if m.permission != nil {
 		sb.WriteString(m.renderPermissionCard())
+		sb.WriteString("\n")
+	}
+	if m.hasCommandCandidates() {
+		sb.WriteString(m.renderCommandSuggestions())
 		sb.WriteString("\n")
 	}
 	sb.WriteString("\n")

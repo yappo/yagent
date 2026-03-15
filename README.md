@@ -58,6 +58,8 @@ allow_paths = ["/Users/you/Projects"]
 - `Ctrl+J`: 改行
 - `PgUp` / `PgDn`: ログスクロール
 - `Alt+↑` / `Alt+↓`: 1 行ずつログスクロール
+- `/` 入力中: 候補コマンドを表示
+- `Tab`: 先頭の候補コマンドを補完
 - `/help`: ヘルプ表示
 - `/clear`: 会話ログをクリア
 - `/exit`: 終了
