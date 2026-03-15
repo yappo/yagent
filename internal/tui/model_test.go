@@ -140,6 +140,73 @@ func TestViewShowsCommandCandidates(t *testing.T) {
 	}
 }
 
+func TestUpInMultilineComposerMovesCursorBeforeHistory(t *testing.T) {
+	m := newTestModel(t)
+	m.history = []string{"previous prompt"}
+	m.historyIndex = len(m.history)
+	m.textarea.SetValue("first line\nsecond line")
+
+	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	next := modelValue.(model)
+
+	if next.textarea.Value() != "first line\nsecond line" {
+		t.Fatalf("textarea value should stay in draft, got %q", next.textarea.Value())
+	}
+	if next.textarea.Line() != 0 {
+		t.Fatalf("cursor should move to first line, got line %d", next.textarea.Line())
+	}
+}
+
+func TestUpAtFirstLineFallsBackToHistory(t *testing.T) {
+	m := newTestModel(t)
+	m.history = []string{"previous prompt"}
+	m.historyIndex = len(m.history)
+	m.textarea.SetValue("first line\nsecond line")
+	m.textarea.CursorUp()
+
+	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	next := modelValue.(model)
+
+	if next.textarea.Value() != "previous prompt" {
+		t.Fatalf("expected history prompt, got %q", next.textarea.Value())
+	}
+}
+
+func TestDownInMultilineComposerMovesCursorBeforeHistory(t *testing.T) {
+	m := newTestModel(t)
+	m.history = []string{"previous prompt"}
+	m.historyIndex = 0
+	m.textarea.SetValue("first line\nsecond line")
+	m.textarea.CursorUp()
+
+	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next := modelValue.(model)
+
+	if next.textarea.Value() != "first line\nsecond line" {
+		t.Fatalf("textarea value should stay in draft, got %q", next.textarea.Value())
+	}
+	if next.textarea.Line() != 1 {
+		t.Fatalf("cursor should move to last line, got line %d", next.textarea.Line())
+	}
+}
+
+func TestDownAtLastLineFallsBackToHistoryBehavior(t *testing.T) {
+	m := newTestModel(t)
+	m.history = []string{"previous prompt"}
+	m.historyIndex = 0
+	m.textarea.SetValue("first line\nsecond line")
+
+	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next := modelValue.(model)
+
+	if next.textarea.Value() != "" {
+		t.Fatalf("expected composer reset after leaving history, got %q", next.textarea.Value())
+	}
+	if next.historyIndex != len(next.history) {
+		t.Fatalf("expected history index at end, got %d", next.historyIndex)
+	}
+}
+
 func TestPathCandidatesForRelativeFile(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {

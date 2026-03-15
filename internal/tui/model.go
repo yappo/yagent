@@ -363,6 +363,11 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollUp(1)
 			return m, nil
 		}
+		if m.textarea.Line() > 0 {
+			m.textarea.CursorUp()
+			m.syncLayout()
+			return m, nil
+		}
 		if m.historyIndex > 0 {
 			m.historyIndex--
 			m.textarea.SetValue(m.history[m.historyIndex])
@@ -373,6 +378,11 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyDown:
 		if msg.Alt {
 			m.viewport.ScrollDown(1)
+			return m, nil
+		}
+		if m.textarea.Line() < m.textarea.LineCount()-1 {
+			m.textarea.CursorDown()
+			m.syncLayout()
 			return m, nil
 		}
 		if m.historyIndex < len(m.history)-1 {
