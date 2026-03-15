@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
 
 	"yagent/internal/domain"
@@ -101,22 +101,25 @@ func newModel(runner *chatusecase.Service, workingDir string) model {
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行, Enter で送信, /exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
 	ta.ShowLineNumbers = false
-	ta.SetPromptFunc(2, func(line int) string {
-		if line == 0 {
+	ta.SetPromptFunc(2, func(info textarea.PromptInfo) string {
+		if info.LineNumber == 0 {
 			return "❯ "
 		}
 		return "  "
 	})
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
-	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
+	styles := ta.Styles()
+	styles.Focused.CursorLine = lipgloss.NewStyle()
+	styles.Blurred.CursorLine = lipgloss.NewStyle()
+	ta.SetStyles(styles)
 	ta.Focus()
+	ta.SetVirtualCursor(false)
 	ta.SetHeight(1)
 
 	m := model{
 		runner:           runner,
 		workingDir:       workingDir,
 		selectedRefs:     map[string]string{},
-		viewport:         viewport.New(0, 0),
+		viewport:         viewport.New(),
 		textarea:         ta,
 		history:          []string{},
 		sessionApprovals: map[string]bool{},
@@ -187,8 +190,8 @@ func (m *model) syncLayout() {
 		footerHeight += m.permissionCardHeight()
 	}
 	headerHeight := 3
-	m.viewport.Width = m.width
-	m.viewport.Height = maxInt(3, m.height-headerHeight-footerHeight)
+	m.viewport.SetWidth(m.width)
+	m.viewport.SetHeight(maxInt(3, m.height-headerHeight-footerHeight))
 	m.refreshViewport()
 }
 
@@ -199,7 +202,7 @@ func (m *model) refreshViewport() {
 
 func (m model) renderLog() string {
 	var sb strings.Builder
-	contentWidth := maxInt(1, m.viewport.Width)
+	contentWidth := maxInt(1, m.viewport.Width())
 
 	for _, line := range m.output {
 		switch {
@@ -304,24 +307,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.Type == tea.KeyCtrlC {
+	if msg.String() == "ctrl+c" {
 		m.resolvePermission(domain.PermissionDeny)
 		return m, tea.Quit
 	}
 
-	switch msg.Type {
-	case tea.KeyLeft, tea.KeyShiftTab:
+	switch msg.String() {
+	case "left", "shift+tab":
 		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex-1, len(permissionOptions))
 		m.syncLayout()
 		return m, nil
-	case tea.KeyRight, tea.KeyTab:
+	case "right", "tab":
 		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex+1, len(permissionOptions))
 		m.syncLayout()
 		return m, nil
-	case tea.KeyEnter:
+	case "enter":
 		m.resolvePermission(permissionOptions[m.permission.selectedIndex].decision)
 		return m, nil
-	case tea.KeyEsc:
+	case "esc":
 		m.resolvePermission(domain.PermissionDeny)
 		return m, nil
 	}
@@ -343,23 +346,23 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyCtrlC:
+	switch msg.String() {
+	case "ctrl+c":
 		return m, tea.Quit
-	case tea.KeyTab:
+	case "tab":
 		if m.hasCompletionCandidates() {
 			m.applyCompletion()
 			return m, nil
 		}
 		return m, nil
-	case tea.KeyPgUp:
+	case "pgup":
 		m.viewport.PageUp()
 		return m, nil
-	case tea.KeyPgDown:
+	case "pgdown":
 		m.viewport.PageDown()
 		return m, nil
-	case tea.KeyUp:
-		if msg.Alt {
+	case "up", "alt+up":
+		if msg.String() == "alt+up" {
 			m.viewport.ScrollUp(1)
 			return m, nil
 		}
@@ -375,8 +378,8 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.syncLayout()
 		}
 		return m, nil
-	case tea.KeyDown:
-		if msg.Alt {
+	case "down", "alt+down":
+		if msg.String() == "alt+down" {
 			m.viewport.ScrollDown(1)
 			return m, nil
 		}
@@ -395,12 +398,12 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.reconcileSelectedRefs()
 		m.syncLayout()
 		return m, nil
-	case tea.KeyCtrlJ:
+	case "ctrl+j":
 		m.textarea.InsertString("\n")
 		m.reconcileSelectedRefs()
 		m.syncLayout()
 		return m, nil
-	case tea.KeyEnter:
+	case "enter":
 		input := strings.TrimSpace(m.textarea.Value())
 		if input == "" {
 			return m, nil
@@ -580,23 +583,39 @@ func findSlashCommand(name string) (slashCommand, bool) {
 	return slashCommand{}, false
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
 	var sb strings.Builder
+	offsetY := 0
 	sb.WriteString(m.styles.hint.Render("入力： コマンド：/help, /clear, /exit | Alt+↑/↓ と PgUp/PgDn でログ"))
 	sb.WriteString("\n")
-	sb.WriteString(m.styles.separator.Render("───────────────────────────────────────────────────────────────────────"))
+	sb.WriteString(m.styles.separator.Render(strings.Repeat("─", maxInt(1, m.width))))
 	sb.WriteString("\n\n")
+	offsetY += 3
 	sb.WriteString(m.viewport.View())
+	offsetY += lipgloss.Height(m.viewport.View())
 	sb.WriteString("\n")
+	offsetY++
 	if m.permission != nil {
-		sb.WriteString(m.renderPermissionCard())
+		card := m.renderPermissionCard()
+		sb.WriteString(card)
 		sb.WriteString("\n")
+		offsetY += lipgloss.Height(card) + 1
 	}
 	if m.hasCompletionCandidates() {
-		sb.WriteString(m.renderCompletionSuggestions())
+		suggestions := m.renderCompletionSuggestions()
+		sb.WriteString(suggestions)
 		sb.WriteString("\n")
+		offsetY += lipgloss.Height(suggestions) + 1
 	}
 	sb.WriteString("\n")
+	offsetY++
 	sb.WriteString(m.textarea.View())
-	return sb.String()
+
+	view := tea.NewView(sb.String())
+	view.AltScreen = true
+	if cursor := m.textarea.Cursor(); cursor != nil {
+		cursor.Position.Y += offsetY
+		view.Cursor = cursor
+	}
+	return view
 }

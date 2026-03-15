@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"yagent/internal/domain"
 	chatusecase "yagent/internal/usecase/chat"
@@ -43,16 +43,16 @@ func TestViewportScrollKey(t *testing.T) {
 	m.output = appendOutputBlock(nil, assistantOutputLabel, strings.Repeat("a\n", 20))
 	m.syncLayout()
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
 	next := modelValue.(model)
-	if next.viewport.YOffset < 0 {
+	if next.viewport.YOffset() < 0 {
 		t.Fatalf("viewport offset should not be negative")
 	}
 }
 
 func TestRenderLogWrapsLongLines(t *testing.T) {
 	m := newTestModel(t)
-	m.viewport.Width = 10
+	m.viewport.SetWidth(10)
 	m.output = appendOutputBlock(nil, assistantOutputLabel, "aaaaaaaaaaaa")
 
 	rendered := m.renderLog()
@@ -85,7 +85,7 @@ func TestTabCompletesFirstCommandCandidate(t *testing.T) {
 	m := newTestModel(t)
 	m.textarea.SetValue("/he")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	next := modelValue.(model)
 	if next.textarea.Value() != "/help" {
 		t.Fatalf("expected /help, got %q", next.textarea.Value())
@@ -96,7 +96,7 @@ func TestTabDoesNothingWithoutCandidate(t *testing.T) {
 	m := newTestModel(t)
 	m.textarea.SetValue("/x")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	next := modelValue.(model)
 	if next.textarea.Value() != "/x" {
 		t.Fatalf("textarea value changed unexpectedly: %q", next.textarea.Value())
@@ -117,7 +117,7 @@ func TestPermissionTabDoesNotTriggerCommandCompletion(t *testing.T) {
 		selectedIndex: 0,
 	}
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	next := modelValue.(model)
 	if next.textarea.Value() != "/he" {
 		t.Fatalf("permission tab should not complete command: %q", next.textarea.Value())
@@ -131,7 +131,7 @@ func TestViewShowsCommandCandidates(t *testing.T) {
 	m.textarea.SetValue("/he")
 	m.syncLayout()
 
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(view, "候補: Tab で補完") {
 		t.Fatalf("expected command hint in view, got %q", view)
 	}
@@ -146,7 +146,7 @@ func TestUpInMultilineComposerMovesCursorBeforeHistory(t *testing.T) {
 	m.historyIndex = len(m.history)
 	m.textarea.SetValue("first line\nsecond line")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	next := modelValue.(model)
 
 	if next.textarea.Value() != "first line\nsecond line" {
@@ -164,7 +164,7 @@ func TestUpAtFirstLineFallsBackToHistory(t *testing.T) {
 	m.textarea.SetValue("first line\nsecond line")
 	m.textarea.CursorUp()
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	next := modelValue.(model)
 
 	if next.textarea.Value() != "previous prompt" {
@@ -179,7 +179,7 @@ func TestDownInMultilineComposerMovesCursorBeforeHistory(t *testing.T) {
 	m.textarea.SetValue("first line\nsecond line")
 	m.textarea.CursorUp()
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	next := modelValue.(model)
 
 	if next.textarea.Value() != "first line\nsecond line" {
@@ -196,7 +196,7 @@ func TestDownAtLastLineFallsBackToHistoryBehavior(t *testing.T) {
 	m.historyIndex = 0
 	m.textarea.SetValue("first line\nsecond line")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	next := modelValue.(model)
 
 	if next.textarea.Value() != "" {
@@ -301,7 +301,7 @@ func TestPathCompletionTabCompletesSingleFile(t *testing.T) {
 	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
 	m.textarea.SetValue("@R")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	next := modelValue.(model)
 	if next.textarea.Value() != "@README.md" {
 		t.Fatalf("expected @README.md, got %q", next.textarea.Value())
@@ -316,7 +316,7 @@ func TestPathCompletionTabCompletesDirectoryWithSlash(t *testing.T) {
 	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
 	m.textarea.SetValue("@l")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	next := modelValue.(model)
 	if next.textarea.Value() != "@lib/" {
 		t.Fatalf("expected @lib/, got %q", next.textarea.Value())
@@ -334,7 +334,7 @@ func TestPathCompletionTabUsesLongestCommonPrefix(t *testing.T) {
 	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
 	m.textarea.SetValue("@l")
 
-	modelValue, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	next := modelValue.(model)
 	if next.textarea.Value() != "@lib" {
 		t.Fatalf("expected @lib, got %q", next.textarea.Value())
