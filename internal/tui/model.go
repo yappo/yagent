@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"yagent/internal/domain"
 	chatusecase "yagent/internal/usecase/chat"
@@ -170,6 +171,8 @@ func (m *model) refreshViewport() {
 
 func (m model) renderLog() string {
 	var sb strings.Builder
+	contentWidth := maxInt(1, m.viewport.Width)
+
 	for _, line := range m.output {
 		switch {
 		case line == userOutputLabel:
@@ -177,20 +180,28 @@ func (m model) renderLog() string {
 		case line == assistantOutputLabel:
 			sb.WriteString(m.styles.assistant.Render("yagent"))
 		case strings.HasPrefix(line, "────────"):
-			sb.WriteString(m.styles.separator.Render(line))
+			sb.WriteString(m.styles.separator.Render(strings.Repeat("─", contentWidth)))
 		default:
-			sb.WriteString(line)
+			sb.WriteString(wrapContent(line, contentWidth))
 		}
 		sb.WriteString("\n")
 	}
 
 	if m.loading && m.permission == nil {
 		frame := loadingFrames[m.loadingFrame%len(loadingFrames)]
-		sb.WriteString(m.styles.tool.Render(frame + " 処理中..."))
+		sb.WriteString(m.styles.tool.Render(wrapContent(frame+" 処理中...", contentWidth)))
 		sb.WriteString("\n")
 	}
 
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+func wrapContent(content string, width int) string {
+	if width <= 0 {
+		return content
+	}
+
+	return runewidth.Wrap(content, width)
 }
 
 func appendOutputBlock(output []string, label, content string) []string {

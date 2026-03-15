@@ -42,3 +42,14 @@ func TestViewportScrollKey(t *testing.T) {
 		t.Fatalf("viewport offset should not be negative")
 	}
 }
+
+func TestRenderLogWrapsLongLines(t *testing.T) {
+	m := newModel(chatusecase.NewService(nil, nil, 1))
+	m.viewport.Width = 10
+	m.output = appendOutputBlock(nil, assistantOutputLabel, "aaaaaaaaaaaa")
+
+	rendered := m.renderLog()
+	if !strings.Contains(rendered, "aaaaaaaaaa\naa") {
+		t.Fatalf("expected wrapped content, got %q", rendered)
+	}
+}
