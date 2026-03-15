@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,16 +18,23 @@ type message struct {
 	role    string
 }
 
+type loadingTickMsg struct{}
+
 type model struct {
-	messages []llm.Message
-	output   []string
-	loading  bool
-	client   *llm.LLMClient
-	style    styles
-	textarea textarea.Model
-	history  []string
-	histIdx  int
+	messages     []llm.Message
+	output       []string
+	loading      bool
+	loadingFrame int
+	client       *llm.LLMClient
+	style        styles
+	textarea     textarea.Model
+	history      []string
+	histIdx      int
 }
+
+var loadingFrames = []string{"◐", "◓", "◑", "◒"}
+
+const loadingTickInterval = 100 * time.Millisecond
 
 type styles struct {
 	prompt    lipgloss.Style
@@ -92,6 +100,12 @@ func (m model) Init() tea.Cmd {
 	return textarea.Blink
 }
 
+func loadingTick() tea.Cmd {
+	return tea.Tick(loadingTickInterval, func(time.Time) tea.Msg {
+		return loadingTickMsg{}
+	})
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -142,6 +156,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 			m.textarea.Reset()
 			m.loading = true
+			m.loadingFrame = 0
 
 			toolDefinitions := m.client.GetToolHandler().GetRegistry().List()
 			request := llm.ChatRequest{
@@ -149,10 +164,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Tools:    toolDefinitions,
 			}
 
-			return m, func() tea.Msg {
+			sendCmd := func() tea.Msg {
 				content, err := m.client.SendChatWithTools(request, 20)
 				return message{content: content, err: err, role: "assistant"}
 			}
+
+			return m, tea.Batch(sendCmd, loadingTick())
 
 		case tea.KeyUp:
 			if m.histIdx > 0 {
@@ -175,6 +192,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
 		return m, cmd
+
+	case loadingTickMsg:
+		if !m.loading {
+			return m, nil
+		}
+
+		m.loadingFrame = (m.loadingFrame + 1) % len(loadingFrames)
+		return m, loadingTick()
 
 	case message:
 		m.loading = false
@@ -219,7 +244,8 @@ func (m model) View() string {
 	}
 
 	if m.loading {
-		sb.WriteString(m.style.tool.Render("処理中..."))
+		frame := loadingFrames[m.loadingFrame%len(loadingFrames)]
+		sb.WriteString(m.style.tool.Render(frame + " 処理中..."))
 		sb.WriteString("\n")
 	}
 
