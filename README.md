@@ -1,85 +1,35 @@
 # yagent
 
-LM Studio と連携するための CLI エージェントで、ローカルの AI モデルとのインタラクションを簡単に行うためのインターフェースを提供します。
-
-## 機能
-
-- LM Studio との CLI インターフェース
-- AI インタラクションのためのシンプルなコマンドラインインターフェース
-- インタラクティブな TUI モードでの対話
-- **Function Calling 対応** - OpenAI API の tools 機能に対応
-- **ファイル操作機能** - LLM の指示に応じてローカルファイルの読み書きを実行可能
+yagent は OpenAI 互換 API を使ってローカルまたはリモートの LLM と対話する、TUI 中心の AI coding agent です。  
+Bubble Tea / Bubbles を使った対話 UI、ツール呼び出し、ファイル操作の許可 UI、単発実行 CLI を備えています。
 
 ## 特徴
 
-### Function Calling (ツール機能)
+- `yagent --config <file>` でそのまま TUI 起動
+- `yagent exec --prompt ...` で単発実行
+- Bubble Tea / Bubbles ベースの TUI
+- OpenAI 互換の `chat/completions` API に対応
+- ツールレジストリ経由で file read / write を実行
+- Claude Code 風の permission UI
+- `internal/` ベースで責務分離した構成
 
-yagent は OpenAI API の Function Calling に対応しています。LLM が自動的にツールを呼び出し、ファイル操作を実行できます：
-
-- **ツール定義**: LLM に利用可能なツールを定義可能
-- **自動呼び出し**: LLM の判断でツールが自動的に呼び出される
-- **拡張可能**: クリーンアーキテクチャに基づき、簡単に新規ツールを追加可能
-
-### ファイル操作ツール
-
-ファイル操作は専用のツールとして実装されています：
-
-- **file_reader**: ファイル読み取りツール
-  - 指定したファイルの内容を読み取り、LLM に送信
-  - LLM の応答に基づいて追加の処理を実行
-  
-- **file_writer**: ファイル書き込みツール
-  - LLM が生成した内容を Markdown コードブロックから抽出し、ファイルに保存
-  - ユーザーの確認を得た後に実行
-
-### セキュリティ機能
-
-- **ユーザー確認**: ファイル操作前に必ずユーザーの確認を取得
-- **パス制限**: `config.toml` で許可するディレクトリを指定可能
-- **トラバーサル防止**: ディレクトリトラバーサル攻撃を防ぐための正規化処理
-
-## インストール
+## コマンド
 
 ```bash
-go install .
-```
-
-## 使用方法
-
-### TUI モード（対話モード）
-
-デフォルトで TUI モードが起動します：
-
-```bash
+# TUI を起動
 yagent
+
+# 設定ファイル付きで TUI を起動
+yagent --config ~/.yagent.toml
+
+# 明示的に TUI を起動
+yagent tui --config ~/.yagent.toml
+
+# 単発実行
+yagent exec --config ~/.yagent.toml --prompt "こんにちは"
 ```
 
-設定ファイルを使用する場合：
-
-```bash
-yagent --config config.toml
-```
-
-### LLM コマンド（単発クエリ）
-
-```bash
-yagent exec --prompt "質問内容" --config config.toml
-```
-
-### ファイル操作の例
-
-TUI モードで以下のように LLM に依頼すると、自動的にファイルが読み書きされます：
-
-```
-LLM: この内容を /Users/yappo/Projects/yagent-tmp/test.txt に書き込んでください：
-```
-```
-これはテストファイルです
-```
-
-### 設定ファイルのフォーマット
-
-TOML 形式で記述します：
+## 設定ファイル
 
 ```toml
 [server]
@@ -88,66 +38,89 @@ default = "lmstudio"
 [[server.servers]]
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
-token = "your-api-token"
+token = ""
 
-# ファイル操作の制限（オプション）
 [file]
-allowed_paths = ["/Users/yappo/Projects/yagent-tmp"]
+allow_paths = ["/Users/you/Projects"]
 ```
+
+### 設定項目
+
+- `server.default`: 使用するサーバー名
+- `server.servers`: 接続先一覧
+- `file.allow_paths`: ツールからアクセス可能なパス一覧
+
+起動時のカレントディレクトリは自動で許可パスに追加されます。
+
+## TUI 操作
+
+- `Enter`: 送信
+- `Ctrl+J`: 改行
+- `PgUp` / `PgDn`: ログスクロール
+- `Alt+↑` / `Alt+↓`: 1 行ずつログスクロール
+- `/help`: ヘルプ表示
+- `/clear`: 会話ログをクリア
+- `/exit`: 終了
+
+### Permission UI
+
+ファイル操作が必要なときは、下部に permission card を表示します。
+
+- `←/→` または `Tab`: 選択移動
+- `Enter`: 確定
+- `Esc`: 拒否
+
+選択肢:
+
+- 今回だけ許可
+- このセッションで許可
+- 拒否
+
+`このセッションで許可` は、同じツール・同じファイルに対してのみ再利用されます。
+
+## アーキテクチャ
+
+主要コードは `internal/` 配下にあります。
+
+```text
+internal/
+  app/       起動 wiring と依存解決
+  cli/       Cobra command 定義
+  config/    TOML 設定読込
+  domain/    中核型と interface
+  infra/     LLM client / tools 実装
+  tui/       Bubble Tea / Bubbles の UI
+  usecase/   会話実行ロジック
+```
+
+### ツール拡張
+
+ツールは `domain.Tool` を実装し、registry に登録します。
+
+現在の file read / write は `internal/infra/tools/file` にあります。  
+新しいツールを増やすときは、具体実装を `internal/infra/tools/<toolname>` に置き、`internal/app` の bootstrap で registry に登録してください。
 
 ## 開発
 
-### テストを実行
-
 ```bash
-go test ./...
-```
-
-### ビルド方法
-
-```bash
-./build.sh
-# または
+# ビルド
 go build -o yagent .
+
+# テスト
+go test ./...
+
+# 実行
+./yagent --config ~/.yagent.toml
 ```
 
-### 新規ツールの追加方法
+## テスト方針
 
-```go
-// ツールの実装
-type MyTool struct {}
-
-func (t *MyTool) Name() string { return "my_tool" }
-func (t *MyTool) Description() string { return "説明" }
-func (t *MyTool) Parameters() map[string]interface{} { return params }
-func (t *MyTool) Execute(ctx context.Context, args map[string]interface{}) *ToolOutput {
-    // 実装
-}
-
-// LLMClient に登録
-client := llm.NewLLMClient(baseURL, token)
-client.WithTools(&MyTool{})
-```
-
-### 実行例
-
-```bash
-# エージェントを実行 (TUI モード)
-yagent
-
-# LLM サーバーに質問を送信 (設定ファイルを使用)
-yagent exec --prompt "こんにちは" --config config.toml
-
-# インタラクティブな対話 (TUI モード)
-yagent --config config.toml
-```
-
-## 依存関係
-
-- [Cobra](https://github.com/spf13/cobra) - CLI フレームワーク
-- [Viper](https://github.com/spf13/viper) - 設定管理
-- [TOML](https://toml.io/) - 設定ファイル形式
+- `internal/config`: 設定読込テスト
+- `internal/infra/llm`: fake server を使った HTTP クライアントテスト
+- `internal/infra/tools`: file tool / registry のユニットテスト
+- `internal/usecase/chat`: tool loop を含む会話実行テスト
+- `internal/tui`: state transition と viewport / permission UI のテスト
 
 ## ライセンス
 
-MIT License
+MIT
