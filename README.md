@@ -63,7 +63,7 @@ yagent --config config.toml
 ### LLM コマンド（単発クエリ）
 
 ```bash
-yagent llm --prompt "質問内容" --config config.toml
+yagent exec --prompt "質問内容" --config config.toml
 ```
 
 ### ファイル操作の例
@@ -136,7 +136,7 @@ client.WithTools(&MyTool{})
 yagent
 
 # LLM サーバーに質問を送信 (設定ファイルを使用)
-yagent llm --prompt "こんにちは" --config config.toml
+yagent exec --prompt "こんにちは" --config config.toml
 
 # インタラクティブな対話 (TUI モード)
 yagent --config config.toml

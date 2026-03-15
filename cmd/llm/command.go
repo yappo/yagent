@@ -9,11 +9,10 @@ import (
 )
 
 var (
-	model      string
-	stream     bool
-	prompt     string
-	maxTokens  int
-	configFile string
+	model     string
+	stream    bool
+	prompt    string
+	maxTokens int
 )
 
 // Config represents the configuration structure
@@ -31,9 +30,9 @@ type Config struct {
 	} `toml:"file"`
 }
 
-// Command represents the llm command
+// Command represents the exec command
 var Command = &cobra.Command{
-	Use:   "llm",
+	Use:   "exec",
 	Short: "LLMサーバーとの通信機能",
 	Long:  `LM StudioなどのLLMサーバーと連携してAIとの対話機能を提供します`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -44,6 +43,7 @@ var Command = &cobra.Command{
 
 		var serverURL, token string
 		var client *LLMClient
+		configFile, _ := cmd.Flags().GetString("config")
 
 		if configFile != "" {
 			// 設定ファイルから読み込み
@@ -120,7 +120,6 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func init() {
-	Command.Flags().StringVar(&configFile, "config", "", "設定ファイルのパス")
 	Command.Flags().StringVar(&model, "model", "", "使用するモデル名")
 	Command.Flags().BoolVar(&stream, "stream", false, "ストリーミング応答を有効にする")
 	Command.Flags().StringVar(&prompt, "prompt", "", "AIに送信するプロンプト")
