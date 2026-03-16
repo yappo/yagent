@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"yagent/internal/domain"
 )
@@ -116,6 +117,15 @@ func (e *Engine) Evaluate(_ context.Context, call domain.ToolCall) (domain.Polic
 		req.Resource = req.Scope
 		req.SideEffects = []string{"process_spawn"}
 		req.Summary = "登録済みタスクを実行します"
+	case "task_bind":
+		req.Operation = "MCP server bind"
+		req.Action = "spawn"
+		req.ResourceKind = "mcp_server"
+		req.Risk = "high"
+		req.Scope = stringValue(call.Arguments["task_id"])
+		req.Resource = req.Scope
+		req.SideEffects = []string{"process_spawn"}
+		req.Summary = "登録済み MCP server を起動して bind します"
 	case "git_status", "git_diff", "git_log", "git_show":
 		req.Operation = "Git 情報取得"
 		req.Action = "git_read"
@@ -128,6 +138,17 @@ func (e *Engine) Evaluate(_ context.Context, call domain.ToolCall) (domain.Polic
 	case "task_list":
 		return domain.PolicyAllow, req, nil
 	default:
+		if strings.HasPrefix(call.Name, "mcp__") {
+			req.Operation = "MCP tool 実行"
+			req.Action = "mcp_call"
+			req.ResourceKind = "mcp_tool"
+			req.Risk = "high"
+			req.Scope = call.Name
+			req.Resource = call.Name
+			req.SideEffects = []string{"llm_disclosure", "external_tool_call"}
+			req.Summary = "bind 済み MCP tool を実行します"
+			break
+		}
 		return domain.PolicyDeny, req, fmt.Errorf("未対応の policy tool です: %s", call.Name)
 	}
 

@@ -7,6 +7,11 @@ type Tool interface {
 	Execute(context.Context, ToolCall) ToolResult
 }
 
+type DynamicToolProvider interface {
+	Definitions(AgentSpec) []ToolDefinition
+	Execute(context.Context, AgentSpec, ToolCall) (ToolResult, bool)
+}
+
 type ToolExecutor interface {
 	Definitions(agent AgentSpec) []ToolDefinition
 	Execute(context.Context, AgentSpec, ToolCall) ToolResult

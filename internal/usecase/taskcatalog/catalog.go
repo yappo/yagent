@@ -22,7 +22,8 @@ type Catalog struct {
 }
 
 type tasksFile struct {
-	Tasks []taskEntry `toml:"tasks"`
+	Tasks      []taskEntry      `toml:"tasks"`
+	MCPServers []mcpServerEntry `toml:"mcpservers"`
 }
 
 type taskEntry struct {
@@ -34,6 +35,23 @@ type taskEntry struct {
 	Risk         string   `toml:"risk"`
 	AllowNetwork bool     `toml:"allow_network"`
 	Timeout      int      `toml:"timeout"`
+}
+
+type mcpServerEntry struct {
+	ID           string            `toml:"id"`
+	Description  string            `toml:"description"`
+	Transport    string            `toml:"transport"`
+	Command      string            `toml:"command"`
+	Args         []string          `toml:"args"`
+	Cwd          string            `toml:"cwd"`
+	Env          map[string]string `toml:"env"`
+	Risk         string            `toml:"risk"`
+	AllowNetwork bool              `toml:"allow_network"`
+	Timeout      int               `toml:"timeout"`
+	ToolPrefix   string            `toml:"tool_prefix"`
+	ParallelSafe bool              `toml:"parallel_safe"`
+	IncludeTools []string          `toml:"include_tools"`
+	ExcludeTools []string          `toml:"exclude_tools"`
 }
 
 func New(workDir string) (*Catalog, error) {
@@ -106,14 +124,54 @@ func loadFile(path string, baseDir string) ([]domain.TaskDefinition, error) {
 			cwd = filepath.Join(baseDir, cwd)
 		}
 		result = append(result, domain.TaskDefinition{
-			ID:           entry.ID,
-			Description:  entry.Description,
-			Command:      entry.Command,
-			Args:         append([]string(nil), entry.Args...),
-			Cwd:          cwd,
-			Risk:         normalizeRisk(entry.Risk),
-			AllowNetwork: entry.AllowNetwork,
-			Timeout:      entry.Timeout,
+			ID:          entry.ID,
+			Description: entry.Description,
+			Kind:        domain.TaskKindCommand,
+			Command: &domain.CommandTaskSpec{
+				Command:      entry.Command,
+				Args:         append([]string(nil), entry.Args...),
+				Cwd:          cwd,
+				Risk:         normalizeRisk(entry.Risk),
+				AllowNetwork: entry.AllowNetwork,
+				Timeout:      entry.Timeout,
+			},
+			Source: path,
+		})
+	}
+	for _, entry := range decoded.MCPServers {
+		cwd := entry.Cwd
+		if cwd == "" {
+			cwd = baseDir
+		} else if !filepath.IsAbs(cwd) {
+			cwd = filepath.Join(baseDir, cwd)
+		}
+		transport := domain.MCPTransport(entry.Transport)
+		if transport == "" {
+			transport = domain.MCPTransportStdio
+		}
+		toolPrefix := entry.ToolPrefix
+		if toolPrefix == "" {
+			toolPrefix = entry.ID
+		}
+		result = append(result, domain.TaskDefinition{
+			ID:          entry.ID,
+			Description: entry.Description,
+			Kind:        domain.TaskKindMCPServer,
+			MCPServer: &domain.MCPServerSpec{
+				Transport:    transport,
+				Command:      entry.Command,
+				Args:         append([]string(nil), entry.Args...),
+				Cwd:          cwd,
+				Env:          cloneEnv(entry.Env),
+				Risk:         normalizeRisk(entry.Risk),
+				AllowNetwork: entry.AllowNetwork,
+				Timeout:      entry.Timeout,
+				ToolPrefix:   toolPrefix,
+				ParallelSafe: entry.ParallelSafe,
+				IncludeTools: append([]string(nil), entry.IncludeTools...),
+				ExcludeTools: append([]string(nil), entry.ExcludeTools...),
+			},
+			Source: path,
 		})
 	}
 	return result, nil
@@ -163,14 +221,18 @@ func detectTemplates(workDir string) []domain.TaskDefinition {
 
 func task(id, desc, command string, args []string, cwd, risk string, allowNetwork bool, timeout int) domain.TaskDefinition {
 	return domain.TaskDefinition{
-		ID:           id,
-		Description:  desc,
-		Command:      command,
-		Args:         append([]string(nil), args...),
-		Cwd:          cwd,
-		Risk:         normalizeRisk(risk),
-		AllowNetwork: allowNetwork,
-		Timeout:      timeout,
+		ID:          id,
+		Description: desc,
+		Kind:        domain.TaskKindCommand,
+		Command: &domain.CommandTaskSpec{
+			Command:      command,
+			Args:         append([]string(nil), args...),
+			Cwd:          cwd,
+			Risk:         normalizeRisk(risk),
+			AllowNetwork: allowNetwork,
+			Timeout:      timeout,
+		},
+		Source: "template",
 	}
 }
 
@@ -186,4 +248,15 @@ func normalizeRisk(risk string) string {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func cloneEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(env))
+	for key, value := range env {
+		cloned[key] = value
+	}
+	return cloned
 }

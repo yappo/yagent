@@ -218,6 +218,71 @@ func TestRunTurnSupportsEphemeralAgent(t *testing.T) {
 	}
 }
 
+func TestRunTurnSeesBoundMCPToolsOnLaterTurn(t *testing.T) {
+	seenBoundTool := false
+	var executor *fakeToolExecutor
+	executor = &fakeToolExecutor{
+		defs: map[string][]domain.ToolDefinition{
+			"manager": {
+				{Name: "task_bind", Parameters: map[string]any{"type": "object"}},
+			},
+		},
+		exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+			if call.Name == "task_bind" {
+				executor.defs["manager"] = append(executor.defs["manager"], domain.ToolDefinition{
+					Name:       "mcp__docs__search_docs__docs",
+					Parameters: map[string]any{"type": "object"},
+				})
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "bound"}
+			}
+			return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "ok"}
+		},
+	}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{
+							ID:        "1",
+							Name:      "task_bind",
+							Arguments: map[string]any{"task_id": "docs"},
+						}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				for _, tool := range request.Tools {
+					if tool.Name == "mcp__docs__search_docs__docs" {
+						seenBoundTool = true
+					}
+				}
+			},
+		},
+		executor,
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "bind docs"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "done" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if !seenBoundTool {
+		t.Fatal("expected bound MCP tool to appear on a later LLM turn")
+	}
+}
+
 func TestToolMessageCarriesToolCallID(t *testing.T) {
 	msg := toolMessage(domain.ToolCall{
 		ID:                 "call-123",

@@ -18,7 +18,8 @@ Bubble Tea / Bubbles を使った対話 UI、permission UI、tool call UI、単�
 - Claude Code 風の permission UI
 - `--log <path>` による JSON Lines イベントログ
 - `execution.max_parallel_agents` による並列実行制御 (`min = 1`)
-- `task_list` / `task_run` による安全寄りの Task Catalog
+- `task_list` / `task_run` / `task_bind` による安全寄りの Task Catalog
+- `tasks.toml` の `[[mcpservers]]` と遅延 bind による MCP 連携
 - `internal/` ベースで責務分離した構成
 
 ## コマンド
@@ -158,7 +159,7 @@ built-in agent の基本セットは最初から使えますが、追加の DSL 
 
 ## Task Catalog (`tasks.toml`)
 
-`task_list` / `task_run` で見える task は、自由なシェルコマンドではなく、事前登録した task だけを実行する仕組みです。  
+`task_list` / `task_run` / `task_bind` で見える task は、自由なシェルコマンドではなく、事前登録した command task と MCP server task を扱う仕組みです。  
 その登録ファイルが `tasks.toml` です。
 
 置き場所は次の 2 つです。
@@ -227,6 +228,45 @@ timeout = 600
 
 `cwd` を相対パスで書いた場合は、現在の作業リポジトリを基準に解決されます。  
 まずは `description` を人間が見て分かる文にしておくと、`task_list` の一覧がかなり使いやすくなります。
+
+### MCP Server Catalog (`[[mcpservers]]`)
+
+同じ `tasks.toml` 内に、MCP server を `[[mcpservers]]` として登録できます。  
+MCP server は `task_run` ではなく `task_bind` で起動・bind します。bind 後にだけ、その server の tool が `mcp__...` 形式で LLM に公開されます。
+
+```toml
+[[mcpservers]]
+id = "docs"
+description = "Docs search MCP"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@example/docs-mcp"]
+tool_prefix = "docs"
+parallel_safe = false
+include_tools = ["search_docs"]
+```
+
+主な項目の意味:
+
+- `id`: MCP server の識別子。`task_bind` ではこの ID を指定します
+- `description`: 人間や agent が `task_list` で読む説明
+- `transport`: 現在は `stdio` のみ対応
+- `command`: MCP server を起動するコマンド本体
+- `args`: コマンド引数の配列
+- `cwd`: 実行ディレクトリ。省略時は現在のリポジトリ root
+- `env`: 追加環境変数
+- `risk`: `low` / `medium` / `high`
+- `allow_network`: ネットワーク利用を伴う server かどうか
+- `timeout`: タイムアウト秒数
+- `tool_prefix`: bind 後の tool 名プレフィックス。未指定時は `id`
+- `parallel_safe`: true のときだけ orchestrator が並列実行候補として扱います
+- `include_tools` / `exclude_tools`: 公開する MCP tool のフィルタ
+
+典型的な流れ:
+
+1. `task_list` で `kind = "mcp_server"` の entry を確認
+2. `task_bind` で対象 server を bind
+3. bind 後に追加された `mcp__...` tool を agent が利用
 
 ## 実行ログ
 
@@ -353,10 +393,10 @@ internal/
 - `fs_read` / `fs_write` / `fs_list` / `fs_stat` / `fs_remove` / `fs_move`
 - `search_text` / `search_files`
 - `git_status` / `git_diff` / `git_log` / `git_show`
-- `task_list` / `task_run`
+- `task_list` / `task_run` / `task_bind`
 - `patch_apply`
 
-Task catalog は `.yagent/tasks.toml` と自動検出テンプレートから構築されます。
+Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。
 
 ## 開発
 

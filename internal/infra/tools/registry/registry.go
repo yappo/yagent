@@ -10,7 +10,8 @@ import (
 )
 
 type Registry struct {
-	tools map[string]domain.Tool
+	tools     map[string]domain.Tool
+	providers []domain.DynamicToolProvider
 }
 
 func New(tools ...domain.Tool) *Registry {
@@ -23,6 +24,10 @@ func New(tools ...domain.Tool) *Registry {
 
 func (r *Registry) Register(tool domain.Tool) {
 	r.tools[tool.Definition().Name] = tool
+}
+
+func (r *Registry) RegisterProvider(provider domain.DynamicToolProvider) {
+	r.providers = append(r.providers, provider)
 }
 
 func (r *Registry) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
@@ -39,10 +44,21 @@ func (r *Registry) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 	for _, name := range names {
 		definitions = append(definitions, r.tools[name].Definition())
 	}
+	for _, provider := range r.providers {
+		definitions = append(definitions, provider.Definitions(agent)...)
+	}
+	sort.Slice(definitions, func(i, j int) bool {
+		return definitions[i].Name < definitions[j].Name
+	})
 	return definitions
 }
 
 func (r *Registry) Execute(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+	for _, provider := range r.providers {
+		if result, ok := provider.Execute(ctx, agent, call); ok {
+			return result
+		}
+	}
 	if !isAllowed(agent, call.Name) {
 		return domain.ToolResult{
 			CallID:  call.ID,
@@ -72,6 +88,9 @@ func isAllowed(agent domain.AgentSpec, toolName string) bool {
 	}
 	for _, allowed := range agent.AllowedTools {
 		if allowed == toolName {
+			return true
+		}
+		if len(allowed) > 1 && allowed[len(allowed)-1] == '*' && len(toolName) >= len(allowed)-1 && toolName[:len(allowed)-1] == allowed[:len(allowed)-1] {
 			return true
 		}
 	}

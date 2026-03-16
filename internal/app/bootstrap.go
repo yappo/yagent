@@ -10,9 +10,11 @@ import (
 	agentcatalog "yagent/internal/infra/agents/catalog"
 	infraLLM "yagent/internal/infra/llm"
 	"yagent/internal/infra/logging"
+	mcpstdio "yagent/internal/infra/mcp/stdio"
 	"yagent/internal/infra/policy"
 	fstools "yagent/internal/infra/tools/fs"
 	gittools "yagent/internal/infra/tools/git"
+	mcptools "yagent/internal/infra/tools/mcp"
 	patchtools "yagent/internal/infra/tools/patch"
 	"yagent/internal/infra/tools/registry"
 	searchtools "yagent/internal/infra/tools/search"
@@ -66,6 +68,7 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 	if err != nil {
 		return nil, err
 	}
+	mcpBindings := taskcatalog.NewMCPBindings(mcpstdio.NewFactory())
 
 	tools := registry.New(
 		fstools.NewReadTool(pathPolicy, policyEngine, approver),
@@ -80,10 +83,12 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 		gittools.NewDiffTool(pathPolicy, policyEngine, approver),
 		gittools.NewLogTool(pathPolicy, policyEngine, approver),
 		gittools.NewShowTool(pathPolicy, policyEngine, approver),
-		tasktools.NewListTool(taskCatalog),
+		tasktools.NewListTool(taskCatalog, mcpBindings),
 		tasktools.NewRunTool(taskCatalog, policyEngine, approver),
+		tasktools.NewBindTool(taskCatalog, mcpBindings, policyEngine, approver),
 		patchtools.New(pathPolicy, policyEngine, approver),
 	)
+	tools.RegisterProvider(mcptools.NewProvider(mcpBindings, policyEngine, approver))
 
 	agents := agentcatalog.New(cfg.Agents)
 	if err := agents.LoadUserAgents(cfg.AgentCatalog.Paths); err != nil {
