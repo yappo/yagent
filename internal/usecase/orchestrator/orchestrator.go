@@ -573,9 +573,10 @@ func childMessages(call domain.ToolCall) []domain.Message {
 
 func toolMessage(call domain.ToolCall, output string) domain.Message {
 	return domain.Message{
-		Role:    domain.RoleTool,
-		Content: output,
-		AgentID: call.RequestedByAgentID,
+		Role:       domain.RoleTool,
+		Content:    output,
+		ToolCallID: call.ID,
+		AgentID:    call.RequestedByAgentID,
 		Metadata: map[string]string{
 			"tool_name": call.Name,
 		},

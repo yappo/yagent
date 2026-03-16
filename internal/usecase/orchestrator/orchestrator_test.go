@@ -218,6 +218,21 @@ func TestRunTurnSupportsEphemeralAgent(t *testing.T) {
 	}
 }
 
+func TestToolMessageCarriesToolCallID(t *testing.T) {
+	msg := toolMessage(domain.ToolCall{
+		ID:                 "call-123",
+		Name:               "directory_list",
+		RequestedByAgentID: "manager",
+	}, "output")
+
+	if msg.Role != domain.RoleTool {
+		t.Fatalf("unexpected role: %s", msg.Role)
+	}
+	if msg.ToolCallID != "call-123" {
+		t.Fatalf("expected tool call id, got %+v", msg)
+	}
+}
+
 func TestRunTurnUsesConfigDefaultModelWhenRequestAndAgentAreEmpty(t *testing.T) {
 	var gotModel string
 	service := New(

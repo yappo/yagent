@@ -26,6 +26,7 @@ type Message struct {
 	Role      Role
 	Content   string
 	ToolCalls []ToolCall
+	ToolCallID string
 	AgentID   string
 	Metadata  map[string]string
 }

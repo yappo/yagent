@@ -39,9 +39,10 @@ type chatRequestDTO struct {
 }
 
 type messageDTO struct {
-	Role      string        `json:"role"`
-	Content   string        `json:"content"`
-	ToolCalls []toolCallDTO `json:"tool_calls,omitempty"`
+	Role       string        `json:"role"`
+	Content    string        `json:"content"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	ToolCalls  []toolCallDTO `json:"tool_calls,omitempty"`
 }
 
 type toolCallDTO struct {
@@ -158,8 +159,9 @@ func toChatRequestDTO(request domain.ModelRequest) chatRequestDTO {
 
 func toMessageDTO(message domain.Message) messageDTO {
 	dto := messageDTO{
-		Role:    string(message.Role),
-		Content: message.Content,
+		Role:       string(message.Role),
+		Content:    message.Content,
+		ToolCallID: message.ToolCallID,
 	}
 	if len(message.ToolCalls) == 0 {
 		return dto
@@ -185,8 +187,9 @@ func toMessageDTO(message domain.Message) messageDTO {
 
 func fromMessageDTO(message messageDTO) domain.Message {
 	result := domain.Message{
-		Role:    domain.Role(message.Role),
-		Content: message.Content,
+		Role:       domain.Role(message.Role),
+		Content:    message.Content,
+		ToolCallID: message.ToolCallID,
 	}
 	if len(message.ToolCalls) == 0 {
 		return result
