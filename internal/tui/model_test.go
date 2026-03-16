@@ -193,12 +193,12 @@ func TestToolEventFinishAppendsToolLog(t *testing.T) {
 func TestToolLogViewportHeightIsBounded(t *testing.T) {
 	m := newTestModel(t)
 	m.height = 18
-	if got := m.toolLogViewportHeight(); got < 6 {
+	if got := m.toolLogViewportHeight(); got < 4 {
 		t.Fatalf("expected minimum bounded height, got %d", got)
 	}
 
 	m.height = 80
-	if got := m.toolLogViewportHeight(); got > 14 {
+	if got := m.toolLogViewportHeight(); got > 10 {
 		t.Fatalf("expected maximum bounded height, got %d", got)
 	}
 }
@@ -418,6 +418,22 @@ func TestStatusAndChatShowMetrics(t *testing.T) {
 	view := m.renderMainPanels()
 	if !strings.Contains(view, "elapsed") || !strings.Contains(view, "ctx 3") {
 		t.Fatalf("expected metrics in panes, got %q", view)
+	}
+	if strings.Contains(view, "Agent Status  elapsed") {
+		t.Fatalf("expected status title to stay compact, got %q", view)
+	}
+}
+
+func TestWideLayoutGivesStatusPaneMoreWidth(t *testing.T) {
+	chatWidth, statusWidth, stacked := layoutWidths(140)
+	if stacked {
+		t.Fatal("expected wide layout not to stack")
+	}
+	if statusWidth < 58 {
+		t.Fatalf("expected wider status pane, got %d", statusWidth)
+	}
+	if chatWidth <= statusWidth {
+		t.Fatalf("expected chat pane to remain wider, got chat=%d status=%d", chatWidth, statusWidth)
 	}
 }
 

@@ -930,14 +930,14 @@ func (m model) hasToolLogs() bool {
 
 func (m model) toolLogViewportHeight() int {
 	if m.height <= 0 {
-		return 8
+		return 5
 	}
-	height := (m.height - 8) / 3
-	if height < 6 {
-		height = 6
+	height := (m.height*30)/100 - 4
+	if height < 4 {
+		height = 4
 	}
-	if height > 14 {
-		height = 14
+	if height > 10 {
+		height = 10
 	}
 	return height
 }
@@ -1184,9 +1184,6 @@ func (m model) renderMainPanels() string {
 		Width(maxInt(1, m.viewport.Width()+paneHorizontalFrame)).
 		Render(chatTitle + "\n" + m.viewport.View())
 	statusTitle := "Agent Status"
-	if metrics := m.currentRunMetrics(); metrics != "" {
-		statusTitle += "  " + metrics
-	}
 	statusPane := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
@@ -1207,6 +1204,9 @@ func (m model) renderStatus() string {
 	}
 
 	var lines []string
+	if metrics := m.currentRunMetrics(); metrics != "" {
+		lines = append(lines, metrics)
+	}
 	lines = append(lines, fmt.Sprintf("running %d  done %d  failed %d", m.countStatus("running", "working", "thinking"), m.countStatus("done"), m.countStatus("failed")))
 	lines = append(lines, "")
 
@@ -1301,8 +1301,8 @@ func layoutWidths(totalWidth int) (int, int, bool) {
 	if totalWidth < 110 {
 		return maxInt(1, totalWidth), maxInt(1, totalWidth), true
 	}
-	statusWidth := minInt(42, maxInt(30, totalWidth/3))
-	chatWidth := maxInt(40, totalWidth-statusWidth-1)
+	statusWidth := minInt(58, maxInt(36, (totalWidth*3)/7))
+	chatWidth := maxInt(44, totalWidth-statusWidth-1)
 	return chatWidth, statusWidth, false
 }
 
