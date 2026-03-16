@@ -53,6 +53,7 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = ""
+model = "gpt-5"
 timeout = "20m"
 
 [file]
@@ -77,6 +78,7 @@ instruction = "Review for regressions first."
 
 - `server.default`: 使用するサーバー名
 - `server.servers`: 接続先一覧
+- `server.servers[].model`: そのサーバーを使うときの既定 model。CLI の `--model` や agent override がなければこれが使われます
 - `server.servers[].timeout`: LLM client の HTTP timeout。未設定時は `20m`
 - `file.allow_paths`: ツールからアクセス可能なパス一覧
 - `execution.max_parallel_agents`: 並列実行する subagent 数の上限。`1` で逐次実行
@@ -87,6 +89,12 @@ instruction = "Review for regressions first."
 - `agents.<id>.model`: built-in agent のモデル上書き
 - `agents.<id>.allowed_tools`: built-in agent の tool allowlist 上書き
 - `agents.<id>.disabled`: built-in agent の無効化
+
+model の優先順は次です。
+
+- `agents.<id>.model`
+- リクエスト時の `--model`
+- `server.servers[].model`
 
 起動時のカレントディレクトリは自動で許可パスに追加されます。
 

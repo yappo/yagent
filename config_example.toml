@@ -5,17 +5,25 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = "your-api-token"
-# 秒単位の HTTP タイムアウト。未指定時は 900 (15 分)
-timeout = 900
+model = "gpt-5"
+# 文字列の duration 形式。未指定時は 20m
+timeout = "20m"
 
 [file]
 # ファイル操作の許可範囲を設定
 # 例: allow_paths = ["/home/user/project", "/tmp"]
 allow_paths = []
 
-[agent]
-# LLM と tool loop の最大反復回数
-max_iterations = 100
+[execution]
+max_parallel_agents = 2
+max_handoff_depth = 2
+default_timeout = "120s"
+
+[agent_catalog]
+paths = []
+
+[agents.coder]
+model = "gpt-5"
 
 # task はこの config.toml には書きません。
 # task を使う場合は、別ファイルとして次のどちらかを作成します。

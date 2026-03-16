@@ -102,6 +102,7 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 			MaxParallelAgents: cfg.Execution.MaxParallelAgents,
 			MaxHandoffDepth:   cfg.Execution.MaxHandoffDepth,
 			DefaultTimeout:    cfg.Execution.DefaultTimeout.Duration,
+			DefaultModel:      server.Model,
 			TraceSink:         logger,
 			Approver:          approver,
 		}),

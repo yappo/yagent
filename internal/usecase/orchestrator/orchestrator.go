@@ -17,6 +17,7 @@ type Config struct {
 	MaxParallelAgents int
 	MaxHandoffDepth   int
 	DefaultTimeout    time.Duration
+	DefaultModel      string
 	TraceSink         domain.TraceSink
 	Approver          domain.Approver
 }
@@ -148,7 +149,7 @@ func (s *Service) runAgent(ctx context.Context, invocation domain.AgentInvocatio
 				Agent:        invocation.Agent,
 				Instructions: invocation.Agent.Instruction,
 				Messages:     messages,
-				Model:        modelName(invocation),
+				Model:        s.modelName(invocation),
 				Stream:       invocation.Stream,
 				Tools:        tools,
 			})
@@ -605,11 +606,14 @@ func handoffToolName(id string) string {
 	return "handoff_to_" + id
 }
 
-func modelName(invocation domain.AgentInvocation) string {
+func (s *Service) modelName(invocation domain.AgentInvocation) string {
 	if invocation.Agent.Model != "" {
 		return invocation.Agent.Model
 	}
-	return invocation.Model
+	if invocation.Model != "" {
+		return invocation.Model
+	}
+	return s.config.DefaultModel
 }
 
 func (s *Service) resolveModel(agent domain.AgentSpec, model string) domain.AgentSpec {

@@ -218,6 +218,101 @@ func TestRunTurnSupportsEphemeralAgent(t *testing.T) {
 	}
 }
 
+func TestRunTurnUsesConfigDefaultModelWhenRequestAndAgentAreEmpty(t *testing.T) {
+	var gotModel string
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				gotModel = request.Model
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DefaultModel: "gpt-5"},
+	)
+
+	_, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if gotModel != "gpt-5" {
+		t.Fatalf("expected default model to be used, got %q", gotModel)
+	}
+}
+
+func TestRunTurnPrefersRequestModelOverConfigDefault(t *testing.T) {
+	var gotModel string
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				gotModel = request.Model
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DefaultModel: "gpt-5"},
+	)
+
+	_, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+		Model:    "gpt-5-mini",
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if gotModel != "gpt-5-mini" {
+		t.Fatalf("expected request model to be used, got %q", gotModel)
+	}
+}
+
+func TestRunTurnPrefersAgentModelOverRequestAndDefault(t *testing.T) {
+	var gotModel string
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				gotModel = request.Model
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4, Model: "agent-model"},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DefaultModel: "default-model"},
+	)
+
+	_, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+		Model:    "request-model",
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if gotModel != "agent-model" {
+		t.Fatalf("expected agent model to be used, got %q", gotModel)
+	}
+}
+
 func TestRunTurnCountsMessageAndFileContext(t *testing.T) {
 	service := New(
 		&fakeModelClient{

@@ -37,6 +37,7 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = "secret"
+model = "gpt-5"
 timeout = "20m"
 
 [file]
@@ -69,6 +70,9 @@ instruction = "custom coder"
 
 	if server.Token != "secret" {
 		t.Fatalf("unexpected token: %s", server.Token)
+	}
+	if server.Model != "gpt-5" {
+		t.Fatalf("unexpected server model: %s", server.Model)
 	}
 	if server.Timeout.Duration != 20*time.Minute {
 		t.Fatalf("unexpected server timeout: %s", server.Timeout.Duration)

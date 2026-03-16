@@ -25,6 +25,7 @@ type ServerTarget struct {
 	Name    string   `toml:"name"`
 	URL     string   `toml:"url"`
 	Token   string   `toml:"token"`
+	Model   string   `toml:"model"`
 	Timeout Duration `toml:"timeout"`
 }
 
