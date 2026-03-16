@@ -191,7 +191,15 @@ func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
 		return failure(call, err.Error())
 	}
-	tools, err := t.bindings.Bind(ctx, taskDef)
+
+	bindCtx := ctx
+	cancel := func() {}
+	if taskDef.MCPServer != nil && taskDef.MCPServer.Timeout > 0 {
+		bindCtx, cancel = context.WithTimeout(ctx, time.Duration(taskDef.MCPServer.Timeout)*time.Second)
+	}
+	defer cancel()
+
+	tools, err := t.bindings.Bind(bindCtx, taskDef)
 	if err != nil {
 		return failure(call, err.Error())
 	}

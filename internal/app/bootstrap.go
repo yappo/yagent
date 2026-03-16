@@ -68,7 +68,7 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 	if err != nil {
 		return nil, err
 	}
-	mcpBindings := taskcatalog.NewMCPBindings(mcpstdio.NewFactory())
+	mcpBindings := taskcatalog.NewMCPBindings(mcpstdio.NewFactory(logger))
 
 	tools := registry.New(
 		fstools.NewReadTool(pathPolicy, policyEngine, approver),

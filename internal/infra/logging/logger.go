@@ -71,3 +71,7 @@ func (l *Logger) Write(typ string, fields map[string]any) error {
 	}
 	return nil
 }
+
+func (l *Logger) WriteRecord(_ context.Context, typ string, fields map[string]any) error {
+	return l.Write(typ, fields)
+}

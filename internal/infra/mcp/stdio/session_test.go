@@ -15,8 +15,24 @@ import (
 	"yagent/internal/domain"
 )
 
+type captureLogger struct {
+	types []string
+}
+
+func (c *captureLogger) WriteRecord(_ context.Context, typ string, fields map[string]any) error {
+	if method, ok := fields["method"].(string); ok {
+		typ += ":" + method
+	}
+	if line, ok := fields["line"].(string); ok {
+		typ += ":" + line
+	}
+	c.types = append(c.types, typ)
+	return nil
+}
+
 func TestSessionInitializeListToolsAndCall(t *testing.T) {
 	counterFile := filepath.Join(t.TempDir(), "tools-list-count")
+	logger := &captureLogger{}
 	task := domain.TaskDefinition{
 		ID:   "docs",
 		Kind: domain.TaskKindMCPServer,
@@ -29,7 +45,7 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 		},
 	}
 
-	sessionRaw, err := NewFactory().Open(context.Background(), task)
+	sessionRaw, err := NewFactory(logger).Open(context.Background(), task)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -64,6 +80,11 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 	if !strings.Contains(output, "search_docs") {
 		t.Fatalf("unexpected output: %q", output)
 	}
+	assertContains(t, logger.types, "mcp.protocol:initialize")
+	assertContains(t, logger.types, "mcp.protocol:notifications/initialized")
+	assertContains(t, logger.types, "mcp.protocol:tools/list")
+	assertContains(t, logger.types, "mcp.protocol:tools/call")
+	assertContains(t, logger.types, "mcp.stderr:helper stderr ready")
 }
 
 func TestSessionInitializeFailsOnInvalidPayload(t *testing.T) {
@@ -79,7 +100,7 @@ func TestSessionInitializeFailsOnInvalidPayload(t *testing.T) {
 		},
 	}
 
-	session, err := NewFactory().Open(context.Background(), task)
+	session, err := NewFactory(nil).Open(context.Background(), task)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -107,6 +128,8 @@ func TestHelperProcess(t *testing.T) {
 
 	reader := bufio.NewReader(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
+	initialized := false
+	_, _ = fmt.Fprintln(os.Stderr, "helper stderr ready")
 	for {
 		payload, err := readFramedMessage(reader)
 		if err != nil {
@@ -135,7 +158,12 @@ func TestHelperProcess(t *testing.T) {
 				"capabilities":    map[string]any{},
 				"serverInfo":      map[string]any{"name": "helper", "version": "1.0.0"},
 			})
+		case "notifications/initialized":
+			initialized = true
 		case "tools/list":
+			if !initialized {
+				os.Exit(2)
+			}
 			bumpCounterFile()
 			writeHelperResponse(writer, req.ID, map[string]any{
 				"tools": []map[string]any{{
@@ -184,4 +212,14 @@ func writeHelperResponse(w *bufio.Writer, id int64, result map[string]any) {
 	})
 	fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(payload), payload)
 	_ = w.Flush()
+}
+
+func assertContains(t *testing.T, items []string, want string) {
+	t.Helper()
+	for _, item := range items {
+		if item == want {
+			return
+		}
+	}
+	t.Fatalf("expected %q in %+v", want, items)
 }

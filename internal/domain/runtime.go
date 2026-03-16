@@ -29,6 +29,10 @@ type TraceSink interface {
 	Append(context.Context, ExecutionEvent) error
 }
 
+type StructuredLogSink interface {
+	WriteRecord(context.Context, string, map[string]any) error
+}
+
 type ExecutionEventStream interface {
 	SubscribeEvents() (<-chan ExecutionEvent, func())
 }

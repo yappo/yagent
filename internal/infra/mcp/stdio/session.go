@@ -16,10 +16,12 @@ import (
 	"yagent/internal/domain"
 )
 
-type Factory struct{}
+type Factory struct {
+	logger domain.StructuredLogSink
+}
 
-func NewFactory() *Factory {
-	return &Factory{}
+func NewFactory(logger domain.StructuredLogSink) *Factory {
+	return &Factory{logger: logger}
 }
 
 func (f *Factory) Open(_ context.Context, task domain.TaskDefinition) (domain.MCPSession, error) {
@@ -50,18 +52,21 @@ func (f *Factory) Open(_ context.Context, task domain.TaskDefinition) (domain.MC
 	}
 
 	s := &Session{
+		taskID:   task.ID,
 		cmd:      cmd,
 		stdin:    stdin,
 		stdout:   bufio.NewReader(stdout),
 		pending:  map[int64]chan responseEnvelope{},
 		callLock: &sync.Mutex{},
+		logger:   f.logger,
 	}
-	go io.Copy(io.Discard, stderr)
+	go s.copyStderr(stderr)
 	go s.readLoop()
 	return s, nil
 }
 
 type Session struct {
+	taskID       string
 	cmd          *exec.Cmd
 	stdin        io.WriteCloser
 	stdout       *bufio.Reader
@@ -76,6 +81,7 @@ type Session struct {
 	closeOnce    sync.Once
 	initializeMu sync.Mutex
 	initialized  bool
+	logger       domain.StructuredLogSink
 }
 
 type requestEnvelope struct {
@@ -117,6 +123,9 @@ func (s *Session) Initialize(ctx context.Context) error {
 		},
 	})
 	if err != nil {
+		return err
+	}
+	if err := s.notify(ctx, "notifications/initialized", map[string]any{}); err != nil {
 		return err
 	}
 	s.initialized = true
@@ -226,7 +235,7 @@ func (s *Session) call(ctx context.Context, method string, params map[string]any
 		s.pendingMu.Unlock()
 	}()
 
-	if err := s.writeMessage(request); err != nil {
+	if err := s.writeMessage(ctx, request); err != nil {
 		return nil, err
 	}
 
@@ -239,6 +248,15 @@ func (s *Session) call(ctx context.Context, method string, params map[string]any
 		}
 		return response.Result, nil
 	}
+}
+
+func (s *Session) notify(ctx context.Context, method string, params map[string]any) error {
+	request := requestEnvelope{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  params,
+	}
+	return s.writeMessage(ctx, request)
 }
 
 func (s *Session) readLoop() {
@@ -254,8 +272,10 @@ func (s *Session) readLoop() {
 			return
 		}
 		if response.Method != "" {
+			s.logProtocol(context.Background(), "receive", payload)
 			continue
 		}
+		s.logProtocol(context.Background(), "receive", payload)
 
 		s.pendingMu.Lock()
 		ch := s.pending[response.ID]
@@ -277,15 +297,26 @@ func (s *Session) failPending(err error) {
 	}
 }
 
-func (s *Session) writeMessage(message any) error {
+func (s *Session) writeMessage(ctx context.Context, message any) error {
 	data, err := json.Marshal(message)
 	if err != nil {
 		return err
 	}
+	s.logProtocol(ctx, "send", data)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err = fmt.Fprintf(s.stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
 	return err
+}
+
+func (s *Session) copyStderr(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		s.logStderr(context.Background(), scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		s.logStderr(context.Background(), "scanner_error: "+err.Error())
+	}
 }
 
 func readFramedMessage(r *bufio.Reader) ([]byte, error) {
@@ -339,4 +370,36 @@ func mergeEnv(extra map[string]string) []string {
 		cmdEnv = append(cmdEnv, key+"="+value)
 	}
 	return cmdEnv
+}
+
+func (s *Session) logProtocol(ctx context.Context, direction string, payload []byte) {
+	if s.logger == nil {
+		return
+	}
+	fields := map[string]any{
+		"task_id":   s.taskID,
+		"direction": direction,
+		"raw":       string(payload),
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err == nil {
+		fields["message"] = decoded
+		if method, ok := decoded["method"].(string); ok {
+			fields["method"] = method
+		}
+		if id, ok := decoded["id"]; ok {
+			fields["id"] = id
+		}
+	}
+	_ = s.logger.WriteRecord(ctx, "mcp.protocol", fields)
+}
+
+func (s *Session) logStderr(ctx context.Context, line string) {
+	if s.logger == nil {
+		return
+	}
+	_ = s.logger.WriteRecord(ctx, "mcp.stderr", map[string]any{
+		"task_id": s.taskID,
+		"line":    line,
+	})
 }
