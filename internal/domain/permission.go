@@ -20,6 +20,9 @@ type PermissionRequest struct {
 	Scope        string
 	Summary      string
 	SideEffects  []string
+	AgentID      string
+	Purpose      string
+	Task         string
 }
 
 type Approver interface {

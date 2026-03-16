@@ -6,19 +6,21 @@ import (
 
 func NewRootCommand() *cobra.Command {
 	var configPath string
+	var logPath string
 
 	root := &cobra.Command{
 		Use:   "yagent",
 		Short: "A terminal AI coding agent",
 		Long:  "yagent is a terminal AI coding agent with interactive TUI and tool support.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTUI(configPath)
+			return runTUI(configPath, logPath)
 		},
 	}
 
 	root.PersistentFlags().StringVar(&configPath, "config", "", "設定ファイルのパス")
-	root.AddCommand(newTUICommand(&configPath))
-	root.AddCommand(newExecCommand(&configPath))
+	root.PersistentFlags().StringVar(&logPath, "log", "", "イベントログの出力先")
+	root.AddCommand(newTUICommand(&configPath, &logPath))
+	root.AddCommand(newExecCommand(&configPath, &logPath))
 
 	return root
 }

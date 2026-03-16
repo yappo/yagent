@@ -22,7 +22,7 @@ func TestRegistryDefinitionsSorted(t *testing.T) {
 		stubTool{definition: domain.ToolDefinition{Name: "a"}},
 	)
 
-	definitions := r.Definitions()
+	definitions := r.Definitions(domain.AgentSpec{})
 	if len(definitions) != 2 || definitions[0].Name != "a" {
 		t.Fatalf("definitions are not sorted")
 	}

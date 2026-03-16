@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadDefault(t *testing.T) {
@@ -20,8 +21,8 @@ func TestLoadDefault(t *testing.T) {
 	if server.URL != "http://localhost:1234" {
 		t.Fatalf("unexpected default URL: %s", server.URL)
 	}
-	if cfg.Agent.MaxIterations != 100 {
-		t.Fatalf("unexpected default max iterations: %d", cfg.Agent.MaxIterations)
+	if cfg.Execution.MaxParallelAgents != 2 {
+		t.Fatalf("unexpected default max parallel agents: %d", cfg.Execution.MaxParallelAgents)
 	}
 }
 
@@ -36,13 +37,21 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = "secret"
-timeout = 1200
+timeout = "20m"
 
 [file]
 allow_paths = ["/tmp"]
 
-[agent]
-max_iterations = 42
+[execution]
+max_parallel_agents = 1
+max_handoff_depth = 3
+default_timeout = "600s"
+
+[agent_catalog]
+paths = ["/tmp/agents"]
+
+[agents.coder]
+instruction = "custom coder"
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -61,10 +70,36 @@ max_iterations = 42
 	if server.Token != "secret" {
 		t.Fatalf("unexpected token: %s", server.Token)
 	}
-	if server.Timeout != 1200 {
-		t.Fatalf("unexpected server timeout: %d", server.Timeout)
+	if server.Timeout.Duration != 20*time.Minute {
+		t.Fatalf("unexpected server timeout: %s", server.Timeout.Duration)
 	}
-	if cfg.Agent.MaxIterations != 42 {
-		t.Fatalf("unexpected max iterations: %d", cfg.Agent.MaxIterations)
+	if cfg.Execution.MaxParallelAgents != 1 {
+		t.Fatalf("unexpected max_parallel_agents: %d", cfg.Execution.MaxParallelAgents)
+	}
+	if cfg.Execution.MaxHandoffDepth != 3 {
+		t.Fatalf("unexpected max_handoff_depth: %d", cfg.Execution.MaxHandoffDepth)
+	}
+	if cfg.Execution.DefaultTimeout.Duration != 600*time.Second {
+		t.Fatalf("unexpected default_timeout: %s", cfg.Execution.DefaultTimeout.Duration)
+	}
+	if cfg.Agents["coder"].Instruction != "custom coder" {
+		t.Fatalf("unexpected coder override: %+v", cfg.Agents["coder"])
+	}
+}
+
+func TestLoadRejectsInvalidParallelAgents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[execution]
+max_parallel_agents = 0
+max_handoff_depth = 1
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error")
 	}
 }

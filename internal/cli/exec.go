@@ -8,10 +8,9 @@ import (
 
 	"yagent/internal/app"
 	"yagent/internal/domain"
-	chatusecase "yagent/internal/usecase/chat"
 )
 
-func newExecCommand(configPath *string) *cobra.Command {
+func newExecCommand(configPath *string, logPath *string) *cobra.Command {
 	var prompt string
 	var model string
 	var stream bool
@@ -20,12 +19,15 @@ func newExecCommand(configPath *string) *cobra.Command {
 		Use:   "exec",
 		Short: "単発でプロンプトを実行",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			container, err := app.Build(*configPath, StdinApprover{})
+			container, err := app.Build(*configPath, StdinApprover{}, app.BuildOptions{LogPath: *logPath})
 			if err != nil {
 				return err
 			}
+			if container.Closer != nil {
+				defer container.Closer.Close()
+			}
 
-			result, err := container.ChatService.Run(cmd.Context(), chatusecase.Input{
+			result, err := container.Orchestrator.RunTurn(cmd.Context(), domain.TurnRequest{
 				Messages: []domain.Message{{Role: domain.RoleUser, Content: prompt}},
 				Model:    model,
 				Stream:   stream,
@@ -51,6 +53,10 @@ type StdinApprover struct{}
 
 func (StdinApprover) Approve(ctx context.Context, request domain.PermissionRequest) (domain.PermissionDecision, error) {
 	fmt.Printf("%sを実行しますか？ファイル：%s\n", request.Operation, request.Resource)
+	fmt.Printf("requester: %s (%s)\n", cliPermissionRequesterLabel(request), cliPermissionRequesterType(request))
+	if request.Purpose != "" {
+		fmt.Printf("purpose: %s\n", request.Purpose)
+	}
 	fmt.Print("[1] 今回だけ許可  [2] このセッションで許可  [3] 拒否: ")
 	var input string
 	fmt.Scanln(&input)
@@ -62,4 +68,18 @@ func (StdinApprover) Approve(ctx context.Context, request domain.PermissionReque
 	default:
 		return domain.PermissionDeny, nil
 	}
+}
+
+func cliPermissionRequesterLabel(request domain.PermissionRequest) string {
+	if request.AgentID == "" || request.AgentID == "manager" {
+		return "manager"
+	}
+	return request.AgentID
+}
+
+func cliPermissionRequesterType(request domain.PermissionRequest) string {
+	if request.AgentID == "" || request.AgentID == "manager" {
+		return "main"
+	}
+	return "subagent"
 }

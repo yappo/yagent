@@ -5,11 +5,11 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	chatusecase "yagent/internal/usecase/chat"
+	"yagent/internal/domain"
 )
 
 type toolEventMsg struct {
-	event chatusecase.ToolEvent
+	event domain.ToolEvent
 }
 
 type ToolObserverBridge struct {
@@ -24,7 +24,7 @@ func (b *ToolObserverBridge) Attach(program *tea.Program) {
 	b.program = program
 }
 
-func (b *ToolObserverBridge) OnToolEvent(_ context.Context, event chatusecase.ToolEvent) {
+func (b *ToolObserverBridge) OnToolEvent(_ context.Context, event domain.ToolEvent) {
 	if b.program != nil {
 		b.program.Send(toolEventMsg{event: event})
 	}

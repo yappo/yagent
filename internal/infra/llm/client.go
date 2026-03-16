@@ -18,15 +18,15 @@ type Client struct {
 	httpClient *http.Client
 }
 
-func NewClient(baseURL, token string, timeoutSeconds int) *Client {
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = 900
+func NewClient(baseURL, token string, timeout time.Duration) *Client {
+	if timeout <= 0 {
+		timeout = 20 * time.Minute
 	}
 	return &Client{
 		baseURL: baseURL,
 		token:   token,
 		httpClient: &http.Client{
-			Timeout: time.Duration(timeoutSeconds) * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
@@ -69,15 +69,15 @@ type chatResponseDTO struct {
 	} `json:"choices"`
 }
 
-func (c *Client) Complete(ctx context.Context, request domain.CompletionRequest) (domain.CompletionResponse, error) {
+func (c *Client) Generate(ctx context.Context, request domain.ModelRequest) (domain.ModelResponse, error) {
 	payload, err := json.Marshal(toChatRequestDTO(request))
 	if err != nil {
-		return domain.CompletionResponse{}, fmt.Errorf("request の JSON 変換に失敗しました: %w", err)
+		return domain.ModelResponse{}, fmt.Errorf("request の JSON 変換に失敗しました: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		return domain.CompletionResponse{}, fmt.Errorf("HTTP リクエストの作成に失敗しました: %w", err)
+		return domain.ModelResponse{}, fmt.Errorf("HTTP リクエストの作成に失敗しました: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -87,44 +87,54 @@ func (c *Client) Complete(ctx context.Context, request domain.CompletionRequest)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return domain.CompletionResponse{}, fmt.Errorf("LLM サーバーとの通信に失敗しました: %w", err)
+		return domain.ModelResponse{}, fmt.Errorf("LLM サーバーとの通信に失敗しました: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return domain.CompletionResponse{}, fmt.Errorf("サーバーがステータス %d を返しました: %s", resp.StatusCode, string(body))
+		return domain.ModelResponse{}, fmt.Errorf("サーバーがステータス %d を返しました: %s", resp.StatusCode, string(body))
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return domain.CompletionResponse{}, fmt.Errorf("レスポンスの読み込みに失敗しました: %w", err)
+		return domain.ModelResponse{}, fmt.Errorf("レスポンスの読み込みに失敗しました: %w", err)
 	}
 
 	var decoded chatResponseDTO
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return domain.CompletionResponse{}, fmt.Errorf("レスポンスのデコードに失敗しました: %w", err)
+		return domain.ModelResponse{}, fmt.Errorf("レスポンスのデコードに失敗しました: %w", err)
 	}
 
 	if len(decoded.Choices) == 0 {
-		return domain.CompletionResponse{}, fmt.Errorf("LLM サーバーから応答がありません")
+		return domain.ModelResponse{}, fmt.Errorf("LLM サーバーから応答がありません")
 	}
 
-	return domain.CompletionResponse{
+	return domain.ModelResponse{
 		Message:      fromMessageDTO(decoded.Choices[0].Message),
 		FinishReason: decoded.Choices[0].FinishReason,
 	}, nil
 }
 
-func toChatRequestDTO(request domain.CompletionRequest) chatRequestDTO {
+func toChatRequestDTO(request domain.ModelRequest) chatRequestDTO {
+	messages := make([]domain.Message, 0, len(request.Messages)+1)
+	if request.Instructions != "" {
+		messages = append(messages, domain.Message{
+			Role:    domain.RoleSystem,
+			Content: request.Instructions,
+			AgentID: request.Agent.ID,
+		})
+	}
+	messages = append(messages, request.Messages...)
+
 	dto := chatRequestDTO{
-		Messages: make([]messageDTO, 0, len(request.Messages)),
+		Messages: make([]messageDTO, 0, len(messages)),
 		Model:    request.Model,
 		Stream:   request.Stream,
 		Tools:    make([]toolDefinitionDTO, 0, len(request.Tools)),
 	}
 
-	for _, message := range request.Messages {
+	for _, message := range messages {
 		dto.Messages = append(dto.Messages, toMessageDTO(message))
 	}
 
@@ -137,7 +147,6 @@ func toChatRequestDTO(request domain.CompletionRequest) chatRequestDTO {
 		fn.Name = tool.Name
 		fn.Description = tool.Description
 		fn.Parameters = tool.Parameters
-
 		dto.Tools = append(dto.Tools, toolDefinitionDTO{
 			Type:     "function",
 			Function: fn,
@@ -152,7 +161,6 @@ func toMessageDTO(message domain.Message) messageDTO {
 		Role:    string(message.Role),
 		Content: message.Content,
 	}
-
 	if len(message.ToolCalls) == 0 {
 		return dto
 	}
@@ -172,7 +180,6 @@ func toMessageDTO(message domain.Message) messageDTO {
 			Function: function,
 		})
 	}
-
 	return dto
 }
 
@@ -181,7 +188,6 @@ func fromMessageDTO(message messageDTO) domain.Message {
 		Role:    domain.Role(message.Role),
 		Content: message.Content,
 	}
-
 	if len(message.ToolCalls) == 0 {
 		return result
 	}
@@ -196,6 +202,5 @@ func fromMessageDTO(message messageDTO) domain.Message {
 			Arguments: args,
 		})
 	}
-
 	return result
 }
