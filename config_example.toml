@@ -39,3 +39,12 @@ model = "gpt-5"
 #   risk = "medium"
 #   allow_network = false
 #   timeout = 300
+#
+#   [[mcpservers]]
+#   id = "docs"
+#   description = "Docs MCP server"
+#   transport = "stdio"
+#   command = "npx"
+#   args = ["-y", "@example/docs-mcp"]
+#   tool_prefix = "docs"
+#   parallel_safe = false
