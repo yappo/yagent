@@ -154,6 +154,27 @@ tags = ["docs"]
 - `timeout`: その agent の LLM 呼び出し timeout
 - `tags`: 人間向けの整理用ラベル
 
+`allowed_tools` は完全一致に加えて、末尾 `*` の prefix wildcard を使えます。たとえば `fs_*` は `fs_read` / `fs_write` / `fs_list` / `fs_stat` にマッチします。
+
+```toml
+allowed_tools = ["fs_*", "git_*", "mcp__*"]
+```
+
+注意点として、MCP server は `task_bind` で起動・bind しますが、bind 後に実際に呼ばれるのは `mcp__...` という tool です。  
+そのため、MCP を扱う agent では用途に応じて次の権限を分けて考えます。
+
+- `task_list`: 利用可能な task を確認する
+- `task_bind`: MCP server task を bind する
+- `mcp__*`: bind 後に公開された MCP tool を実行する
+
+たとえば「MCP server の bind から実行までできる agent」は次のように書けます。
+
+```toml
+allowed_tools = ["task_list", "task_bind", "mcp__*"]
+```
+
+`mcp:*` のような指定は使わず、tool 名の prefix に合わせて `mcp__*` を使ってください。
+
 `agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
 built-in agent の基本セットは最初から使えますが、追加の DSL で repo 専用 agent を拡張する前提です。
 
