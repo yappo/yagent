@@ -55,7 +55,7 @@ func (f *fakeBindings) CallTool(context.Context, string, string, map[string]any)
 }
 
 func TestRunToolRejectsUnknownTask(t *testing.T) {
-	tool := NewRunTool(fakeCatalog{items: map[string]domain.TaskDefinition{}}, nil, nil)
+	tool := NewRunTool(fakeCatalog{items: map[string]domain.TaskDefinition{}}, nil, nil, nil)
 	result := tool.Execute(context.Background(), domain.ToolCall{
 		ID:        "1",
 		Name:      "task_run",
@@ -82,7 +82,7 @@ func TestRunToolAddsNetworkSideEffect(t *testing.T) {
 				Timeout:      60,
 			},
 		},
-	}}, nilPolicyEngine{}, approver)
+	}}, nilPolicyEngine{}, approver, nil)
 	result := tool.Execute(context.Background(), domain.ToolCall{
 		ID:        "1",
 		Name:      "task_run",

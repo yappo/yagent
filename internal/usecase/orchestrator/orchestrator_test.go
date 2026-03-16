@@ -218,6 +218,36 @@ func TestRunTurnSupportsEphemeralAgent(t *testing.T) {
 	}
 }
 
+func TestRunTurnCanDisablePhaseHarness(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done directly"},
+				}},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DisablePhaseHarness: true},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "done directly" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if result.Run == nil || len(result.Run.Plan) != 0 || len(result.Run.Verification) != 0 {
+		t.Fatalf("expected harness phases to be skipped, got %+v", result.Run)
+	}
+}
+
 func TestRunTurnSeesBoundMCPToolsOnLaterTurn(t *testing.T) {
 	seenBoundTool := false
 	var executor *fakeToolExecutor
@@ -650,5 +680,155 @@ func TestRunTurnBiasesManagerTowardDelegationForBroadResearchTask(t *testing.T) 
 	}
 	if !strings.Contains(managerInstruction, "planner and/or researcher") {
 		t.Fatalf("expected manager instruction to mention planner/researcher, got %q", managerInstruction)
+	}
+}
+
+func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
+	toolCalls := 0
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{
+							ID:   "1",
+							Name: "fs_write",
+							Arguments: map[string]any{
+								"path":      "README.md",
+								"content":   "x",
+								"create":    true,
+								"overwrite": true,
+							},
+						}},
+					},
+				}, {
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{
+							ID:   "2",
+							Name: "enable_capability",
+							Arguments: map[string]any{
+								"capability": "fs_write",
+							},
+						}},
+					},
+				}, {
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{
+							ID:   "3",
+							Name: "fs_write",
+							Arguments: map[string]any{
+								"path":      "README.md",
+								"content":   "x",
+								"create":    true,
+								"overwrite": true,
+							},
+						}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{
+					Name:             "fs_write",
+					CapabilityGroup:  "fs_write",
+					MutatesWorkspace: true,
+				}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				toolCalls++
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "ok"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 8},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "update the README"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "done" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected only the enabled mutation tool call to execute, got %d", toolCalls)
+	}
+}
+
+func TestRunTurnRunsVerificationAndRecoveryLoop(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{
+							ID:   "1",
+							Name: "handoff_to_coder",
+							Arguments: map[string]any{
+								"task": "Implement the change",
+							},
+						}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "final summary"},
+				}},
+				"coder": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "initial implementation"},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "fixed implementation"},
+				}},
+				"tester": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: fail\nSUMMARY: missing regression coverage\nREPAIR_BRIEF: add the missing regression handling"},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: tests are now green\nREPAIR_BRIEF: none"},
+				}},
+				"reviewer": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: no regressions found\nREPAIR_BRIEF: none"},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: review looks good\nREPAIR_BRIEF: none"},
+				}},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager":  {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"coder":    {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+			"tester":   {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"reviewer": {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, MaxVerificationAttempts: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "fix the bug"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "final summary" {
+		t.Fatalf("unexpected final content: %q", result.Message.Content)
+	}
+	if result.Run == nil || len(result.Run.Verification) < 2 {
+		t.Fatalf("expected verification results to be recorded, got %+v", result.Run)
+	}
+	foundRecovery := false
+	for _, artifact := range result.Run.Artifacts {
+		if artifact.Kind == "recovery" {
+			foundRecovery = true
+		}
+	}
+	if !foundRecovery {
+		t.Fatalf("expected recovery artifact, got %+v", result.Run.Artifacts)
 	}
 }

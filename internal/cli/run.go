@@ -24,5 +24,7 @@ func runTUI(configPath string, logPath string) error {
 		container.TaskCatalog,
 		container.MCPBindings,
 		container.AgentCatalog,
+		container.RunStore,
+		container.MemoryStore,
 	)
 }

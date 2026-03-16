@@ -30,8 +30,12 @@ func New(paths *policy.PathPolicy, engine domain.PolicyEngine, approver domain.A
 
 func (t *Tool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "patch_apply",
-		Description: "構造化テキストパッチを適用します。各 operation は old_text を new_text に置換します。",
+		Name:             "patch_apply",
+		Description:      "構造化テキストパッチを適用します。各 operation は old_text を new_text に置換します。",
+		CapabilityGroup:  "patch",
+		Risk:             "high",
+		RequiresApproval: true,
+		MutatesWorkspace: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

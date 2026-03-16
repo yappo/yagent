@@ -94,6 +94,25 @@ func (s stubAgentCatalog) LoadUserAgents(_ []string) error {
 	return nil
 }
 
+type stubMemoryStore struct {
+	memory *domain.RepoMemory
+}
+
+func (s stubMemoryStore) LoadMemory(context.Context) (*domain.RepoMemory, error) {
+	if s.memory == nil {
+		return &domain.RepoMemory{}, nil
+	}
+	return s.memory, nil
+}
+
+func (s stubMemoryStore) SaveMemory(context.Context, *domain.RepoMemory) error {
+	return nil
+}
+
+func (s stubMemoryStore) RecordCommand(context.Context, domain.CommandMemoryEntry) error {
+	return nil
+}
+
 func newTestModel(t *testing.T) model {
 	t.Helper()
 	return newModel(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil)
@@ -297,6 +316,127 @@ func TestToolEventFinishAppendsToolLog(t *testing.T) {
 	card := next.renderToolLogCard()
 	if !strings.Contains(card, "Tool Logs") || !strings.Contains(card, "task_run") || !strings.Contains(card, "[stderr]") {
 		t.Fatalf("unexpected tool log card: %q", card)
+	}
+}
+
+func TestSlashPlanSwitchesPanel(t *testing.T) {
+	m := newTestModel(t)
+	m.lastRun = &domain.RunState{
+		Plan: []domain.PlanNode{{Title: "Implement harness", Status: "done"}},
+	}
+
+	modelValue, _ := handleSlashCommand(m, "/plan")
+	next := modelValue.(model)
+
+	if next.activePanel != sidePanelPlan {
+		t.Fatalf("expected plan panel, got %s", next.activePanel)
+	}
+	if !strings.Contains(strings.Join(next.output, "\n"), "Current plan:") {
+		t.Fatalf("expected plan output, got %+v", next.output)
+	}
+}
+
+func TestCtrlRightCyclesPanels(t *testing.T) {
+	m := newTestModel(t)
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModCtrl})
+	next := modelValue.(model)
+	if next.activePanel != sidePanelPlan {
+		t.Fatalf("expected plan panel after first cycle, got %s", next.activePanel)
+	}
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModCtrl})
+	next = modelValue.(model)
+	if next.activePanel != sidePanelVerification {
+		t.Fatalf("expected verification panel after second cycle, got %s", next.activePanel)
+	}
+}
+
+func TestCtrlHAndCtrlLCyclePanels(t *testing.T) {
+	m := newTestModel(t)
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: 'l', Mod: tea.ModCtrl})
+	next := modelValue.(model)
+	if next.activePanel != sidePanelPlan {
+		t.Fatalf("expected plan panel after ctrl+l, got %s", next.activePanel)
+	}
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: 'h', Mod: tea.ModCtrl})
+	next = modelValue.(model)
+	if next.activePanel != sidePanelRunGraph {
+		t.Fatalf("expected run graph panel after ctrl+h, got %s", next.activePanel)
+	}
+}
+
+func TestAltBracketCyclesPanels(t *testing.T) {
+	m := newTestModel(t)
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: ']', Mod: tea.ModAlt})
+	next := modelValue.(model)
+	if next.activePanel != sidePanelPlan {
+		t.Fatalf("expected plan panel after alt+], got %s", next.activePanel)
+	}
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: '[', Mod: tea.ModAlt})
+	next = modelValue.(model)
+	if next.activePanel != sidePanelRunGraph {
+		t.Fatalf("expected run graph panel after alt+[ , got %s", next.activePanel)
+	}
+}
+
+func TestViewShowsPanelTabs(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 120
+	m.height = 28
+	m.syncLayout()
+
+	view := m.View().Content
+	if !strings.Contains(view, "Run Graph") || !strings.Contains(view, "Verification") || !strings.Contains(view, "Memory") {
+		t.Fatalf("expected panel tabs in view, got %q", view)
+	}
+}
+
+func TestRenderVerificationPanelUsesRunState(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 120
+	m.height = 28
+	m.activePanel = sidePanelVerification
+	m.lastRun = &domain.RunState{
+		ID:           "run-1",
+		CurrentPhase: domain.RunPhaseVerify,
+		Status:       domain.RunStatusRunning,
+		Attempt:      2,
+		Verification: []domain.VerificationResult{{
+			Attempt:     2,
+			SourceAgent: "reviewer",
+			Status:      "fail",
+			Summary:     "missing regression coverage",
+			RepairBrief: "add a regression test",
+		}},
+	}
+	m.syncLayout()
+
+	rendered := m.renderStatus()
+	if !strings.Contains(rendered, "reviewer") || !strings.Contains(rendered, "repair: add a regression test") {
+		t.Fatalf("unexpected verification panel: %q", rendered)
+	}
+}
+
+func TestRenderMemoryPanelUsesMemoryStore(t *testing.T) {
+	m := newModelWithStores(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil, nil, stubMemoryStore{memory: &domain.RepoMemory{
+		Constraints:        []string{"Keep README updated."},
+		FailurePatterns:    []string{"missing regression coverage"},
+		RecentArtifacts:    []string{"Final response"},
+		SuccessfulCommands: []domain.CommandMemoryEntry{{Summary: "go test ./..."}},
+	}})
+	m.width = 120
+	m.height = 28
+	m.activePanel = sidePanelMemory
+	m.syncLayout()
+
+	rendered := m.renderStatus()
+	if !strings.Contains(rendered, "Keep README updated.") || !strings.Contains(rendered, "go test ./...") {
+		t.Fatalf("unexpected memory panel: %q", rendered)
 	}
 }
 

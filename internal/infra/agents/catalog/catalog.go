@@ -19,20 +19,21 @@ type Catalog struct {
 }
 
 type fileAgentSpec struct {
-	ID           string           `toml:"id"`
-	Name         string           `toml:"name"`
-	Description  string           `toml:"description"`
-	Instruction  string           `toml:"instruction"`
-	Mode         domain.AgentMode `toml:"mode"`
-	AllowedTools []string         `toml:"allowed_tools"`
-	ReadOnly     bool             `toml:"read_only"`
-	InputSchema  map[string]any   `toml:"input_schema"`
-	OutputSchema map[string]any   `toml:"output_schema"`
-	Model        string           `toml:"model"`
-	Timeout      time.Duration    `toml:"timeout"`
-	MaxTurns     int              `toml:"max_turns"`
-	TokenBudget  int              `toml:"token_budget"`
-	Tags         []string         `toml:"tags"`
+	ID             string           `toml:"id"`
+	Name           string           `toml:"name"`
+	Description    string           `toml:"description"`
+	Instruction    string           `toml:"instruction"`
+	Mode           domain.AgentMode `toml:"mode"`
+	AllowedTools   []string         `toml:"allowed_tools"`
+	ReadOnly       bool             `toml:"read_only"`
+	InputSchema    map[string]any   `toml:"input_schema"`
+	OutputSchema   map[string]any   `toml:"output_schema"`
+	Model          string           `toml:"model"`
+	RoutingProfile string           `toml:"routing_profile"`
+	Timeout        time.Duration    `toml:"timeout"`
+	MaxTurns       int              `toml:"max_turns"`
+	TokenBudget    int              `toml:"token_budget"`
+	Tags           []string         `toml:"tags"`
 }
 
 func New(overrides map[string]config.AgentOverride) *Catalog {
@@ -142,20 +143,21 @@ func (c *Catalog) loadFile(path string) error {
 	}
 
 	spec := domain.AgentSpec{
-		ID:           parsed.ID,
-		Name:         fallback(parsed.Name, parsed.ID),
-		Description:  parsed.Description,
-		Instruction:  parsed.Instruction,
-		Mode:         fallbackMode(parsed.Mode),
-		AllowedTools: append([]string(nil), parsed.AllowedTools...),
-		ReadOnly:     parsed.ReadOnly,
-		InputSchema:  cloneMap(parsed.InputSchema),
-		OutputSchema: cloneMap(parsed.OutputSchema),
-		Model:        parsed.Model,
-		Timeout:      parsed.Timeout,
-		MaxTurns:     parsed.MaxTurns,
-		TokenBudget:  parsed.TokenBudget,
-		Tags:         append([]string(nil), parsed.Tags...),
+		ID:             parsed.ID,
+		Name:           fallback(parsed.Name, parsed.ID),
+		Description:    parsed.Description,
+		Instruction:    parsed.Instruction,
+		Mode:           fallbackMode(parsed.Mode),
+		AllowedTools:   append([]string(nil), parsed.AllowedTools...),
+		ReadOnly:       parsed.ReadOnly,
+		InputSchema:    cloneMap(parsed.InputSchema),
+		OutputSchema:   cloneMap(parsed.OutputSchema),
+		Model:          parsed.Model,
+		RoutingProfile: parsed.RoutingProfile,
+		Timeout:        parsed.Timeout,
+		MaxTurns:       parsed.MaxTurns,
+		TokenBudget:    parsed.TokenBudget,
+		Tags:           append([]string(nil), parsed.Tags...),
 	}
 	c.agents[spec.ID] = spec
 	return nil
@@ -164,69 +166,82 @@ func (c *Catalog) loadFile(path string) error {
 func builtInAgents() map[string]domain.AgentSpec {
 	return map[string]domain.AgentSpec{
 		"manager": {
-			ID:            "manager",
-			Name:          "Manager",
-			Description:   "ユーザー窓口として委譲と最終応答を担当します。",
-			Instruction:   "You are the manager agent. Delegate research, testing, review, and implementation tasks when helpful. Keep the final response concise and grounded in available tool and agent results.",
-			Mode:          domain.AgentModeManager,
-			AllowedTools:  []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
-			MaxTurns:      200,
-			BuiltIn:       true,
-			AllowOverride: true,
+			ID:             "manager",
+			Name:           "Manager",
+			Description:    "ユーザー窓口として委譲と最終応答を担当します。",
+			Instruction:    "You are the manager agent. Delegate research, testing, review, and implementation tasks when helpful. Keep the final response concise and grounded in available tool and agent results.",
+			Mode:           domain.AgentModeManager,
+			AllowedTools:   []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
+			RoutingProfile: "strong",
+			PhasePolicies: []domain.PhasePolicy{
+				{Phase: domain.RunPhasePlan, RequiredAgentIDs: []string{"planner"}, ForceDelegation: true},
+				{Phase: domain.RunPhaseExecute, RequiredAgentIDs: []string{"coder"}, ForceDelegation: true},
+				{Phase: domain.RunPhaseVerify, RequiredAgentIDs: []string{"tester", "reviewer"}, ForceDelegation: true},
+			},
+			VerificationPolicy: domain.VerificationPolicy{Required: true, MaxAttempts: 2},
+			MaxTurns:           200,
+			BuiltIn:            true,
+			AllowOverride:      true,
 		},
 		"planner": {
-			ID:           "planner",
-			Name:         "Planner",
-			Description:  "タスク分解を担当します。",
-			Instruction:  "Break the task into a practical plan with explicit constraints and deliverables. Do not delegate to coder for simple repository inspection tasks. Prefer direct read-only tools such as fs_list and fs_read.",
-			Mode:         domain.AgentModeTool,
-			ReadOnly:     true,
-			AllowedTools: []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
-			MaxTurns:     200,
-			BuiltIn:      true,
+			ID:             "planner",
+			Name:           "Planner",
+			Description:    "タスク分解を担当します。",
+			Instruction:    "Break the task into a practical plan with explicit constraints and deliverables. Do not delegate to coder for simple repository inspection tasks. Prefer direct read-only tools such as fs_list and fs_read.",
+			Mode:           domain.AgentModeTool,
+			ReadOnly:       true,
+			RoutingProfile: "fast",
+			AllowedTools:   []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
+			MaxTurns:       200,
+			BuiltIn:        true,
 		},
 		"researcher": {
-			ID:           "researcher",
-			Name:         "Researcher",
-			Description:  "関連ファイルの探索と要点抽出を担当します。",
-			Instruction:  "Inspect available context and files, then return only the most relevant findings. Prefer fs_list and fs_read instead of asking another agent to write scripts.",
-			Mode:         domain.AgentModeTool,
-			ReadOnly:     true,
-			AllowedTools: []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
-			MaxTurns:     200,
-			BuiltIn:      true,
+			ID:             "researcher",
+			Name:           "Researcher",
+			Description:    "関連ファイルの探索と要点抽出を担当します。",
+			Instruction:    "Inspect available context and files, then return only the most relevant findings. Prefer fs_list and fs_read instead of asking another agent to write scripts.",
+			Mode:           domain.AgentModeTool,
+			ReadOnly:       true,
+			RoutingProfile: "fast",
+			AllowedTools:   []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
+			MaxTurns:       200,
+			BuiltIn:        true,
 		},
 		"coder": {
-			ID:           "coder",
-			Name:         "Coder",
-			Description:  "実装ターンを主担当します。",
-			Instruction:  "Implement the requested change directly when enough context is available. Prefer precise file edits and mention verification status. Do not delegate planning back to planner when the task is already an implementation handoff.",
-			Mode:         domain.AgentModeHandoff,
-			AllowedTools: []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
-			MaxTurns:     200,
-			BuiltIn:      true,
+			ID:                 "coder",
+			Name:               "Coder",
+			Description:        "実装ターンを主担当します。",
+			Instruction:        "Implement the requested change directly when enough context is available. Prefer precise file edits and mention verification status. Do not delegate planning back to planner when the task is already an implementation handoff.",
+			Mode:               domain.AgentModeHandoff,
+			RoutingProfile:     "strong",
+			VerificationPolicy: domain.VerificationPolicy{Required: true, MaxAttempts: 2},
+			AllowedTools:       []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
+			MaxTurns:           200,
+			BuiltIn:            true,
 		},
 		"tester": {
-			ID:           "tester",
-			Name:         "Tester",
-			Description:  "検証と要約を担当します。",
-			Instruction:  "Verify behavior using available read-only context and report any validation gaps clearly.",
-			Mode:         domain.AgentModeTool,
-			ReadOnly:     true,
-			AllowedTools: []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*"},
-			MaxTurns:     200,
-			BuiltIn:      true,
+			ID:             "tester",
+			Name:           "Tester",
+			Description:    "検証と要約を担当します。",
+			Instruction:    "Verify behavior using available read-only context and report any validation gaps clearly.",
+			Mode:           domain.AgentModeTool,
+			ReadOnly:       true,
+			RoutingProfile: "fast",
+			AllowedTools:   []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*"},
+			MaxTurns:       200,
+			BuiltIn:        true,
 		},
 		"reviewer": {
-			ID:           "reviewer",
-			Name:         "Reviewer",
-			Description:  "リスクと回帰確認を担当します。",
-			Instruction:  "Review changes for bugs, regressions, and missing tests. Focus on findings first.",
-			Mode:         domain.AgentModeTool,
-			ReadOnly:     true,
-			AllowedTools: []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
-			MaxTurns:     200,
-			BuiltIn:      true,
+			ID:             "reviewer",
+			Name:           "Reviewer",
+			Description:    "リスクと回帰確認を担当します。",
+			Instruction:    "Review changes for bugs, regressions, and missing tests. Focus on findings first.",
+			Mode:           domain.AgentModeTool,
+			ReadOnly:       true,
+			RoutingProfile: "strong",
+			AllowedTools:   []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
+			MaxTurns:       200,
+			BuiltIn:        true,
 		},
 	}
 }
@@ -237,6 +252,9 @@ func applyOverride(spec domain.AgentSpec, override config.AgentOverride) domain.
 	}
 	if override.Model != "" {
 		spec.Model = override.Model
+	}
+	if override.RoutingProfile != "" {
+		spec.RoutingProfile = override.RoutingProfile
 	}
 	if len(override.AllowedTools) > 0 {
 		spec.AllowedTools = append([]string(nil), override.AllowedTools...)

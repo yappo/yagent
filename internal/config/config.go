@@ -12,6 +12,12 @@ type Config struct {
 	Server       ServerConfig             `toml:"server"`
 	File         FileConfig               `toml:"file"`
 	Execution    ExecutionConfig          `toml:"execution"`
+	Features     FeaturesConfig           `toml:"features"`
+	Routing      RoutingConfig            `toml:"routing"`
+	Harness      HarnessConfig            `toml:"harness"`
+	Context      ContextConfig            `toml:"context"`
+	Memory       MemoryConfig             `toml:"memory"`
+	Benchmark    BenchmarkConfig          `toml:"benchmark"`
 	AgentCatalog AgentCatalogConfig       `toml:"agent_catalog"`
 	Agents       map[string]AgentOverride `toml:"agents"`
 }
@@ -39,15 +45,61 @@ type ExecutionConfig struct {
 	DefaultTimeout    Duration `toml:"default_timeout"`
 }
 
+type FeaturesConfig struct {
+	PhaseHarness       bool `toml:"phase_harness"`
+	AdaptiveCompaction bool `toml:"adaptive_compaction"`
+	RoleRouting        bool `toml:"role_routing"`
+	RepoMemory         bool `toml:"repo_memory"`
+}
+
+type RoutingConfig struct {
+	Profiles map[string]RoutingProfileConfig `toml:"profiles"`
+}
+
+type RoutingProfileConfig struct {
+	Server         string `toml:"server"`
+	Model          string `toml:"model"`
+	FallbackServer string `toml:"fallback_server"`
+	FallbackModel  string `toml:"fallback_model"`
+}
+
+type HarnessConfig struct {
+	MaxVerificationAttempts int  `toml:"max_verification_attempts"`
+	ForcePlanner            bool `toml:"force_planner"`
+	ForceResearcher         bool `toml:"force_researcher"`
+}
+
+type ContextConfig struct {
+	MaxRecentMessages        int `toml:"max_recent_messages"`
+	MaxArtifacts             int `toml:"max_artifacts"`
+	MaxRelevantFiles         int `toml:"max_relevant_files"`
+	CompactAfterTurns        int `toml:"compact_after_turns"`
+	CompactAfterToolCalls    int `toml:"compact_after_tool_calls"`
+	CompactAfterEstTokens    int `toml:"compact_after_est_tokens"`
+	CompactAfterVerifyCycles int `toml:"compact_after_verify_cycles"`
+}
+
+type MemoryConfig struct {
+	Enabled  bool   `toml:"enabled"`
+	StateDir string `toml:"state_dir"`
+	MaxRuns  int    `toml:"max_runs"`
+	MaxFacts int    `toml:"max_facts"`
+}
+
+type BenchmarkConfig struct {
+	DefaultRuns int `toml:"default_runs"`
+}
+
 type AgentCatalogConfig struct {
 	Paths []string `toml:"paths"`
 }
 
 type AgentOverride struct {
-	Instruction  string   `toml:"instruction"`
-	Model        string   `toml:"model"`
-	AllowedTools []string `toml:"allowed_tools"`
-	Disabled     bool     `toml:"disabled"`
+	Instruction    string   `toml:"instruction"`
+	Model          string   `toml:"model"`
+	RoutingProfile string   `toml:"routing_profile"`
+	AllowedTools   []string `toml:"allowed_tools"`
+	Disabled       bool     `toml:"disabled"`
 }
 
 type Duration struct {
@@ -78,6 +130,24 @@ func Load(path string) (Config, error) {
 	if cfg.Agents == nil {
 		cfg.Agents = map[string]AgentOverride{}
 	}
+	if cfg.Routing.Profiles == nil {
+		cfg.Routing.Profiles = map[string]RoutingProfileConfig{}
+	}
+	if cfg.Harness.MaxVerificationAttempts < 1 {
+		return Config{}, fmt.Errorf("harness.max_verification_attempts は 1 以上である必要があります")
+	}
+	if cfg.Context.MaxRecentMessages < 1 {
+		return Config{}, fmt.Errorf("context.max_recent_messages は 1 以上である必要があります")
+	}
+	if cfg.Memory.MaxRuns < 1 {
+		return Config{}, fmt.Errorf("memory.max_runs は 1 以上である必要があります")
+	}
+	if cfg.Memory.MaxFacts < 1 {
+		return Config{}, fmt.Errorf("memory.max_facts は 1 以上である必要があります")
+	}
+	if cfg.Benchmark.DefaultRuns < 1 {
+		return Config{}, fmt.Errorf("benchmark.default_runs は 1 以上である必要があります")
+	}
 
 	return cfg, nil
 }
@@ -101,6 +171,43 @@ func Default() Config {
 			MaxParallelAgents: 2,
 			MaxHandoffDepth:   2,
 			DefaultTimeout:    Duration{Duration: 120 * time.Second},
+		},
+		Features: FeaturesConfig{
+			PhaseHarness:       true,
+			AdaptiveCompaction: true,
+			RoleRouting:        true,
+			RepoMemory:         true,
+		},
+		Routing: RoutingConfig{
+			Profiles: map[string]RoutingProfileConfig{
+				"default": {},
+				"fast":    {},
+				"strong":  {},
+				"summary": {},
+			},
+		},
+		Harness: HarnessConfig{
+			MaxVerificationAttempts: 2,
+			ForcePlanner:            true,
+			ForceResearcher:         false,
+		},
+		Context: ContextConfig{
+			MaxRecentMessages:        12,
+			MaxArtifacts:             8,
+			MaxRelevantFiles:         16,
+			CompactAfterTurns:        12,
+			CompactAfterToolCalls:    12,
+			CompactAfterEstTokens:    12000,
+			CompactAfterVerifyCycles: 2,
+		},
+		Memory: MemoryConfig{
+			Enabled:  true,
+			StateDir: ".yagent/state",
+			MaxRuns:  20,
+			MaxFacts: 50,
+		},
+		Benchmark: BenchmarkConfig{
+			DefaultRuns: 2,
 		},
 		AgentCatalog: AgentCatalogConfig{
 			Paths: []string{},

@@ -13,7 +13,7 @@ yagent は、「LLM に bash を渡しておけば勝手に賢くやる」とい
 
 MCP Server についても、そのまま無造作に露出させるのではなく、task catalog と bind フローの中で独自にラップしています。これは安全性のためだけではありません。MCP は便利な一方で、server や tool の情報を常時抱え込むとコンテキストを食いやすく、必要のない情報まで LLM に渡し続ける構造になりがちです。yagent では必要なときにだけ `task_bind` で server を bind し、必要な tool だけを公開できるので、コンテキスト消費を抑えながら拡張性も確保しやすくなっています。
 
-さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、handoff や delegate を通じて仕事を分け、必要なら ephemeral agent もその場で生成できます。そして repo 固有の役割も、Agent DSL でシンプルに追加できます。README 専用 agent、テスト観点整理 agent、特定ディレクトリ専用の調査 agent のようなものを、コード改修なしで足していけます。
+さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、`intake -> plan -> execute -> verify -> recover -> finalize` の harness で仕事を分け、必要なら ephemeral agent もその場で生成できます。repo memory や context compaction も持つので、長めの run でも必要な事実だけを残しやすくなっています。
 
 要するに yagent は、単なる「TUI から LLM を叩くツール」でも、単なる「自律実行が派手な agent」でもありません。Bash を安易に渡さず、task catalog・file permission・MCP wrapping・subagent orchestration を最初から設計に入れたうえで、それでも task や agent は簡単に拡張できるようにした、**“LLM を信用しない” 前提の実運用志向 coding agent** です。
 
@@ -21,14 +21,21 @@ MCP Server についても、そのまま無造作に露出させるのではな
 
 - `yagent --config <file>` でそのまま TUI 起動
 - `yagent exec --prompt ...` で単発実行
+- `yagent exec --resume latest --profile strong` のような resume / routing 指定
+- `yagent benchmark --feature-profile legacy --feature-profile current --prompt ...` で feature flag 差分を比較
 - Orchestrator-first のサブエージェント実行
+- `intake -> plan -> execute -> verify -> recover -> finalize` の run harness
+- adaptive context compaction と lightweight repo memory
+- role / phase ベースの model routing
+- lazy capability discovery (`list_capabilities` / `enable_capability`)
 - built-in agent catalog と user-defined agent DSL
 - built-in agent に加えて ephemeral agent の即席生成
 - Bubble Tea / Bubbles ベースの TUI
+- Run Graph / Plan / Verification / Memory の切替 panel
 - OpenAI 互換の `chat/completions` API に対応
 - Agent Status viewport による実行状況モニター
 - tool call card / tool log card による実行中ツール表示
-- ツールレジストリ経由で `file` `fs` `search` `git` `task` `patch` を実行
+- ツールレジストリ経由で `fs` `search` `git` `task` `patch` を実行
 - Claude Code 風の permission UI
 - `--log <path>` による JSON Lines イベントログ
 - `execution.max_parallel_agents` による並列実行制御 (`min = 1`)
@@ -56,6 +63,15 @@ yagent exec --config ~/.yagent.toml --prompt "こんにちは"
 
 # 単発実行 + イベントログ
 yagent exec --log yagent.log --prompt "こんにちは"
+
+# 前回 run を復元して続ける
+yagent exec --resume latest --prompt "続きの修正をして"
+
+# routing profile を指定
+yagent exec --profile strong --prompt "慎重にレビューして"
+
+# feature flag の比較
+yagent benchmark --feature-profile legacy --feature-profile current --prompt "この repo の改善点を提案して"
 ```
 
 ## 設定ファイル
@@ -79,11 +95,48 @@ max_parallel_agents = 2
 max_handoff_depth = 2
 default_timeout = "120s"
 
+[features]
+phase_harness = true
+adaptive_compaction = true
+role_routing = true
+repo_memory = true
+
+[routing.profiles.fast]
+server = "lmstudio"
+model = "gpt-5-mini"
+
+[routing.profiles.strong]
+server = "lmstudio"
+model = "gpt-5"
+
+[harness]
+max_verification_attempts = 2
+force_planner = true
+
+[context]
+max_recent_messages = 12
+max_artifacts = 8
+max_relevant_files = 16
+compact_after_turns = 12
+compact_after_tool_calls = 12
+compact_after_est_tokens = 12000
+compact_after_verify_cycles = 2
+
+[memory]
+enabled = true
+state_dir = ".yagent/state"
+max_runs = 20
+max_facts = 50
+
+[benchmark]
+default_runs = 2
+
 [agent_catalog]
 paths = ["~/.config/yagent/agents"]
 
 [agents.coder]
 model = "gpt-5"
+routing_profile = "strong"
 
 [agents.reviewer]
 instruction = "Review for regressions first."
@@ -99,9 +152,20 @@ instruction = "Review for regressions first."
 - `execution.max_parallel_agents`: 並列実行する subagent 数の上限。`1` で逐次実行
 - `execution.max_handoff_depth`: handoff の最大深度
 - `execution.default_timeout`: agent ごとの LLM 呼び出し timeout
+- `features.phase_harness`: phased multi-agent harness を使うか
+- `features.adaptive_compaction`: adaptive context compaction を使うか
+- `features.role_routing`: role / phase ベースの router を使うか
+- `features.repo_memory`: repo memory の読込と更新を使うか
+- `routing.profiles.*`: role / phase ごとの model routing 先
+- `harness.max_verification_attempts`: verify -> recover の最大試行回数
+- `harness.force_planner`: 実装前に planner を強制するか
+- `context.*`: recent messages / artifacts / compaction 閾値
+- `memory.*`: `./.yagent/state/` 配下の run state / repo memory 設定
+- `benchmark.default_runs`: `yagent benchmark` の既定試行回数
 - `agent_catalog.paths`: user-defined agent DSL のファイルまたはディレクトリ一覧
 - `agents.<id>.instruction`: built-in agent の instruction 上書き
 - `agents.<id>.model`: built-in agent のモデル上書き
+- `agents.<id>.routing_profile`: built-in agent の routing profile 上書き
 - `agents.<id>.allowed_tools`: built-in agent の tool allowlist 上書き
 - `agents.<id>.disabled`: built-in agent の無効化
 
@@ -112,6 +176,20 @@ model の優先順は次です。
 - `server.servers[].model`
 
 起動時のカレントディレクトリは自動で許可パスに追加されます。
+
+## TUI Panels
+
+右側 pane は `Run Graph / Plan / Verification / Memory` を切り替えられます。`/graph` `/plan` `/verification` `/memory` で直接開けて、`Ctrl+←/→` でも順送りできます。`/resume` を使うと直近 run を読み込み、Plan / Verification / Memory panel もその内容で更新されます。
+
+## Benchmark
+
+`yagent benchmark` は feature flag の組み合わせを比較するための簡易コマンドです。既定では `legacy` と `current` を比較します。
+
+- `legacy`: phase harness / compaction / role routing / repo memory をすべて無効化した single-manager baseline
+- `current`: `features.*` に設定された現在の構成
+- `no-harness`, `no-routing`, `no-memory`, `no-compaction`: 個別 flag を切って比較する補助 profile
+
+出力は各 profile ごとの成功数、平均時間、平均イベント数、verification failure 数、各 run の phase / attempt / tool call 数をまとめます。
 
 ## Agent DSL
 
@@ -166,6 +244,7 @@ tags = ["docs"]
 - `model`: その agent だけ別 model を使いたいときに指定
 - `max_turns`: その agent の最大継続ターン数
 - `timeout`: その agent の LLM 呼び出し timeout
+- `routing_profile`: その agent をどの routing profile で実行するか
 - `tags`: 人間向けの整理用ラベル
 
 `agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
@@ -309,6 +388,11 @@ include_tools = ["search_docs"]
 - `@` 入力中: `pwd` 基準の相対パス候補を表示
 - `Tab`: 候補コマンドまたはファイルパスを補完
 - `/help`: ヘルプ表示
+- `/plan`: 直近 run の plan を表示
+- `/artifacts`: 直近 run の artifacts を表示
+- `/memory`: repo memory を表示
+- `/resume`: 最新 run を会話に復元
+- `/approvals`: approval の状態を表示
 - `/clear`: 会話ログをクリア
 - `/exit`: 終了
 
@@ -409,6 +493,7 @@ internal/
 - `git_status` / `git_diff` / `git_log` / `git_show`
 - `task_list` / `task_run` / `task_bind`
 - `patch_apply`
+- `list_capabilities` / `enable_capability`
 
 Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。
 

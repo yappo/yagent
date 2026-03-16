@@ -24,6 +24,9 @@ func TestLoadDefault(t *testing.T) {
 	if cfg.Execution.MaxParallelAgents != 2 {
 		t.Fatalf("unexpected default max parallel agents: %d", cfg.Execution.MaxParallelAgents)
 	}
+	if cfg.Harness.MaxVerificationAttempts != 2 {
+		t.Fatalf("unexpected default max verification attempts: %d", cfg.Harness.MaxVerificationAttempts)
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -47,6 +50,38 @@ allow_paths = ["/tmp"]
 max_parallel_agents = 1
 max_handoff_depth = 3
 default_timeout = "600s"
+
+[features]
+phase_harness = true
+adaptive_compaction = false
+role_routing = true
+repo_memory = false
+
+[routing.profiles.fast]
+server = "lmstudio"
+model = "gpt-5-mini"
+
+[harness]
+max_verification_attempts = 3
+force_planner = true
+
+[context]
+max_recent_messages = 8
+max_artifacts = 5
+max_relevant_files = 6
+compact_after_turns = 9
+compact_after_tool_calls = 10
+compact_after_est_tokens = 11000
+compact_after_verify_cycles = 2
+
+[memory]
+enabled = true
+state_dir = ".yagent/state"
+max_runs = 10
+max_facts = 20
+
+[benchmark]
+default_runs = 3
 
 [agent_catalog]
 paths = ["/tmp/agents"]
@@ -85,6 +120,21 @@ instruction = "custom coder"
 	}
 	if cfg.Execution.DefaultTimeout.Duration != 600*time.Second {
 		t.Fatalf("unexpected default_timeout: %s", cfg.Execution.DefaultTimeout.Duration)
+	}
+	if cfg.Features.AdaptiveCompaction {
+		t.Fatalf("unexpected features config: %+v", cfg.Features)
+	}
+	if cfg.Routing.Profiles["fast"].Model != "gpt-5-mini" {
+		t.Fatalf("unexpected routing profile: %+v", cfg.Routing.Profiles["fast"])
+	}
+	if cfg.Harness.MaxVerificationAttempts != 3 {
+		t.Fatalf("unexpected harness config: %+v", cfg.Harness)
+	}
+	if cfg.Context.MaxRecentMessages != 8 || cfg.Context.CompactAfterEstTokens != 11000 {
+		t.Fatalf("unexpected context config: %+v", cfg.Context)
+	}
+	if cfg.Benchmark.DefaultRuns != 3 {
+		t.Fatalf("unexpected benchmark config: %+v", cfg.Benchmark)
 	}
 	if cfg.Agents["coder"].Instruction != "custom coder" {
 		t.Fatalf("unexpected coder override: %+v", cfg.Agents["coder"])

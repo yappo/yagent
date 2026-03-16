@@ -31,12 +31,15 @@ func (p *Provider) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 			continue
 		}
 		definitions = append(definitions, domain.ToolDefinition{
-			Name:         item.QualifiedName,
-			Description:  item.Description,
-			Parameters:   item.InputSchema,
-			Metadata:     map[string]any{"category": "mcp", "task_id": item.TaskID, "server_tool_name": item.ServerToolName, "source": "mcp"},
-			ReadOnly:     item.ReadOnly,
-			ParallelSafe: item.ParallelSafe,
+			Name:             item.QualifiedName,
+			Description:      item.Description,
+			CapabilityGroup:  "mcp",
+			Risk:             "high",
+			RequiresApproval: true,
+			Parameters:       item.InputSchema,
+			Metadata:         map[string]any{"category": "mcp", "task_id": item.TaskID, "server_tool_name": item.ServerToolName, "source": "mcp"},
+			ReadOnly:         item.ReadOnly,
+			ParallelSafe:     item.ParallelSafe,
 		})
 	}
 	return definitions

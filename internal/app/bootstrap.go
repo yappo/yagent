@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"yagent/internal/config"
 	"yagent/internal/domain"
@@ -12,6 +13,7 @@ import (
 	"yagent/internal/infra/logging"
 	mcpstdio "yagent/internal/infra/mcp/stdio"
 	"yagent/internal/infra/policy"
+	"yagent/internal/infra/state"
 	fstools "yagent/internal/infra/tools/fs"
 	gittools "yagent/internal/infra/tools/git"
 	mcptools "yagent/internal/infra/tools/mcp"
@@ -19,6 +21,7 @@ import (
 	"yagent/internal/infra/tools/registry"
 	searchtools "yagent/internal/infra/tools/search"
 	tasktools "yagent/internal/infra/tools/task"
+	"yagent/internal/usecase/contextengine"
 	"yagent/internal/usecase/orchestrator"
 	"yagent/internal/usecase/taskcatalog"
 )
@@ -30,6 +33,8 @@ type Container struct {
 	TaskCatalog  domain.TaskCatalog
 	MCPBindings  domain.MCPConnectionManager
 	AgentCatalog domain.AgentCatalog
+	RunStore     domain.RunStateStore
+	MemoryStore  domain.RepoMemoryStore
 	WorkingDir   string
 	DefaultModel string
 	Closer       io.Closer
@@ -44,7 +49,10 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 	if err != nil {
 		return nil, err
 	}
+	return BuildFromConfig(cfg, approver, options)
+}
 
+func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildOptions) (*Container, error) {
 	server, err := cfg.ResolveServer()
 	if err != nil {
 		return nil, err
@@ -67,6 +75,29 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 	allowPaths := append([]string{pwd}, cfg.File.AllowPaths...)
 	pathPolicy := policy.NewPathPolicy(pwd, allowPaths)
 	policyEngine := policy.NewEngine()
+	var runStore *state.FileStore
+	if cfg.Memory.Enabled {
+		stateDir := cfg.Memory.StateDir
+		if !filepath.IsAbs(stateDir) {
+			stateDir = filepath.Join(pwd, stateDir)
+		}
+		runStore, err = state.NewFileStore(stateDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	memoryStore := domain.RepoMemoryStore(nil)
+	if cfg.Features.RepoMemory {
+		memoryStore = runStore
+	}
+	contextCfg := cfg.Context
+	if !cfg.Features.AdaptiveCompaction {
+		contextCfg.CompactAfterTurns = 1 << 30
+		contextCfg.CompactAfterToolCalls = 1 << 30
+		contextCfg.CompactAfterEstTokens = 1 << 30
+		contextCfg.CompactAfterVerifyCycles = 1 << 30
+	}
+	contextEngine := contextengine.New(contextCfg, memoryStore, cfg.Memory.MaxFacts)
 
 	taskCatalog, err := taskcatalog.New(pwd)
 	if err != nil {
@@ -88,7 +119,7 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 		gittools.NewLogTool(pathPolicy, policyEngine, approver),
 		gittools.NewShowTool(pathPolicy, policyEngine, approver),
 		tasktools.NewListTool(taskCatalog, mcpBindings),
-		tasktools.NewRunTool(taskCatalog, policyEngine, approver),
+		tasktools.NewRunTool(taskCatalog, policyEngine, approver, memoryStore),
 		tasktools.NewBindTool(taskCatalog, mcpBindings, policyEngine, approver),
 		patchtools.New(pathPolicy, policyEngine, approver),
 	)
@@ -99,22 +130,34 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 		return nil, err
 	}
 
-	client := infraLLM.NewClient(server.URL, server.Token, server.Timeout.Duration)
+	client, err := infraLLM.NewRouter(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Container{
 		Config: cfg,
 		Orchestrator: orchestrator.New(client, tools, agents, orchestrator.Config{
-			MaxParallelAgents: cfg.Execution.MaxParallelAgents,
-			MaxHandoffDepth:   cfg.Execution.MaxHandoffDepth,
-			DefaultTimeout:    cfg.Execution.DefaultTimeout.Duration,
-			DefaultModel:      server.Model,
-			TraceSink:         logger,
-			Approver:          approver,
+			MaxParallelAgents:       cfg.Execution.MaxParallelAgents,
+			MaxHandoffDepth:         cfg.Execution.MaxHandoffDepth,
+			MaxVerificationAttempts: cfg.Harness.MaxVerificationAttempts,
+			DefaultTimeout:          cfg.Execution.DefaultTimeout.Duration,
+			DefaultModel:            server.Model,
+			DisablePhaseHarness:     !cfg.Features.PhaseHarness,
+			ForcePlanner:            cfg.Harness.ForcePlanner,
+			ForceResearcher:         cfg.Harness.ForceResearcher,
+			TraceSink:               logger,
+			Approver:                approver,
+			ContextEngine:           contextEngine,
+			RunStore:                runStore,
+			MemoryStore:             memoryStore,
 		}),
 		Tools:        tools,
 		TaskCatalog:  taskCatalog,
 		MCPBindings:  mcpBindings,
 		AgentCatalog: agents,
+		RunStore:     runStore,
+		MemoryStore:  memoryStore,
 		WorkingDir:   pwd,
 		DefaultModel: server.Model,
 		Closer:       logger,
