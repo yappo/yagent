@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
 
 	"yagent/internal/domain"
 )
+
+var invalidToolNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
 type MCPBindings struct {
 	factory  domain.MCPSessionFactory
@@ -139,9 +142,8 @@ func QualifiedToolName(taskID string, prefix string, toolName string) string {
 
 func sanitizeName(value string) string {
 	value = strings.TrimSpace(value)
-	value = strings.ReplaceAll(value, " ", "_")
-	value = strings.ReplaceAll(value, "-", "_")
-	value = strings.ReplaceAll(value, "/", "_")
+	value = invalidToolNameChars.ReplaceAllString(value, "_")
+	value = strings.Trim(value, "_")
 	if value == "" {
 		return "tool"
 	}

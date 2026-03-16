@@ -29,17 +29,17 @@ func (f *fakeSession) Close() error                                             
 func TestMCPBindingsApplyFiltersAndQualifyNames(t *testing.T) {
 	bindings := NewMCPBindings(fakeSessionFactory{session: &fakeSession{
 		tools: []domain.MCPToolDescriptor{
-			{Name: "allowed", InputSchema: map[string]any{"type": "object"}, ParallelSafe: true},
+			{Name: "allowed.tool:v1", InputSchema: map[string]any{"type": "object"}, ParallelSafe: true},
 			{Name: "ignored", InputSchema: map[string]any{"type": "object"}, ParallelSafe: true},
 		},
 	}})
 	task := domain.TaskDefinition{
-		ID:   "docs",
+		ID:   "docs:v1",
 		Kind: domain.TaskKindMCPServer,
 		MCPServer: &domain.MCPServerSpec{
-			ToolPrefix:   "docs",
+			ToolPrefix:   "docs.api/v1",
 			ParallelSafe: true,
-			IncludeTools: []string{"allowed"},
+			IncludeTools: []string{"allowed.tool:v1"},
 		},
 	}
 
@@ -47,12 +47,15 @@ func TestMCPBindingsApplyFiltersAndQualifyNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Bind returned error: %v", err)
 	}
-	if len(tools) != 1 || tools[0].Name != "allowed" {
+	if len(tools) != 1 || tools[0].Name != "allowed.tool:v1" {
 		t.Fatalf("unexpected filtered tools: %+v", tools)
 	}
 
 	bound := bindings.BoundTools()
 	if len(bound) != 1 || bound[0].QualifiedName == "" {
 		t.Fatalf("unexpected bound tools: %+v", bound)
+	}
+	if bound[0].QualifiedName != "mcp__docs_api_v1__allowed_tool_v1__docs_v1" {
+		t.Fatalf("unexpected qualified name: %s", bound[0].QualifiedName)
 	}
 }
