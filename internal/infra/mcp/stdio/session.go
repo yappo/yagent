@@ -351,16 +351,22 @@ func (s *Session) logProtocol(ctx context.Context, direction string, payload []b
 	fields := map[string]any{
 		"task_id":   s.taskID,
 		"direction": direction,
-		"raw":       string(payload),
+		"bytes":     len(payload),
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(payload, &decoded); err == nil {
-		fields["message"] = decoded
 		if method, ok := decoded["method"].(string); ok {
 			fields["method"] = method
+			fields["message_kind"] = "request"
 		}
 		if id, ok := decoded["id"]; ok {
 			fields["id"] = id
+		}
+		if _, ok := decoded["result"]; ok {
+			fields["message_kind"] = "response"
+		}
+		if _, ok := decoded["error"]; ok {
+			fields["message_kind"] = "error"
 		}
 	}
 	_ = s.logger.WriteRecord(ctx, "mcp.protocol", fields)
@@ -382,7 +388,7 @@ func (s *Session) logInvalidStdout(ctx context.Context, payload []byte, err erro
 	}
 	_ = s.logger.WriteRecord(ctx, "mcp.stdout_invalid", map[string]any{
 		"task_id": s.taskID,
-		"raw":     string(payload),
+		"bytes":   len(payload),
 		"error":   err.Error(),
 	})
 }
