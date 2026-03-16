@@ -15,5 +15,5 @@ func runTUI(configPath string, logPath string) error {
 		defer container.Closer.Close()
 	}
 
-	return tui.Run(container.Orchestrator, bridge, container.WorkingDir)
+	return tui.Run(container.Orchestrator, bridge, container.WorkingDir, container.DefaultModel)
 }

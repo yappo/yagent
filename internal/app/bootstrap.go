@@ -26,6 +26,7 @@ type Container struct {
 	Config       config.Config
 	Orchestrator *orchestrator.Service
 	WorkingDir   string
+	DefaultModel string
 	Closer       io.Closer
 }
 
@@ -106,7 +107,8 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 			TraceSink:         logger,
 			Approver:          approver,
 		}),
-		WorkingDir: pwd,
-		Closer:     logger,
+		WorkingDir:   pwd,
+		DefaultModel: server.Model,
+		Closer:       logger,
 	}, nil
 }

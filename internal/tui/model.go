@@ -60,6 +60,7 @@ type slashCommand struct {
 type model struct {
 	runner           domain.Orchestrator
 	workingDir       string
+	defaultModel     string
 	selectedRefs     map[string]string
 	messages         []domain.Message
 	output           []string
@@ -151,7 +152,7 @@ const (
 	paneHorizontalFrame  = 4
 )
 
-func newModel(runner domain.Orchestrator, workingDir string) model {
+func newModel(runner domain.Orchestrator, workingDir string, defaultModel string) model {
 	ta := textarea.New()
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行, Enter で送信, /exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
@@ -173,6 +174,7 @@ func newModel(runner domain.Orchestrator, workingDir string) model {
 	m := model{
 		runner:           runner,
 		workingDir:       workingDir,
+		defaultModel:     defaultModel,
 		selectedRefs:     map[string]string{},
 		viewport:         viewport.New(),
 		statusViewport:   viewport.New(),
@@ -628,6 +630,7 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 	send := func() tea.Msg {
 		result, err := m.runner.RunTurn(context.Background(), domain.TurnRequest{
 			Messages: m.messages,
+			Model:    m.defaultModel,
 		})
 		return chatMessage{content: result.Message.Content, err: err}
 	}

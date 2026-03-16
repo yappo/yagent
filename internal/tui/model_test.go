@@ -19,9 +19,18 @@ func (stubOrchestrator) RunTurn(_ context.Context, _ domain.TurnRequest) (domain
 	return domain.TurnResult{}, nil
 }
 
+type recordingOrchestrator struct {
+	last domain.TurnRequest
+}
+
+func (r *recordingOrchestrator) RunTurn(_ context.Context, request domain.TurnRequest) (domain.TurnResult, error) {
+	r.last = request
+	return domain.TurnResult{Message: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}, nil
+}
+
 func newTestModel(t *testing.T) model {
 	t.Helper()
-	return newModel(stubOrchestrator{}, t.TempDir())
+	return newModel(stubOrchestrator{}, t.TempDir(), "")
 }
 
 func TestPermissionRequestState(t *testing.T) {
@@ -458,7 +467,7 @@ func TestPathCandidatesForRelativeFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@R")
 
 	ctx := m.activePathCompletion()
@@ -472,7 +481,7 @@ func TestPathCandidatesForCurrentDirectoryPrefix(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@./")
 
 	ctx := m.activePathCompletion()
@@ -489,7 +498,7 @@ func TestPathCandidatesIncludeDirectoriesAndFiles(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "libexe"), 0o755); err != nil {
 		t.Fatalf("mkdir libexe: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@l")
 
 	ctx := m.activePathCompletion()
@@ -509,7 +518,7 @@ func TestPathCandidatesForDirectoryContents(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "lib", "file.go"), []byte("package lib"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@lib/")
 
 	ctx := m.activePathCompletion()
@@ -526,7 +535,7 @@ func TestPathCandidatesIncludeHiddenEntries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("A=B"), 0o644); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@.")
 
 	ctx := m.activePathCompletion()
@@ -544,7 +553,7 @@ func TestPathCompletionTabCompletesSingleFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@R")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -559,7 +568,7 @@ func TestPathCompletionTabCompletesDirectoryWithSlash(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "lib"), 0o755); err != nil {
 		t.Fatalf("mkdir lib: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@l")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -577,7 +586,7 @@ func TestPathCompletionTabUsesLongestCommonPrefix(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "libexe"), 0o755); err != nil {
 		t.Fatalf("mkdir libexe: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.textarea.SetValue("@l")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -611,7 +620,7 @@ func TestSubmitPromptStoresNormalizedMessageOnlyForSelectedReference(t *testing.
 		t.Fatalf("write main.go: %v", err)
 	}
 
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	m.selectedRefs["@main.go"] = "main.go"
 	modelValue, _ := submitPrompt(m, "@main.go の概要を見せて")
 	next := modelValue.(model)
@@ -630,11 +639,37 @@ func TestSubmitPromptKeepsManualAtReferenceUnchanged(t *testing.T) {
 		t.Fatalf("write main.go: %v", err)
 	}
 
-	m := newModel(stubOrchestrator{}, dir)
+	m := newModel(stubOrchestrator{}, dir, "")
 	modelValue, _ := submitPrompt(m, "@main.go の概要を見せて")
 	next := modelValue.(model)
 
 	if len(next.messages) != 1 || next.messages[0].Content != "@main.go の概要を見せて" {
 		t.Fatalf("unexpected stored message: %+v", next.messages)
+	}
+}
+
+func TestSubmitPromptPassesDefaultModelToTurnRequest(t *testing.T) {
+	runner := &recordingOrchestrator{}
+	m := newModel(runner, t.TempDir(), "gpt-5")
+
+	modelValue, cmd := submitPrompt(m, "hello")
+	if cmd == nil {
+		t.Fatal("expected command")
+	}
+	_ = modelValue
+
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected batch message, got %T", msg)
+	}
+	if len(batch) == 0 {
+		t.Fatal("expected batch commands")
+	}
+	if _, ok := batch[0]().(chatMessage); !ok {
+		t.Fatalf("expected first batch command to return chatMessage")
+	}
+	if runner.last.Model != "gpt-5" {
+		t.Fatalf("expected default model to be passed, got %q", runner.last.Model)
 	}
 }

@@ -9,8 +9,8 @@ import (
 	"yagent/internal/domain"
 )
 
-func Run(runner domain.Orchestrator, approver *ApproverBridge, workingDir string) error {
-	m := newModel(runner, workingDir)
+func Run(runner domain.Orchestrator, approver *ApproverBridge, workingDir string, defaultModel string) error {
+	m := newModel(runner, workingDir, defaultModel)
 	program := tea.NewProgram(m)
 	approver.Attach(program)
 
