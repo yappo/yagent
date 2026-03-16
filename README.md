@@ -100,7 +100,31 @@ model の優先順は次です。
 
 ## Agent DSL
 
-user-defined agent は TOML で定義します。
+yagent には最初からいくつかの built-in agent が入っていますが、リポジトリ固有の役割は TOML で追加できます。  
+この TOML を README では `Agent DSL` と呼んでいます。
+
+Agent DSL を使うと、たとえば次のような専用 agent を追加できます。
+
+- ドキュメント更新専用 agent
+- テスト観点の洗い出し専用 agent
+- 特定ディレクトリだけを読む調査 agent
+
+Agent DSL のファイルは `agent_catalog.paths` に指定したファイルまたはディレクトリから読み込みます。  
+ディレクトリを指定した場合は、その中の `.toml` ファイルをすべて読み込みます。
+
+まず built-in agent の基本セットがあり、その上に user-defined agent を追加するイメージです。  
+`agents.<id>` は built-in agent の上書き設定で、Agent DSL は新しい agent を追加するための仕組みです。
+
+標準では次の built-in agent を同梱しています。
+
+- `manager`: ユーザー窓口と全体の取り回しを担当
+- `planner`: タスク分解を担当
+- `researcher`: 関連ファイルの探索と要点抽出を担当
+- `coder`: 実装ターンを担当
+- `tester`: 検証を担当
+- `reviewer`: レビューを担当
+
+user-defined agent は 1 ファイルにつき 1 agent を定義します。最小例は次です。
 
 ```toml
 id = "docs-writer"
@@ -115,17 +139,94 @@ timeout = "30s"
 tags = ["docs"]
 ```
 
-標準では次の built-in agent を同梱しています。
+主な項目の意味:
 
-- `manager`
-- `planner`
-- `researcher`
-- `coder`
-- `tester`
-- `reviewer`
+- `id`: agent の識別子。tool / handoff からこの ID で参照されます
+- `name`: UI に表示する名前。省略時は `id`
+- `description`: その agent が何を担当するかの短い説明
+- `instruction`: その agent に常に与える追加指示
+- `mode`: agent の使われ方。`tool` は補助役、`handoff` は実装の主担当、`manager` は窓口用です
+- `allowed_tools`: その agent が使ってよい tool 一覧
+- `read_only`: 読み取り専用 agent として扱いたいときに指定
+- `model`: その agent だけ別 model を使いたいときに指定
+- `max_turns`: その agent の最大継続ターン数
+- `timeout`: その agent の LLM 呼び出し timeout
+- `tags`: 人間向けの整理用ラベル
 
 `agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
 built-in agent の基本セットは最初から使えますが、追加の DSL で repo 専用 agent を拡張する前提です。
+
+## Task Catalog (`tasks.toml`)
+
+`task_list` / `task_run` で見える task は、自由なシェルコマンドではなく、事前登録した task だけを実行する仕組みです。  
+その登録ファイルが `tasks.toml` です。
+
+置き場所は次の 2 つです。
+
+- リポジトリごとの設定: `.yagent/tasks.toml`
+- ユーザー共通の設定: `~/.config/yagent/tasks.toml`
+
+これに加えて、`go.mod` や `package.json` などを見て自動で task テンプレートも追加されます。  
+読み込み順は「自動検出テンプレート → ユーザー設定 → リポジトリ設定」で、同じ `id` があれば後から読んだ定義が上書きします。
+
+最小例:
+
+```toml
+[[tasks]]
+id = "go:test"
+description = "Go のテストを実行"
+command = "go"
+args = ["test", "./..."]
+risk = "medium"
+allow_network = false
+timeout = 300
+```
+
+主な項目の意味:
+
+- `id`: task の識別子。`task_run` ではこの ID を指定します
+- `description`: 人間や agent が `task_list` で読む説明
+- `command`: 実行するコマンド本体
+- `args`: コマンド引数の配列
+- `cwd`: 実行ディレクトリ。省略時は現在のリポジトリ root
+- `risk`: `low` / `medium` / `high`。未指定時は `medium`
+- `allow_network`: ネットワーク利用を伴う task かどうか
+- `timeout`: タイムアウト秒数
+
+実用例:
+
+```toml
+[[tasks]]
+id = "go:test"
+description = "Go の全テストを実行"
+command = "go"
+args = ["test", "./..."]
+risk = "medium"
+allow_network = false
+timeout = 300
+
+[[tasks]]
+id = "go:build"
+description = "Go のビルドを実行"
+command = "go"
+args = ["build", "./..."]
+risk = "medium"
+allow_network = false
+timeout = 300
+
+[[tasks]]
+id = "frontend:test"
+description = "フロントエンドの単体テストを実行"
+command = "npm"
+args = ["test"]
+cwd = "web"
+risk = "medium"
+allow_network = false
+timeout = 600
+```
+
+`cwd` を相対パスで書いた場合は、現在の作業リポジトリを基準に解決されます。  
+まずは `description` を人間が見て分かる文にしておくと、`task_list` の一覧がかなり使いやすくなります。
 
 ## 実行ログ
 
