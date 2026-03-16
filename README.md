@@ -1,7 +1,21 @@
 # yagent
 
-yagent は OpenAI 互換 API を使ってローカルまたはリモートの LLM と対話する、TUI 中心の AI coding agent です。  
-Bubble Tea / Bubbles を使った対話 UI、permission UI、tool call UI、単発実行 CLI に加えて、宣言的 Agent DSL による動的サブエージェント実行を備えています。
+「AIに bash 渡しとけば賢くやるでしょ」をやめた yagent は Bash tool を置かず task catalog/file permission/MCP wrappingでコンテキスト問題対策/subagent orchestration を最初から設計に入れた、*LLMを信用しない* 前提の coding agent。でも task や agent 追加は簡単!
+https://github.com/yappo/yagent/
+
+## yagent のユニークなポイント
+
+yagent は、「LLM に bash を渡しておけば勝手に賢くやる」という発想ではなく、「LLM は便利だが、そのまま広い権限を与えるには信用しきれない」という前提から設計した coding agent です。そのため、あえて汎用の Bash tool は持たせていません。自由な shell 実行は強力ですが、モデルの誤解や暴走がそのまま危険操作につながりやすく、実運用では不安要素にもなります。yagent はそこを便利さで押し切らず、最初から危険な操作を簡単には通さない構造を選んでいます。
+
+ただし、bash を消すだけでは不便になります。そこで yagent では、必要な作業を `tasks.toml` の task catalog として追加できるようにし、ビルド、テスト、検証、補助コマンド、MCP server の bind などを、安全性を意識した独自ツール経由で扱えるようにしています。つまり「何でも shell でやらせる」のではなく、「このリポジトリでは何を許可するか」を宣言的に定義して実行する形です。安全側に倒しつつ、運用上必要な task は素直に足せるので、窮屈な固定製品ではなく、現場仕様に育てやすい構成になっています。
+
+ファイルアクセスも同じ思想です。広く自由に読める・書ける方が短期的には便利ですが、実際にはそれがそのまま不安につながります。yagent ではアクセス可能なパスを明示的に絞り込みつつ、作業の流れを止めすぎないよう permission UI を通じて問題ない範囲だけ段階的に緩められます。厳しく閉じるだけでもなく、最初から全部開けるだけでもなく、現場で扱いやすい粒度で制御できることを重視しています。
+
+MCP Server についても、そのまま無造作に露出させるのではなく、task catalog と bind フローの中で独自にラップしています。これは安全性のためだけではありません。MCP は便利な一方で、server や tool の情報を常時抱え込むとコンテキストを食いやすく、必要のない情報まで LLM に渡し続ける構造になりがちです。yagent では必要なときにだけ `task_bind` で server を bind し、必要な tool だけを公開できるので、コンテキスト消費を抑えながら拡張性も確保しやすくなっています。
+
+さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、handoff や delegate を通じて仕事を分け、必要なら ephemeral agent もその場で生成できます。そして repo 固有の役割も、Agent DSL でシンプルに追加できます。README 専用 agent、テスト観点整理 agent、特定ディレクトリ専用の調査 agent のようなものを、コード改修なしで足していけます。
+
+要するに yagent は、単なる「TUI から LLM を叩くツール」でも、単なる「自律実行が派手な agent」でもありません。Bash を安易に渡さず、task catalog・file permission・MCP wrapping・subagent orchestration を最初から設計に入れたうえで、それでも task や agent は簡単に拡張できるようにした、**“LLM を信用しない” 前提の実運用志向 coding agent** です。
 
 ## 特徴
 
@@ -154,27 +168,6 @@ tags = ["docs"]
 - `timeout`: その agent の LLM 呼び出し timeout
 - `tags`: 人間向けの整理用ラベル
 
-`allowed_tools` は完全一致に加えて、末尾 `*` の prefix wildcard を使えます。たとえば `fs_*` は `fs_read` / `fs_write` / `fs_list` / `fs_stat` にマッチします。
-
-```toml
-allowed_tools = ["fs_*", "git_*", "mcp__*"]
-```
-
-注意点として、MCP server は `task_bind` で起動・bind しますが、bind 後に実際に呼ばれるのは `mcp__...` という tool です。  
-そのため、MCP を扱う agent では用途に応じて次の権限を分けて考えます。
-
-- `task_list`: 利用可能な task を確認する
-- `task_bind`: MCP server task を bind する
-- `mcp__*`: bind 後に公開された MCP tool を実行する
-
-たとえば「MCP server の bind から実行までできる agent」は次のように書けます。
-
-```toml
-allowed_tools = ["task_list", "task_bind", "mcp__*"]
-```
-
-`mcp:*` のような指定は使わず、tool 名の prefix に合わせて `mcp__*` を使ってください。
-
 `agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
 built-in agent の基本セットは最初から使えますが、追加の DSL で repo 専用 agent を拡張する前提です。
 
@@ -316,10 +309,6 @@ include_tools = ["search_docs"]
 - `@` 入力中: `pwd` 基準の相対パス候補を表示
 - `Tab`: 候補コマンドまたはファイルパスを補完
 - `/help`: ヘルプ表示
-- `/tools`: 利用可能な tool 一覧を表示
-- `/tasks`: 登録済み task 一覧を表示
-- `/mcp`: bind 済み MCP tool 一覧を表示
-- `/agents`: 利用可能な agent 一覧を表示
 - `/clear`: 会話ログをクリア
 - `/exit`: 終了
 
