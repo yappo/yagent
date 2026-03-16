@@ -11,7 +11,6 @@ import (
 	infraLLM "yagent/internal/infra/llm"
 	"yagent/internal/infra/logging"
 	"yagent/internal/infra/policy"
-	filetools "yagent/internal/infra/tools/file"
 	fstools "yagent/internal/infra/tools/fs"
 	gittools "yagent/internal/infra/tools/git"
 	patchtools "yagent/internal/infra/tools/patch"
@@ -60,7 +59,6 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 	}
 
 	allowPaths := append([]string{pwd}, cfg.File.AllowPaths...)
-	validator := filetools.NewValidator(pwd, allowPaths)
 	pathPolicy := policy.NewPathPolicy(pwd, allowPaths)
 	policyEngine := policy.NewEngine()
 
@@ -70,9 +68,6 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 	}
 
 	tools := registry.New(
-		filetools.NewReadTool(validator, approver),
-		filetools.NewWriteTool(validator, approver),
-		filetools.NewListTool(validator, approver),
 		fstools.NewReadTool(pathPolicy, policyEngine, approver),
 		fstools.NewWriteTool(pathPolicy, policyEngine, approver),
 		fstools.NewListTool(pathPolicy, policyEngine, approver),

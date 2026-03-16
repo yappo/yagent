@@ -6,7 +6,7 @@ import (
 	"sort"
 
 	"yagent/internal/domain"
-	filetools "yagent/internal/infra/tools/file"
+	"yagent/internal/infra/tools/execctx"
 )
 
 type Registry struct {
@@ -79,5 +79,5 @@ func isAllowed(agent domain.AgentSpec, toolName string) bool {
 }
 
 func filetoolContext(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall) context.Context {
-	return filetools.WithExecutionContext(ctx, agent.ID, call.Purpose)
+	return execctx.WithExecutionContext(ctx, agent.ID, call.Purpose)
 }

@@ -221,7 +221,7 @@ func TestRunTurnSupportsEphemeralAgent(t *testing.T) {
 func TestToolMessageCarriesToolCallID(t *testing.T) {
 	msg := toolMessage(domain.ToolCall{
 		ID:                 "call-123",
-		Name:               "directory_list",
+		Name:               "fs_list",
 		RequestedByAgentID: "manager",
 	}, "output")
 
@@ -446,7 +446,7 @@ func TestRunAgentRequestsContinuationAtMaxTurns(t *testing.T) {
 		&fakeModelClient{
 			responses: map[string][]domain.ModelResponse{
 				"manager": {
-					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "directory_list", Arguments: map[string]any{"directory_path": "cmd"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "fs_list", Arguments: map[string]any{"path": "cmd"}}}}},
 					{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
 				},
 			},
@@ -482,9 +482,9 @@ func TestContinueApprovalDoesNotUseDeadlineContext(t *testing.T) {
 						Role: domain.RoleAssistant,
 						ToolCalls: []domain.ToolCall{{
 							ID:   "1",
-							Name: "directory_list",
+							Name: "fs_list",
 							Arguments: map[string]any{
-								"directory_path": "cmd",
+								"path": "cmd",
 							},
 						}},
 					},
@@ -516,9 +516,9 @@ func TestToolExecutionDoesNotUseDeadlineContext(t *testing.T) {
 						Role: domain.RoleAssistant,
 						ToolCalls: []domain.ToolCall{{
 							ID:   "1",
-							Name: "directory_list",
+							Name: "fs_list",
 							Arguments: map[string]any{
-								"directory_path": "cmd",
+								"path": "cmd",
 							},
 						}},
 					},

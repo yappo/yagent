@@ -30,7 +30,7 @@ id = "docs-writer"
 name = "Docs Writer"
 instruction = "Write docs"
 mode = "tool"
-allowed_tools = ["file_reader"]
+allowed_tools = ["fs_read"]
 read_only = true
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

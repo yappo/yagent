@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"yagent/internal/domain"
+	"yagent/internal/infra/tools/execctx"
 )
 
 type listTool struct {
@@ -125,6 +126,8 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 	if err != nil {
 		return err
 	}
+	request.AgentID = execctx.AgentID(ctx)
+	request.Purpose = execctx.Purpose(ctx)
 	if taskDef.AllowNetwork {
 		request.SideEffects = append(request.SideEffects, "network_access")
 		request.Risk = "high"

@@ -8,6 +8,7 @@ import (
 
 	"yagent/internal/domain"
 	"yagent/internal/infra/policy"
+	"yagent/internal/infra/tools/execctx"
 )
 
 type tool struct {
@@ -134,6 +135,8 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 	if err != nil {
 		return err
 	}
+	request.AgentID = execctx.AgentID(ctx)
+	request.Purpose = execctx.Purpose(ctx)
 	if decision == domain.PolicyAllow {
 		return nil
 	}

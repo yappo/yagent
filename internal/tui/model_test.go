@@ -39,7 +39,7 @@ func TestPermissionRequestState(t *testing.T) {
 
 	modelValue, _ := m.Update(permissionRequestMsg{
 		request: domain.PermissionRequest{
-			ToolName:  "file_reader",
+			ToolName:  "fs_read",
 			Operation: "ファイル読み取り",
 			Resource:  "/tmp/a.txt",
 		},
@@ -59,7 +59,7 @@ func TestPermissionRequestsQueueInsteadOfOverwriting(t *testing.T) {
 
 	modelValue, _ := m.Update(permissionRequestMsg{
 		request: domain.PermissionRequest{
-			ToolName:  "directory_list",
+			ToolName:  "fs_list",
 			Operation: "ディレクトリ一覧取得",
 			Resource:  "/tmp/one",
 		},
@@ -69,7 +69,7 @@ func TestPermissionRequestsQueueInsteadOfOverwriting(t *testing.T) {
 
 	modelValue, _ = next.Update(permissionRequestMsg{
 		request: domain.PermissionRequest{
-			ToolName:  "directory_list",
+			ToolName:  "fs_list",
 			Operation: "ディレクトリ一覧取得",
 			Resource:  "/tmp/two",
 		},
@@ -95,7 +95,7 @@ func TestPermissionCardShowsRequester(t *testing.T) {
 	m.width = 100
 	m.permission = &permissionState{
 		request: domain.PermissionRequest{
-			ToolName:  "file_reader",
+			ToolName:  "fs_read",
 			Operation: "ファイル読み取り",
 			Resource:  "/tmp/a.txt",
 			AgentID:   "researcher",
@@ -113,7 +113,7 @@ func TestResolvePermissionAppendsRequesterToOutput(t *testing.T) {
 	m := newTestModel(t)
 	m.permission = &permissionState{
 		request: domain.PermissionRequest{
-			ToolName:  "file_reader",
+			ToolName:  "fs_read",
 			Operation: "ファイル読み取り",
 			Resource:  "/tmp/a.txt",
 			AgentID:   "manager",
@@ -286,7 +286,7 @@ func TestPermissionTabDoesNotTriggerCommandCompletion(t *testing.T) {
 	response := make(chan domain.PermissionDecision, 1)
 	m.permission = &permissionState{
 		request: domain.PermissionRequest{
-			ToolName:  "file_reader",
+			ToolName:  "fs_read",
 			Operation: "ファイル読み取り",
 			Resource:  "/tmp/a.txt",
 		},

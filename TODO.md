@@ -3,7 +3,7 @@
 ## Next
 
 - permission ダイアログの一括承認 UI
-- `directory_list` / `fs_list` の探索粒度最適化と重複要求削減
+- `fs_list` の探索粒度最適化と重複要求削減
 - Agent Status viewport から失敗理由の詳細を開けるようにする
 - 会話ログの永続化
 - exec モードでも TUI と同等のイベント要約を見やすく出す
@@ -21,7 +21,7 @@
 - permission queue は大量件数でも動くが、同種 request の集約やバッチ承認がまだない
 - tool observer と approver bridge の責務整理
 - orchestrator の event payload は UI 表示用 detail とログ用 detail が混ざっている
-- `directory_list` / `fs_list` の結果をより強く再利用し、同じ探索を繰り返さないようにしたい
+- `fs_list` の結果をより強く再利用し、同じ探索を繰り返さないようにしたい
 - path policy は将来的に glob / rule ベースへ拡張したい
 - task catalog の schema validation と分かりやすいエラーメッセージ整備
 - `exec` コマンドも TUI と同じイベント基盤へさらに寄せたい

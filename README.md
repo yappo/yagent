@@ -108,7 +108,7 @@ name = "Docs Writer"
 description = "README や設計メモの更新を担当"
 instruction = "Write concise docs with concrete examples."
 mode = "tool"
-allowed_tools = ["file_reader", "fs_read"]
+allowed_tools = ["fs_read"]
 read_only = true
 max_turns = 4
 timeout = "30s"
@@ -232,7 +232,7 @@ internal/
 - `delegate_to_<agent>` で bounded task を subagent に委譲
 - `handoff_to_<agent>` で専門 agent に現在ターンを handoff
 - `run_ephemeral_agent` で一時的な subagent を即席生成
-- リポジトリ探索には `directory_list` や `fs_list` を優先し、単純な一覧取得のためにスクリプト生成へ逃がさない
+- リポジトリ探索には `fs_list` を優先し、単純な一覧取得のためにスクリプト生成へ逃がさない
 - `planner -> coder -> planner` のような再委譲ループは orchestrator で抑止
 - 並列化は非破壊系 task のみ。書き込み系は常に直列化
 
@@ -240,7 +240,6 @@ internal/
 
 現在の主な tool は次です。
 
-- `file_reader` / `file_writer` / `directory_list`
 - `fs_read` / `fs_write` / `fs_list` / `fs_stat` / `fs_remove` / `fs_move`
 - `search_text` / `search_files`
 - `git_status` / `git_diff` / `git_log` / `git_show`
