@@ -26,6 +26,7 @@ type Service struct {
 	tools      domain.ToolExecutor
 	catalog    domain.AgentCatalog
 	config     Config
+	observer   domain.ToolObserver
 	runCounter atomic.Uint64
 	mu         sync.Mutex
 	listeners  map[chan domain.ExecutionEvent]struct{}
@@ -66,6 +67,10 @@ func (s *Service) SubscribeEvents() (<-chan domain.ExecutionEvent, func()) {
 	}
 
 	return ch, cancel
+}
+
+func (s *Service) SetObserver(observer domain.ToolObserver) {
+	s.observer = observer
 }
 
 func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (domain.TurnResult, error) {
@@ -350,7 +355,9 @@ func (s *Service) executeOne(ctx context.Context, invocation domain.AgentInvocat
 		}
 		return toolMessage(item.call, result.Message.Content), nil, result.Events, nil
 	default:
+		s.notifyToolEvent(ctx, domain.ToolEvent{Phase: "start", Call: item.call})
 		result := s.tools.Execute(ctx, invocation.Agent, item.call)
+		s.notifyToolEvent(ctx, domain.ToolEvent{Phase: "finish", Call: item.call, Result: result})
 		eventType := "tool_called"
 		detail := item.call.Name
 		if !result.Success {
@@ -359,6 +366,12 @@ func (s *Service) executeOne(ctx context.Context, invocation domain.AgentInvocat
 		}
 		events := []domain.ExecutionEvent{s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, eventType, detail, countContextItems(invocation.Messages, invocation.Context))}
 		return toolMessage(item.call, result.Output), nil, events, nil
+	}
+}
+
+func (s *Service) notifyToolEvent(ctx context.Context, event domain.ToolEvent) {
+	if s.observer != nil {
+		s.observer.OnToolEvent(ctx, event)
 	}
 }
 

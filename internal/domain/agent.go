@@ -42,6 +42,7 @@ type ToolDefinition struct {
 	Name             string
 	Description      string
 	Parameters       map[string]any
+	Metadata         map[string]any
 	ReadOnly         bool
 	ParallelSafe     bool
 	MutatesWorkspace bool

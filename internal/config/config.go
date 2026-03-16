@@ -38,10 +38,6 @@ type ExecutionConfig struct {
 	DefaultTimeout    Duration `toml:"default_timeout"`
 }
 
-type Duration struct {
-	time.Duration
-}
-
 type AgentCatalogConfig struct {
 	Paths []string `toml:"paths"`
 }
@@ -51,6 +47,10 @@ type AgentOverride struct {
 	Model        string   `toml:"model"`
 	AllowedTools []string `toml:"allowed_tools"`
 	Disabled     bool     `toml:"disabled"`
+}
+
+type Duration struct {
+	time.Duration
 }
 
 func Load(path string) (Config, error) {

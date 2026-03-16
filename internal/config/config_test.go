@@ -21,6 +21,9 @@ func TestLoadDefault(t *testing.T) {
 	if server.URL != "http://localhost:1234" {
 		t.Fatalf("unexpected default URL: %s", server.URL)
 	}
+	if cfg.Execution.MaxParallelAgents != 2 {
+		t.Fatalf("unexpected default max parallel agents: %d", cfg.Execution.MaxParallelAgents)
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -41,6 +44,7 @@ allow_paths = ["/tmp"]
 
 [execution]
 max_parallel_agents = 1
+max_handoff_depth = 3
 default_timeout = "600s"
 
 [agent_catalog]
@@ -72,10 +76,30 @@ instruction = "custom coder"
 	if cfg.Execution.MaxParallelAgents != 1 {
 		t.Fatalf("unexpected max_parallel_agents: %d", cfg.Execution.MaxParallelAgents)
 	}
-	if cfg.Execution.DefaultTimeout.Duration.Seconds() != 600 {
+	if cfg.Execution.MaxHandoffDepth != 3 {
+		t.Fatalf("unexpected max_handoff_depth: %d", cfg.Execution.MaxHandoffDepth)
+	}
+	if cfg.Execution.DefaultTimeout.Duration != 600*time.Second {
 		t.Fatalf("unexpected default_timeout: %s", cfg.Execution.DefaultTimeout.Duration)
 	}
 	if cfg.Agents["coder"].Instruction != "custom coder" {
 		t.Fatalf("unexpected coder override: %+v", cfg.Agents["coder"])
+	}
+}
+
+func TestLoadRejectsInvalidParallelAgents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[execution]
+max_parallel_agents = 0
+max_handoff_depth = 1
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error")
 	}
 }

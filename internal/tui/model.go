@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -33,6 +34,19 @@ type permissionState struct {
 	selectedIndex int
 }
 
+type toolCallState struct {
+	name    string
+	target  string
+	options []string
+	status  string
+	success *bool
+}
+
+type toolLogEntry struct {
+	title   string
+	content string
+}
+
 type permissionOption struct {
 	label    string
 	decision domain.PermissionDecision
@@ -55,9 +69,12 @@ type model struct {
 	height           int
 	viewport         viewport.Model
 	statusViewport   viewport.Model
+	toolLogViewport  viewport.Model
 	textarea         textarea.Model
 	history          []string
 	historyIndex     int
+	activeTool       *toolCallState
+	toolLogs         []toolLogEntry
 	permission       *permissionState
 	permissionQueue  []permissionState
 	sessionApprovals map[string]bool
@@ -90,6 +107,15 @@ type styles struct {
 	tool               lipgloss.Style
 	separator          lipgloss.Style
 	hint               lipgloss.Style
+	toolCard           lipgloss.Style
+	toolTitle          lipgloss.Style
+	toolMeta           lipgloss.Style
+	toolOption         lipgloss.Style
+	toolSuccess        lipgloss.Style
+	toolFailure        lipgloss.Style
+	toolLogCard        lipgloss.Style
+	toolLogTitle       lipgloss.Style
+	toolLogHint        lipgloss.Style
 	permissionCard     lipgloss.Style
 	permissionTitle    lipgloss.Style
 	permissionPath     lipgloss.Style
@@ -150,6 +176,7 @@ func newModel(runner domain.Orchestrator, workingDir string) model {
 		selectedRefs:     map[string]string{},
 		viewport:         viewport.New(),
 		statusViewport:   viewport.New(),
+		toolLogViewport:  viewport.New(),
 		textarea:         ta,
 		history:          []string{},
 		sessionApprovals: map[string]bool{},
@@ -171,6 +198,21 @@ func defaultStyles() styles {
 		tool:      lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Italic(true),
 		separator: lipgloss.NewStyle().Foreground(lipgloss.Color("240")),
 		hint:      lipgloss.NewStyle().Foreground(lipgloss.Color("99")).Italic(true),
+		toolCard: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("242")).
+			Padding(0, 1),
+		toolTitle:   lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Bold(true),
+		toolMeta:    lipgloss.NewStyle().Foreground(lipgloss.Color("250")),
+		toolOption:  lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		toolSuccess: lipgloss.NewStyle().Foreground(lipgloss.Color("114")).Bold(true),
+		toolFailure: lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
+		toolLogCard: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("238")).
+			Padding(0, 1),
+		toolLogTitle: lipgloss.NewStyle().Foreground(lipgloss.Color("223")).Bold(true),
+		toolLogHint:  lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
 		permissionCard: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("240")).
@@ -222,6 +264,12 @@ func (m *model) syncLayout() {
 	if m.hasCompletionCandidates() {
 		footerHeight += m.completionSuggestionsHeight()
 	}
+	if m.activeTool != nil {
+		footerHeight += m.toolCardHeight()
+	}
+	if m.hasToolLogs() {
+		footerHeight += m.toolLogCardHeight()
+	}
 	if m.permission != nil {
 		footerHeight += m.permissionCardHeight()
 	}
@@ -242,14 +290,28 @@ func (m *model) syncLayout() {
 		m.statusViewport.SetWidth(statusWidth)
 		m.statusViewport.SetHeight(maxInt(3, mainHeight-paneChromeHeight))
 	}
+	m.syncToolLogViewport()
 	m.refreshViewport()
 }
 
 func (m *model) refreshViewport() {
 	m.viewport.SetContent(m.renderLog())
 	m.statusViewport.SetContent(m.renderStatus())
+	m.syncToolLogViewport()
 	m.viewport.GotoBottom()
 	m.statusViewport.GotoTop()
+}
+
+func (m *model) syncToolLogViewport() {
+	if !m.hasToolLogs() || m.width <= 0 {
+		return
+	}
+
+	contentWidth := maxInt(1, m.width-6)
+	m.toolLogViewport.SetWidth(contentWidth)
+	m.toolLogViewport.SetHeight(m.toolLogViewportHeight())
+	m.toolLogViewport.SetContent(m.renderToolLogs(contentWidth))
+	m.toolLogViewport.GotoBottom()
 }
 
 func (m model) renderLog() string {
@@ -295,7 +357,13 @@ func appendOutputBlock(output []string, label, content string) []string {
 }
 
 func approvalKey(request domain.PermissionRequest) string {
-	return request.ToolName + "\x00" + request.Resource
+	return strings.Join([]string{
+		request.ToolName,
+		request.Action,
+		request.ResourceKind,
+		request.Scope,
+		request.Risk,
+	}, "\x00")
 }
 
 func (m model) currentInput() string {
@@ -321,6 +389,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.permissionQueue = append(m.permissionQueue, state)
 		}
 		m.syncLayout()
+		return m, nil
+
+	case toolEventMsg:
+		switch msg.event.Phase {
+		case "start":
+			m.activeTool = buildToolCallState(msg.event.Call)
+		case "finish":
+			m.activeTool = finalizeToolCallState(msg.event.Call, msg.event.Result, m.activeTool)
+			m.appendToolLog(msg.event.Call, msg.event.Result)
+			m.output = append(m.output, formatToolSummary(m.activeTool))
+			m.output = append(m.output, "───────────────────────────────────────────────────────────────────────")
+			m.activeTool = nil
+		}
+		m.syncLayout()
+		m.refreshViewport()
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -644,6 +727,20 @@ func (m model) permissionCardHeight() int {
 	return lipgloss.Height(m.renderPermissionCard())
 }
 
+func (m model) toolCardHeight() int {
+	if m.activeTool == nil {
+		return 0
+	}
+	return lipgloss.Height(m.renderToolCard())
+}
+
+func (m model) toolLogCardHeight() int {
+	if !m.hasToolLogs() {
+		return 0
+	}
+	return m.toolLogViewportHeight() + 4
+}
+
 func (m model) renderPermissionCard() string {
 	if m.permission == nil {
 		return ""
@@ -656,8 +753,21 @@ func (m model) renderPermissionCard() string {
 		m.styles.permissionPath.Render(resource),
 		m.styles.permissionHelp.Render("requester: " + permissionRequesterDisplay(m.permission.request)),
 	}
+	if summary := strings.TrimSpace(m.permission.request.Summary); summary != "" {
+		lines = append(lines, m.styles.permissionHelp.Render(summary))
+	}
 	if m.permission.request.Purpose != "" {
 		lines = append(lines, m.styles.permissionHelp.Render("purpose: "+m.permission.request.Purpose))
+	}
+	meta := strings.TrimSpace(strings.Join([]string{
+		"risk: " + fallbackString(m.permission.request.Risk, "-"),
+		"scope: " + fallbackString(m.permission.request.Scope, "-"),
+	}, " • "))
+	if meta != "" {
+		lines = append(lines, m.styles.permissionHelp.Render(meta))
+	}
+	if len(m.permission.request.SideEffects) > 0 {
+		lines = append(lines, m.styles.permissionHelp.Render("effects: "+strings.Join(m.permission.request.SideEffects, ", ")))
 	}
 	lines = append(lines,
 		renderPermissionOptions(m.permission.selectedIndex, m.styles.permissionSelected, m.styles.permissionOption),
@@ -665,6 +775,49 @@ func (m model) renderPermissionCard() string {
 	)
 	card := strings.Join(lines, "\n")
 	return m.styles.permissionCard.Width(cardWidth).Render(card)
+}
+
+func (m model) renderToolCard() string {
+	if m.activeTool == nil {
+		return ""
+	}
+
+	cardWidth := maxInt(32, m.width-2)
+	statusStyle := m.styles.toolMeta
+	if m.activeTool.success != nil {
+		if *m.activeTool.success {
+			statusStyle = m.styles.toolSuccess
+		} else {
+			statusStyle = m.styles.toolFailure
+		}
+	}
+
+	lines := []string{
+		m.styles.toolTitle.Render("Tool Use"),
+		m.styles.toolMeta.Render(m.activeTool.name + "  " + statusStyle.Render(m.activeTool.status)),
+	}
+	if m.activeTool.target != "" {
+		lines = append(lines, m.styles.permissionPath.Render(trimPathFromEnd(m.activeTool.target, cardWidth-4)))
+	}
+	for _, option := range m.activeTool.options {
+		lines = append(lines, m.styles.toolOption.Render("• "+option))
+	}
+
+	return m.styles.toolCard.Width(cardWidth).Render(strings.Join(lines, "\n"))
+}
+
+func (m model) renderToolLogCard() string {
+	if !m.hasToolLogs() {
+		return ""
+	}
+
+	cardWidth := maxInt(32, m.width-2)
+	lines := []string{
+		m.styles.toolLogTitle.Render("Tool Logs"),
+		m.styles.toolLogHint.Render("stdout/stderr や一覧結果など、ユーザに意味のある tool 出力を表示"),
+		m.toolLogViewport.View(),
+	}
+	return m.styles.toolLogCard.Width(cardWidth).Render(strings.Join(lines, "\n"))
 }
 
 func renderPermissionOptions(selected int, selectedStyle, baseStyle lipgloss.Style) string {
@@ -703,6 +856,216 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func fallbackString(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func (m *model) appendToolLog(call domain.ToolCall, result domain.ToolResult) {
+	content := strings.TrimSpace(result.Output)
+	if content == "" {
+		return
+	}
+	content = compactToolLogContent(content)
+	if content == "" {
+		return
+	}
+
+	entry := toolLogEntry{
+		title:   formatToolLogTitle(call, result.Success),
+		content: content,
+	}
+	m.toolLogs = append(m.toolLogs, entry)
+	if len(m.toolLogs) > 20 {
+		m.toolLogs = m.toolLogs[len(m.toolLogs)-20:]
+	}
+}
+
+func (m model) hasToolLogs() bool {
+	return len(m.toolLogs) > 0
+}
+
+func (m model) toolLogViewportHeight() int {
+	if m.height <= 0 {
+		return 8
+	}
+	height := (m.height - 8) / 3
+	if height < 6 {
+		height = 6
+	}
+	if height > 14 {
+		height = 14
+	}
+	return height
+}
+
+func (m model) renderToolLogs(width int) string {
+	if len(m.toolLogs) == 0 {
+		return ""
+	}
+
+	blocks := make([]string, 0, len(m.toolLogs))
+	for _, entry := range m.toolLogs {
+		blocks = append(blocks, m.styles.toolMeta.Render(entry.title)+"\n"+wrapContent(entry.content, width))
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+func buildToolCallState(call domain.ToolCall) *toolCallState {
+	target, options := summarizeToolCall(call)
+	return &toolCallState{
+		name:    call.Name,
+		target:  target,
+		options: options,
+		status:  "requesting",
+	}
+}
+
+func finalizeToolCallState(call domain.ToolCall, result domain.ToolResult, current *toolCallState) *toolCallState {
+	state := current
+	if state == nil {
+		state = buildToolCallState(call)
+	}
+	success := result.Success
+	state.success = &success
+	if result.Success {
+		state.status = "completed"
+	} else {
+		state.status = "failed"
+	}
+	return state
+}
+
+func summarizeToolCall(call domain.ToolCall) (string, []string) {
+	targetKeys := []string{"path", "repo_path", "root", "task_id", "source_path", "destination_path", "target"}
+	target := ""
+	for _, key := range targetKeys {
+		if value, ok := call.Arguments[key]; ok {
+			target = stringifyToolValue(value)
+			if target != "" {
+				break
+			}
+		}
+	}
+
+	keys := make([]string, 0, len(call.Arguments))
+	for key := range call.Arguments {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	options := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if isPrimaryTargetKey(key) {
+			continue
+		}
+		options = append(options, fmt.Sprintf("%s=%s", key, stringifyToolValue(call.Arguments[key])))
+	}
+	if len(options) == 0 {
+		options = append(options, "no extra options")
+	}
+
+	return target, options
+}
+
+func formatToolSummary(state *toolCallState) string {
+	if state == nil {
+		return ""
+	}
+	status := "done"
+	if state.success != nil && !*state.success {
+		status = "failed"
+	}
+	line := "tool " + state.name + " " + status
+	if state.target != "" {
+		line += " • target=" + state.target
+	}
+	if len(state.options) > 0 {
+		line += " • " + strings.Join(state.options, " • ")
+	}
+	return line
+}
+
+func isPrimaryTargetKey(key string) bool {
+	switch key {
+	case "path", "repo_path", "root", "task_id", "target":
+		return true
+	default:
+		return false
+	}
+}
+
+func stringifyToolValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		if len(typed) > 80 {
+			return typed[:77] + "..."
+		}
+		return typed
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return fmt.Sprintf("%.0f", typed)
+	case int:
+		return fmt.Sprintf("%d", typed)
+	case []any:
+		return fmt.Sprintf("%d items", len(typed))
+	case map[string]any:
+		if data, err := json.Marshal(typed); err == nil {
+			return string(data)
+		}
+	}
+	if data, err := json.Marshal(value); err == nil {
+		text := string(data)
+		if len(text) > 80 {
+			return text[:77] + "..."
+		}
+		return text
+	}
+	return fmt.Sprintf("%v", value)
+}
+
+func formatToolLogTitle(call domain.ToolCall, success bool) string {
+	status := "done"
+	if !success {
+		status = "failed"
+	}
+	target, _ := summarizeToolCall(call)
+	if target == "" {
+		return call.Name + " • " + status
+	}
+	return call.Name + " • " + status + " • " + target
+}
+
+func compactToolLogContent(content string) string {
+	lines := strings.Split(content, "\n")
+	trimmed := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		if strings.TrimSpace(line) == "" {
+			trimmed = append(trimmed, "")
+			continue
+		}
+		trimmed = append(trimmed, line)
+	}
+
+	for len(trimmed) > 0 && trimmed[0] == "" {
+		trimmed = trimmed[1:]
+	}
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == "" {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	if len(trimmed) > 120 {
+		trimmed = append(trimmed[:120], "... (truncated)")
+	}
+	return strings.Join(trimmed, "\n")
+}
+
 func loadingTick() tea.Cmd {
 	return tea.Tick(loadingInterval, func(time.Time) tea.Msg {
 		return loadingTickMsg{}
@@ -731,6 +1094,18 @@ func (m model) View() tea.View {
 	offsetY += lipgloss.Height(mainView)
 	sb.WriteString("\n")
 	offsetY++
+	if m.hasToolLogs() {
+		card := m.renderToolLogCard()
+		sb.WriteString(card)
+		sb.WriteString("\n")
+		offsetY += lipgloss.Height(card) + 1
+	}
+	if m.activeTool != nil {
+		card := m.renderToolCard()
+		sb.WriteString(card)
+		sb.WriteString("\n")
+		offsetY += lipgloss.Height(card) + 1
+	}
 	if m.permission != nil {
 		card := m.renderPermissionCard()
 		sb.WriteString(card)

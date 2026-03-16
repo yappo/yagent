@@ -5,8 +5,29 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = "your-api-token"
+# 秒単位の HTTP タイムアウト。未指定時は 900 (15 分)
+timeout = 900
 
 [file]
 # ファイル操作の許可範囲を設定
 # 例: allow_paths = ["/home/user/project", "/tmp"]
 allow_paths = []
+
+[agent]
+# LLM と tool loop の最大反復回数
+max_iterations = 100
+
+# task はこの config.toml には書きません。
+# task を使う場合は、別ファイルとして次のどちらかを作成します。
+#   .yagent/tasks.toml
+#   ~/.config/yagent/tasks.toml
+#
+# 例:
+#   [[tasks]]
+#   id = "go:test"
+#   description = "Go のテストを実行"
+#   command = "go"
+#   args = ["test", "./..."]
+#   risk = "medium"
+#   allow_network = false
+#   timeout = 300

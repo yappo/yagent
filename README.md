@@ -1,7 +1,7 @@
 # yagent
 
 yagent は OpenAI 互換 API を使ってローカルまたはリモートの LLM と対話する、TUI 中心の AI coding agent です。  
-Bubble Tea / Bubbles を使った対話 UI、ファイル操作の許可 UI、単発実行 CLI に加えて、宣言的 Agent DSL による動的サブエージェント実行を備えています。
+Bubble Tea / Bubbles を使った対話 UI、permission UI、tool call UI、単発実行 CLI に加えて、宣言的 Agent DSL による動的サブエージェント実行を備えています。
 
 ## 特徴
 
@@ -13,10 +13,12 @@ Bubble Tea / Bubbles を使った対話 UI、ファイル操作の許可 UI、�
 - Bubble Tea / Bubbles ベースの TUI
 - OpenAI 互換の `chat/completions` API に対応
 - Agent Status viewport による実行状況モニター
-- ツールレジストリ経由で file read / write / directory list を実行
+- tool call card / tool log card による実行中ツール表示
+- ツールレジストリ経由で `file` `fs` `search` `git` `task` `patch` を実行
 - Claude Code 風の permission UI
 - `--log <path>` による JSON Lines イベントログ
 - `execution.max_parallel_agents` による並列実行制御 (`min = 1`)
+- `task_list` / `task_run` による安全寄りの Task Catalog
 - `internal/` ベースで責務分離した構成
 
 ## コマンド
@@ -88,7 +90,7 @@ instruction = "Review for regressions first."
 
 起動時のカレントディレクトリは自動で許可パスに追加されます。
 
-### Agent DSL
+## Agent DSL
 
 user-defined agent は TOML で定義します。
 
@@ -98,7 +100,7 @@ name = "Docs Writer"
 description = "README や設計メモの更新を担当"
 instruction = "Write concise docs with concrete examples."
 mode = "tool"
-allowed_tools = ["file_reader"]
+allowed_tools = ["file_reader", "fs_read"]
 read_only = true
 max_turns = 4
 timeout = "30s"
@@ -117,7 +119,7 @@ tags = ["docs"]
 `agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
 built-in agent の基本セットは最初から使えますが、追加の DSL で repo 専用 agent を拡張する前提です。
 
-### 実行ログ
+## 実行ログ
 
 `--log <path>` を指定すると、実行イベントを JSON Lines 形式で出力します。
 
@@ -131,7 +133,7 @@ built-in agent の基本セットは最初から使えますが、追加の DSL 
 - `permission.requested`
 - `permission.resolved`
 
-`tool_failed` と `agent_failed` には失敗理由も記録されるので、subagent の失敗調査に使えます。
+`tool_failed` と `agent_failed` には失敗理由も記録されるので、subagent の失敗調査に使えます。  
 権限確認や継続確認が複数同時に発生した場合でも、TUI 側で順番に処理できます。
 
 ## TUI 操作
@@ -149,7 +151,7 @@ built-in agent の基本セットは最初から使えますが、追加の DSL 
 
 ### Permission UI
 
-ファイル操作が必要なときは、下部に permission card を表示します。
+ファイル操作や task 実行などで許可が必要なときは、下部に permission card を表示します。
 
 - `←/→` または `Tab`: 選択移動
 - `Enter`: 確定
@@ -161,9 +163,20 @@ built-in agent の基本セットは最初から使えますが、追加の DSL 
 - このセッションで許可
 - 拒否
 
-`このセッションで許可` は、同じツール・同じファイルに対してのみ再利用されます。  
-サブエージェント導入後も permission の判定ルール自体は変わりません。
+`このセッションで許可` は、同じツール・同じ action・同じ scope・同じ risk に対して再利用されます。  
+サブエージェント導入後も permission の判定ルール自体は変わりません。  
 permission card には、どの agent が要求したかも表示されます。
+
+### Tool Call UI
+
+LLM が tool を呼び出すと、TUI 下部に tool call card を表示します。
+
+- 実行しようとしている `tool` 名
+- 対象 path や task id などの `target`
+- `limit_bytes`, `recursive`, `overwrite` などの主なオプション
+- 実行状態 (`requesting`, `completed`, `failed`)
+
+tool の出力は `Tool Logs` card に蓄積されます。
 
 ### Agent Status
 
@@ -199,9 +212,9 @@ internal/
   cli/       Cobra command 定義
   config/    TOML 設定読込
   domain/    中核型と interface
-  infra/     LLM client / tools / agent catalog 実装
+  infra/     LLM client / tools / policy / agent catalog 実装
   tui/       Bubble Tea / Bubbles の UI
-  usecase/   orchestrator / 実行ロジック
+  usecase/   orchestrator / task catalog / 実行ロジック
 ```
 
 ### 実行モデル
@@ -211,16 +224,22 @@ internal/
 - `delegate_to_<agent>` で bounded task を subagent に委譲
 - `handoff_to_<agent>` で専門 agent に現在ターンを handoff
 - `run_ephemeral_agent` で一時的な subagent を即席生成
-- リポジトリ探索には `directory_list` を優先し、単純な一覧取得のためにスクリプト生成へ逃がさない
+- リポジトリ探索には `directory_list` や `fs_list` を優先し、単純な一覧取得のためにスクリプト生成へ逃がさない
 - `planner -> coder -> planner` のような再委譲ループは orchestrator で抑止
 - 並列化は非破壊系 task のみ。書き込み系は常に直列化
 
-### ツール拡張
+### ツール
 
-ツールは `domain.Tool` を実装し、registry に登録します。
+現在の主な tool は次です。
 
-現在の file read / write は `internal/infra/tools/file` にあります。  
-新しいツールを増やすときは、具体実装を `internal/infra/tools/<toolname>` に置き、`internal/app` の bootstrap で registry に登録してください。
+- `file_reader` / `file_writer` / `directory_list`
+- `fs_read` / `fs_write` / `fs_list` / `fs_stat` / `fs_remove` / `fs_move`
+- `search_text` / `search_files`
+- `git_status` / `git_diff` / `git_log` / `git_show`
+- `task_list` / `task_run`
+- `patch_apply`
+
+Task catalog は `.yagent/tasks.toml` と自動検出テンプレートから構築されます。
 
 ## 開発
 
@@ -240,9 +259,11 @@ go test ./...
 - `internal/config`: 設定読込テスト
 - `internal/infra/agents/catalog`: built-in catalog / user DSL 読込テスト
 - `internal/infra/llm`: fake server を使った HTTP クライアントテスト
-- `internal/infra/tools`: file tool / registry のユニットテスト
+- `internal/infra/policy`: permission policy / path policy テスト
+- `internal/infra/tools`: file/fs/task/registry のユニットテスト
 - `internal/usecase/orchestrator`: delegation / handoff / ephemeral agent の実行テスト
-- `internal/tui`: state transition と viewport / permission UI のテスト
+- `internal/usecase/taskcatalog`: task catalog の読込テスト
+- `internal/tui`: state transition と viewport / permission UI / status UI のテスト
 
 ## ライセンス
 

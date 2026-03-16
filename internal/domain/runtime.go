@@ -27,3 +27,18 @@ type TraceSink interface {
 type ExecutionEventStream interface {
 	SubscribeEvents() (<-chan ExecutionEvent, func())
 }
+
+type ToolEvent struct {
+	Phase  string
+	Call   ToolCall
+	Result ToolResult
+}
+
+type ToolObserver interface {
+	OnToolEvent(context.Context, ToolEvent)
+}
+
+type ObservableOrchestrator interface {
+	Orchestrator
+	SetObserver(ToolObserver)
+}

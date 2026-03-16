@@ -13,6 +13,13 @@ func Run(runner domain.Orchestrator, approver *ApproverBridge, workingDir string
 	m := newModel(runner, workingDir)
 	program := tea.NewProgram(m)
 	approver.Attach(program)
+
+	if observable, ok := runner.(domain.ObservableOrchestrator); ok {
+		observer := NewToolObserverBridge()
+		observer.Attach(program)
+		observable.SetObserver(observer)
+	}
+
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "エラー: %v\n", err)
 		return err
