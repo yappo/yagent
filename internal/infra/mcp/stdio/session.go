@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -253,6 +252,7 @@ func (s *Session) call(ctx context.Context, method string, params map[string]any
 func (s *Session) notify(ctx context.Context, method string, params map[string]any) error {
 	request := requestEnvelope{
 		JSONRPC: "2.0",
+		ID:      0,
 		Method:  method,
 		Params:  params,
 	}
@@ -260,22 +260,21 @@ func (s *Session) notify(ctx context.Context, method string, params map[string]a
 }
 
 func (s *Session) readLoop() {
-	for {
-		payload, err := readFramedMessage(s.stdout)
-		if err != nil {
-			s.failPending(err)
-			return
-		}
+	scanner := bufio.NewScanner(s.stdout)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	for scanner.Scan() {
+		payload := append([]byte(nil), scanner.Bytes()...)
+		s.logProtocol(context.Background(), "receive", payload)
 		var response responseEnvelope
 		if err := json.Unmarshal(payload, &response); err != nil {
+			s.logInvalidStdout(context.Background(), payload, err)
 			s.failPending(err)
 			return
 		}
 		if response.Method != "" {
-			s.logProtocol(context.Background(), "receive", payload)
 			continue
 		}
-		s.logProtocol(context.Background(), "receive", payload)
 
 		s.pendingMu.Lock()
 		ch := s.pending[response.ID]
@@ -283,6 +282,9 @@ func (s *Session) readLoop() {
 		if ch != nil {
 			ch <- response
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		s.failPending(err)
 	}
 }
 
@@ -305,7 +307,7 @@ func (s *Session) writeMessage(ctx context.Context, message any) error {
 	s.logProtocol(ctx, "send", data)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err = fmt.Fprintf(s.stdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
+	_, err = fmt.Fprintf(s.stdin, "%s\n", data)
 	return err
 }
 
@@ -317,36 +319,6 @@ func (s *Session) copyStderr(r io.Reader) {
 	if err := scanner.Err(); err != nil {
 		s.logStderr(context.Background(), "scanner_error: "+err.Error())
 	}
-}
-
-func readFramedMessage(r *bufio.Reader) ([]byte, error) {
-	length := 0
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			break
-		}
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "content-length:") {
-			value := strings.TrimSpace(line[len("Content-Length:"):])
-			length, err = strconv.Atoi(value)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	if length <= 0 {
-		return nil, fmt.Errorf("invalid content length")
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
 }
 
 func annotationBool(values map[string]any, key string) bool {
@@ -401,5 +373,16 @@ func (s *Session) logStderr(ctx context.Context, line string) {
 	_ = s.logger.WriteRecord(ctx, "mcp.stderr", map[string]any{
 		"task_id": s.taskID,
 		"line":    line,
+	})
+}
+
+func (s *Session) logInvalidStdout(ctx context.Context, payload []byte, err error) {
+	if s.logger == nil {
+		return
+	}
+	_ = s.logger.WriteRecord(ctx, "mcp.stdout_invalid", map[string]any{
+		"task_id": s.taskID,
+		"raw":     string(payload),
+		"error":   err.Error(),
 	})
 }

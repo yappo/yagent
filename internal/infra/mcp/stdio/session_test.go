@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,15 +130,16 @@ func TestHelperProcess(t *testing.T) {
 	initialized := false
 	_, _ = fmt.Fprintln(os.Stderr, "helper stderr ready")
 	for {
-		payload, err := readFramedMessage(reader)
+		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			if err == io.EOF {
-				os.Exit(0)
-			}
-			os.Exit(1)
+			os.Exit(0)
+		}
+		payload := bytesTrimSpace(line)
+		if len(payload) == 0 {
+			continue
 		}
 		if mode == "mcp-invalid" {
-			fmt.Fprint(writer, "Content-Length: 3\r\n\r\nbad")
+			fmt.Fprintln(writer, "bad")
 			_ = writer.Flush()
 			os.Exit(0)
 		}
@@ -210,7 +210,7 @@ func writeHelperResponse(w *bufio.Writer, id int64, result map[string]any) {
 		"id":      id,
 		"result":  result,
 	})
-	fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(payload), payload)
+	fmt.Fprintf(w, "%s\n", payload)
 	_ = w.Flush()
 }
 
@@ -222,4 +222,8 @@ func assertContains(t *testing.T, items []string, want string) {
 		}
 	}
 	t.Fatalf("expected %q in %+v", want, items)
+}
+
+func bytesTrimSpace(input []byte) []byte {
+	return []byte(strings.TrimSpace(string(input)))
 }
