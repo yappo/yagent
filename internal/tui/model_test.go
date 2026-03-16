@@ -28,9 +28,75 @@ func (r *recordingOrchestrator) RunTurn(_ context.Context, request domain.TurnRe
 	return domain.TurnResult{Message: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}, nil
 }
 
+type stubToolExecutor struct {
+	definitions []domain.ToolDefinition
+}
+
+func (s stubToolExecutor) Definitions(_ domain.AgentSpec) []domain.ToolDefinition {
+	return append([]domain.ToolDefinition(nil), s.definitions...)
+}
+
+func (s stubToolExecutor) Execute(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true}
+}
+
+type stubTaskCatalog struct {
+	tasks []domain.TaskDefinition
+}
+
+func (s stubTaskCatalog) List(_ context.Context) []domain.TaskDefinition {
+	return append([]domain.TaskDefinition(nil), s.tasks...)
+}
+
+func (s stubTaskCatalog) Get(_ context.Context, id string) (domain.TaskDefinition, bool) {
+	for _, task := range s.tasks {
+		if task.ID == id {
+			return task, true
+		}
+	}
+	return domain.TaskDefinition{}, false
+}
+
+type stubMCPBindings struct {
+	bound []domain.BoundMCPTool
+}
+
+func (s stubMCPBindings) Bind(_ context.Context, _ domain.TaskDefinition) ([]domain.MCPToolDescriptor, error) {
+	return nil, nil
+}
+
+func (s stubMCPBindings) BoundTools() []domain.BoundMCPTool {
+	return append([]domain.BoundMCPTool(nil), s.bound...)
+}
+
+func (s stubMCPBindings) CallTool(_ context.Context, _ string, _ string, _ map[string]any) (string, error) {
+	return "", nil
+}
+
+type stubAgentCatalog struct {
+	agents []domain.AgentSpec
+}
+
+func (s stubAgentCatalog) List() []domain.AgentSpec {
+	return append([]domain.AgentSpec(nil), s.agents...)
+}
+
+func (s stubAgentCatalog) Resolve(id string) (domain.AgentSpec, bool) {
+	for _, agent := range s.agents {
+		if agent.ID == id {
+			return agent, true
+		}
+	}
+	return domain.AgentSpec{}, false
+}
+
+func (s stubAgentCatalog) LoadUserAgents(_ []string) error {
+	return nil
+}
+
 func newTestModel(t *testing.T) model {
 	t.Helper()
-	return newModel(stubOrchestrator{}, t.TempDir(), "")
+	return newModel(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil)
 }
 
 func TestPermissionRequestState(t *testing.T) {
@@ -277,8 +343,8 @@ func TestCommandCandidatesForSlash(t *testing.T) {
 	m.textarea.SetValue("/")
 
 	candidates := m.activeSlashCompletion().candidates
-	if len(candidates) != 3 {
-		t.Fatalf("expected 3 candidates, got %d", len(candidates))
+	if len(candidates) != len(slashCommands) {
+		t.Fatalf("expected %d candidates, got %d", len(slashCommands), len(candidates))
 	}
 }
 
@@ -468,6 +534,87 @@ func TestViewShowsCommandCandidates(t *testing.T) {
 	}
 }
 
+func TestHandleSlashCommandListsTools(t *testing.T) {
+	m := newModel(
+		stubOrchestrator{},
+		t.TempDir(),
+		"",
+		stubToolExecutor{definitions: []domain.ToolDefinition{
+			{Name: "fs_read", Description: "ファイルを読み取る"},
+			{Name: "task_list", Description: "task を一覧する"},
+			{Name: "mcp__docs__search", Description: "MCP search"},
+		}},
+		nil,
+		nil,
+		nil,
+	)
+
+	modelValue, _ := handleSlashCommand(m, "/tools")
+	next := modelValue.(model)
+	output := strings.Join(next.output, "\n")
+
+	if !strings.Contains(output, "利用可能な tool:") {
+		t.Fatalf("expected tools header, got %q", output)
+	}
+	if !strings.Contains(output, "fs_read - ファイルを読み取る") {
+		t.Fatalf("expected fs_read entry, got %q", output)
+	}
+	if strings.Contains(output, "mcp__docs__search") {
+		t.Fatalf("expected /tools to exclude bound MCP tools, got %q", output)
+	}
+}
+
+func TestHandleSlashCommandListsTasks(t *testing.T) {
+	m := newModel(
+		stubOrchestrator{},
+		t.TempDir(),
+		"",
+		nil,
+		stubTaskCatalog{tasks: []domain.TaskDefinition{
+			{ID: "go:test", Description: "Go のテストを実行"},
+			{ID: "docs:mcp", Description: "Docs MCP server を bind"},
+		}},
+		nil,
+		nil,
+	)
+
+	modelValue, _ := handleSlashCommand(m, "/tasks")
+	next := modelValue.(model)
+	output := strings.Join(next.output, "\n")
+
+	if !strings.Contains(output, "登録済み task:") {
+		t.Fatalf("expected tasks header, got %q", output)
+	}
+	if !strings.Contains(output, "go:test - Go のテストを実行") {
+		t.Fatalf("expected go:test entry, got %q", output)
+	}
+}
+
+func TestHandleSlashCommandListsBoundMCPTools(t *testing.T) {
+	m := newModel(
+		stubOrchestrator{},
+		t.TempDir(),
+		"",
+		nil,
+		nil,
+		stubMCPBindings{bound: []domain.BoundMCPTool{
+			{QualifiedName: "mcp__docs__search", Description: "ドキュメント検索"},
+		}},
+		nil,
+	)
+
+	modelValue, _ := handleSlashCommand(m, "/mcp")
+	next := modelValue.(model)
+	output := strings.Join(next.output, "\n")
+
+	if !strings.Contains(output, "bind 済み MCP tool:") {
+		t.Fatalf("expected mcp header, got %q", output)
+	}
+	if !strings.Contains(output, "mcp__docs__search - ドキュメント検索") {
+		t.Fatalf("expected bound MCP tool entry, got %q", output)
+	}
+}
+
 func TestViewKeepsTextareaVisibleWithStatusPane(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 140
@@ -634,7 +781,7 @@ func TestPathCandidatesForRelativeFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@R")
 
 	ctx := m.activePathCompletion()
@@ -648,7 +795,7 @@ func TestPathCandidatesForCurrentDirectoryPrefix(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@./")
 
 	ctx := m.activePathCompletion()
@@ -665,7 +812,7 @@ func TestPathCandidatesIncludeDirectoriesAndFiles(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "libexe"), 0o755); err != nil {
 		t.Fatalf("mkdir libexe: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@l")
 
 	ctx := m.activePathCompletion()
@@ -685,7 +832,7 @@ func TestPathCandidatesForDirectoryContents(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "lib", "file.go"), []byte("package lib"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@lib/")
 
 	ctx := m.activePathCompletion()
@@ -702,7 +849,7 @@ func TestPathCandidatesIncludeHiddenEntries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("A=B"), 0o644); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@.")
 
 	ctx := m.activePathCompletion()
@@ -720,7 +867,7 @@ func TestPathCompletionTabCompletesSingleFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@R")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -735,7 +882,7 @@ func TestPathCompletionTabCompletesDirectoryWithSlash(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "lib"), 0o755); err != nil {
 		t.Fatalf("mkdir lib: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@l")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -753,7 +900,7 @@ func TestPathCompletionTabUsesLongestCommonPrefix(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "libexe"), 0o755); err != nil {
 		t.Fatalf("mkdir libexe: %v", err)
 	}
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.textarea.SetValue("@l")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -787,7 +934,7 @@ func TestSubmitPromptStoresNormalizedMessageOnlyForSelectedReference(t *testing.
 		t.Fatalf("write main.go: %v", err)
 	}
 
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	m.selectedRefs["@main.go"] = "main.go"
 	modelValue, _ := submitPrompt(m, "@main.go の概要を見せて")
 	next := modelValue.(model)
@@ -806,7 +953,7 @@ func TestSubmitPromptKeepsManualAtReferenceUnchanged(t *testing.T) {
 		t.Fatalf("write main.go: %v", err)
 	}
 
-	m := newModel(stubOrchestrator{}, dir, "")
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
 	modelValue, _ := submitPrompt(m, "@main.go の概要を見せて")
 	next := modelValue.(model)
 
@@ -817,7 +964,7 @@ func TestSubmitPromptKeepsManualAtReferenceUnchanged(t *testing.T) {
 
 func TestSubmitPromptPassesDefaultModelToTurnRequest(t *testing.T) {
 	runner := &recordingOrchestrator{}
-	m := newModel(runner, t.TempDir(), "gpt-5")
+	m := newModel(runner, t.TempDir(), "gpt-5", nil, nil, nil, nil)
 
 	modelValue, cmd := submitPrompt(m, "hello")
 	if cmd == nil {
@@ -838,5 +985,30 @@ func TestSubmitPromptPassesDefaultModelToTurnRequest(t *testing.T) {
 	}
 	if runner.last.Model != "gpt-5" {
 		t.Fatalf("expected default model to be passed, got %q", runner.last.Model)
+	}
+}
+func TestHandleSlashCommandListsAgents(t *testing.T) {
+	m := newModel(
+		stubOrchestrator{},
+		t.TempDir(),
+		"",
+		nil,
+		nil,
+		nil,
+		stubAgentCatalog{agents: []domain.AgentSpec{
+			{ID: "manager", Description: "ユーザー窓口として委譲と最終応答を担当します。"},
+			{ID: "docs-writer", Description: "README や設計メモの更新を担当"},
+		}},
+	)
+
+	modelValue, _ := handleSlashCommand(m, "/agents")
+	next := modelValue.(model)
+	output := strings.Join(next.output, "\n")
+
+	if !strings.Contains(output, "利用可能な agent:") {
+		t.Fatalf("expected agents header, got %q", output)
+	}
+	if !strings.Contains(output, "docs-writer - README や設計メモの更新を担当") {
+		t.Fatalf("expected docs-writer entry, got %q", output)
 	}
 }

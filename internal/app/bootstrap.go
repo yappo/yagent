@@ -26,6 +26,10 @@ import (
 type Container struct {
 	Config       config.Config
 	Orchestrator *orchestrator.Service
+	Tools        domain.ToolExecutor
+	TaskCatalog  domain.TaskCatalog
+	MCPBindings  domain.MCPConnectionManager
+	AgentCatalog domain.AgentCatalog
 	WorkingDir   string
 	DefaultModel string
 	Closer       io.Closer
@@ -107,6 +111,10 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 			TraceSink:         logger,
 			Approver:          approver,
 		}),
+		Tools:        tools,
+		TaskCatalog:  taskCatalog,
+		MCPBindings:  mcpBindings,
+		AgentCatalog: agents,
 		WorkingDir:   pwd,
 		DefaultModel: server.Model,
 		Closer:       logger,

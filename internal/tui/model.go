@@ -70,6 +70,10 @@ type slashCommand struct {
 
 type model struct {
 	runner           domain.Orchestrator
+	tools            domain.ToolExecutor
+	taskCatalog      domain.TaskCatalog
+	mcpBindings      domain.MCPConnectionManager
+	agentCatalog     domain.AgentCatalog
 	workingDir       string
 	defaultModel     string
 	selectedRefs     map[string]string
@@ -160,6 +164,10 @@ var filePermissionOptions = []permissionOption{
 
 var slashCommands = []slashCommand{
 	{name: "/help", description: "ヘルプを表示"},
+	{name: "/tools", description: "利用可能な tool 一覧を表示"},
+	{name: "/tasks", description: "登録済み task 一覧を表示"},
+	{name: "/mcp", description: "bind 済み MCP tool 一覧を表示"},
+	{name: "/agents", description: "利用可能な agent 一覧を表示"},
 	{name: "/clear", description: "会話ログをクリア"},
 	{name: "/exit", description: "yagent を終了"},
 }
@@ -174,7 +182,7 @@ const (
 	paneHorizontalFrame  = 4
 )
 
-func newModel(runner domain.Orchestrator, workingDir string, defaultModel string) model {
+func newModel(runner domain.Orchestrator, workingDir string, defaultModel string, tools domain.ToolExecutor, taskCatalog domain.TaskCatalog, mcpBindings domain.MCPConnectionManager, agentCatalog domain.AgentCatalog) model {
 	ta := textarea.New()
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行, Enter で送信, /exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
@@ -195,6 +203,10 @@ func newModel(runner domain.Orchestrator, workingDir string, defaultModel string
 
 	m := model{
 		runner:           runner,
+		tools:            tools,
+		taskCatalog:      taskCatalog,
+		mcpBindings:      mcpBindings,
+		agentCatalog:     agentCatalog,
 		workingDir:       workingDir,
 		defaultModel:     defaultModel,
 		selectedRefs:     map[string]string{},
@@ -711,6 +723,30 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 		for _, slashCommand := range slashCommands {
 			m.output = append(m.output, fmt.Sprintf("  %s - %s", slashCommand.name, slashCommand.description))
 		}
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/tools":
+		m.output = append(m.output, formatSlashList("利用可能な tool", m.listTools())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/tasks":
+		m.output = append(m.output, formatSlashList("登録済み task", m.listTasks())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/mcp":
+		m.output = append(m.output, formatSlashList("bind 済み MCP tool", m.listMCPTools())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/agents":
+		m.output = append(m.output, formatSlashList("利用可能な agent", m.listAgents())...)
 		m.logDirty = true
 		m.textarea.Reset()
 		m.syncLayout()
@@ -1245,6 +1281,94 @@ func findSlashCommand(name string) (slashCommand, bool) {
 		}
 	}
 	return slashCommand{}, false
+}
+
+func (m model) listTools() []string {
+	if m.tools == nil {
+		return nil
+	}
+
+	definitions := m.tools.Definitions(domain.AgentSpec{})
+	items := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		if strings.HasPrefix(definition.Name, "mcp__") {
+			continue
+		}
+		description := strings.TrimSpace(definition.Description)
+		if description == "" {
+			description = "(説明なし)"
+		}
+		items = append(items, fmt.Sprintf("%s - %s", definition.Name, description))
+	}
+	sort.Strings(items)
+	return items
+}
+
+func (m model) listTasks() []string {
+	if m.taskCatalog == nil {
+		return nil
+	}
+
+	tasks := m.taskCatalog.List(context.Background())
+	items := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		description := strings.TrimSpace(task.Description)
+		if description == "" {
+			description = "(説明なし)"
+		}
+		items = append(items, fmt.Sprintf("%s - %s", task.ID, description))
+	}
+	sort.Strings(items)
+	return items
+}
+
+func (m model) listMCPTools() []string {
+	if m.mcpBindings == nil {
+		return nil
+	}
+
+	bound := m.mcpBindings.BoundTools()
+	items := make([]string, 0, len(bound))
+	for _, tool := range bound {
+		description := strings.TrimSpace(tool.Description)
+		if description == "" {
+			description = "(説明なし)"
+		}
+		items = append(items, fmt.Sprintf("%s - %s", tool.QualifiedName, description))
+	}
+	sort.Strings(items)
+	return items
+}
+
+func (m model) listAgents() []string {
+	if m.agentCatalog == nil {
+		return nil
+	}
+
+	agents := m.agentCatalog.List()
+	items := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		description := strings.TrimSpace(agent.Description)
+		if description == "" {
+			description = "(説明なし)"
+		}
+		items = append(items, fmt.Sprintf("%s - %s", agent.ID, description))
+	}
+	sort.Strings(items)
+	return items
+}
+
+func formatSlashList(title string, items []string) []string {
+	if len(items) == 0 {
+		return []string{title + ":", "  (なし)"}
+	}
+
+	lines := make([]string, 0, len(items)+1)
+	lines = append(lines, title+":")
+	for _, item := range items {
+		lines = append(lines, "  "+item)
+	}
+	return lines
 }
 
 func (m model) View() tea.View {

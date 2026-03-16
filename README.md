@@ -316,6 +316,10 @@ include_tools = ["search_docs"]
 - `@` 入力中: `pwd` 基準の相対パス候補を表示
 - `Tab`: 候補コマンドまたはファイルパスを補完
 - `/help`: ヘルプ表示
+- `/tools`: 利用可能な tool 一覧を表示
+- `/tasks`: 登録済み task 一覧を表示
+- `/mcp`: bind 済み MCP tool 一覧を表示
+- `/agents`: 利用可能な agent 一覧を表示
 - `/clear`: 会話ログをクリア
 - `/exit`: 終了
 
