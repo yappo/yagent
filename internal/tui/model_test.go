@@ -280,6 +280,32 @@ func TestPasteMsgUpdatesTextarea(t *testing.T) {
 	}
 }
 
+func TestTypingDoesNotDirtyLogOrStatusViewports(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.height = 30
+	m.output = appendOutputBlock(nil, assistantOutputLabel, "hello")
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-1",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: time.Now(),
+	})
+	m.syncLayout()
+	m.logDirty = false
+	m.statusDirty = false
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Text: "a"})
+	next := modelValue.(model)
+
+	if next.logDirty {
+		t.Fatal("expected typing not to dirty log viewport")
+	}
+	if next.statusDirty {
+		t.Fatal("expected typing not to dirty status viewport")
+	}
+}
+
 func TestPermissionTabDoesNotTriggerCommandCompletion(t *testing.T) {
 	m := newTestModel(t)
 	m.textarea.SetValue("/he")

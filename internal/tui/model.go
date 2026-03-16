@@ -83,6 +83,9 @@ type model struct {
 	statusEvents     <-chan domain.ExecutionEvent
 	cancelStatus     func()
 	styles           styles
+	logDirty         bool
+	statusDirty      bool
+	toolLogDirty     bool
 }
 
 type statusState struct {
@@ -185,6 +188,9 @@ func newModel(runner domain.Orchestrator, workingDir string, defaultModel string
 		status: statusState{
 			nodes: map[string]*agentStatusNode{},
 		},
+		logDirty:     true,
+		statusDirty:  true,
+		toolLogDirty: true,
 	}
 	if stream, ok := runner.(domain.ExecutionEventStream); ok {
 		m.statusEvents, m.cancelStatus = stream.SubscribeEvents()
@@ -276,6 +282,10 @@ func (m *model) syncLayout() {
 		footerHeight += m.permissionCardHeight()
 	}
 	headerHeight := 3
+	prevChatWidth := m.viewport.Width()
+	prevChatHeight := m.viewport.Height()
+	prevStatusWidth := m.statusViewport.Width()
+	prevStatusHeight := m.statusViewport.Height()
 	chatWidth, statusWidth, stacked := layoutWidths(m.width)
 	mainHeight := maxInt(3, m.height-headerHeight-footerHeight)
 	if stacked {
@@ -292,16 +302,27 @@ func (m *model) syncLayout() {
 		m.statusViewport.SetWidth(statusWidth)
 		m.statusViewport.SetHeight(maxInt(3, mainHeight-paneChromeHeight))
 	}
-	m.syncToolLogViewport()
+	if prevChatWidth != m.viewport.Width() || prevChatHeight != m.viewport.Height() {
+		m.logDirty = true
+	}
+	if prevStatusWidth != m.statusViewport.Width() || prevStatusHeight != m.statusViewport.Height() {
+		m.statusDirty = true
+	}
 	m.refreshViewport()
 }
 
 func (m *model) refreshViewport() {
-	m.viewport.SetContent(m.renderLog())
-	m.statusViewport.SetContent(m.renderStatus())
+	if m.logDirty {
+		m.viewport.SetContent(m.renderLog())
+		m.viewport.GotoBottom()
+		m.logDirty = false
+	}
+	if m.statusDirty {
+		m.statusViewport.SetContent(m.renderStatus())
+		m.statusViewport.GotoTop()
+		m.statusDirty = false
+	}
 	m.syncToolLogViewport()
-	m.viewport.GotoBottom()
-	m.statusViewport.GotoTop()
 }
 
 func (m *model) syncToolLogViewport() {
@@ -310,10 +331,18 @@ func (m *model) syncToolLogViewport() {
 	}
 
 	contentWidth := maxInt(1, m.width-6)
+	prevWidth := m.toolLogViewport.Width()
+	prevHeight := m.toolLogViewport.Height()
 	m.toolLogViewport.SetWidth(contentWidth)
 	m.toolLogViewport.SetHeight(m.toolLogViewportHeight())
-	m.toolLogViewport.SetContent(m.renderToolLogs(contentWidth))
-	m.toolLogViewport.GotoBottom()
+	if prevWidth != contentWidth || prevHeight != m.toolLogViewport.Height() {
+		m.toolLogDirty = true
+	}
+	if m.toolLogDirty {
+		m.toolLogViewport.SetContent(m.renderToolLogs(contentWidth))
+		m.toolLogViewport.GotoBottom()
+		m.toolLogDirty = false
+	}
 }
 
 func (m model) renderLog() string {
@@ -403,9 +432,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.output = append(m.output, formatToolSummary(m.activeTool))
 			m.output = append(m.output, "───────────────────────────────────────────────────────────────────────")
 			m.activeTool = nil
+			m.logDirty = true
+			m.toolLogDirty = true
 		}
 		m.syncLayout()
-		m.refreshViewport()
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -419,6 +449,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loadingFrame = (m.loadingFrame + 1) % len(loadingFrames)
+		m.logDirty = true
 		m.refreshViewport()
 		return m, loadingTick()
 
@@ -429,6 +460,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.messages) > 0 {
 				m.messages = m.messages[:len(m.messages)-1]
 			}
+			m.logDirty = true
 			m.refreshViewport()
 			return m, nil
 		}
@@ -437,11 +469,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Content: msg.content,
 		})
 		m.output = appendOutputBlock(m.output, assistantOutputLabel, msg.content)
+		m.logDirty = true
 		m.refreshViewport()
 		return m, nil
 
 	case statusEventMsg:
 		m.applyStatusEvent(msg.event)
+		m.statusDirty = true
 		m.refreshViewport()
 		return m, listenStatusEvents(m.statusEvents)
 
@@ -584,6 +618,7 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 	command, ok := findSlashCommand(input)
 	if !ok {
 		m.output = append(m.output, "不明なコマンドです。/help でヘルプを表示します")
+		m.logDirty = true
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
@@ -597,12 +632,14 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 		for _, slashCommand := range slashCommands {
 			m.output = append(m.output, fmt.Sprintf("  %s - %s", slashCommand.name, slashCommand.description))
 		}
+		m.logDirty = true
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/clear":
 		m.messages = nil
 		m.output = []string{"チャット履歴をクリアしました"}
+		m.logDirty = true
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
@@ -624,8 +661,8 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 	m.selectedRefs = map[string]string{}
 	m.loading = true
 	m.loadingFrame = 0
+	m.logDirty = true
 	m.syncLayout()
-	m.refreshViewport()
 
 	send := func() tea.Msg {
 		result, err := m.runner.RunTurn(context.Background(), domain.TurnRequest{
@@ -662,6 +699,7 @@ func (m *model) resolvePermission(decision domain.PermissionDecision) {
 	} else {
 		m.permission = nil
 	}
+	m.logDirty = true
 	m.syncLayout()
 }
 
