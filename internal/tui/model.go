@@ -32,6 +32,8 @@ type permissionState struct {
 	request       domain.PermissionRequest
 	response      chan domain.PermissionDecision
 	selectedIndex int
+	patternMode   bool
+	patternInput  string
 }
 
 type toolCallState struct {
@@ -48,8 +50,17 @@ type toolLogEntry struct {
 }
 
 type permissionOption struct {
-	label    string
-	decision domain.PermissionDecision
+	label           string
+	decision        domain.PermissionDecision
+	requiresPattern bool
+}
+
+type patternApproval struct {
+	toolName     string
+	action       string
+	resourceKind string
+	risk         string
+	pattern      string
 }
 
 type slashCommand struct {
@@ -79,6 +90,7 @@ type model struct {
 	permission       *permissionState
 	permissionQueue  []permissionState
 	sessionApprovals map[string]bool
+	patternApprovals []patternApproval
 	status           statusState
 	statusEvents     <-chan domain.ExecutionEvent
 	cancelStatus     func()
@@ -133,9 +145,16 @@ type styles struct {
 
 var loadingFrames = []string{"◐", "◓", "◑", "◒"}
 
-var permissionOptions = []permissionOption{
+var defaultPermissionOptions = []permissionOption{
 	{label: "今回だけ許可", decision: domain.PermissionAllowOnce},
-	{label: "このセッションで許可", decision: domain.PermissionAllowSession},
+	{label: "同じ操作を以後許可", decision: domain.PermissionAllowSession},
+	{label: "拒否", decision: domain.PermissionDeny},
+}
+
+var filePermissionOptions = []permissionOption{
+	{label: "今回だけ許可", decision: domain.PermissionAllowOnce},
+	{label: "同じ操作を以後許可", decision: domain.PermissionAllowSession},
+	{label: "ファイルパターン指定で以後許可", decision: domain.PermissionAllowSession, requiresPattern: true},
 	{label: "拒否", decision: domain.PermissionDeny},
 }
 
@@ -409,6 +428,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			close(msg.response)
 			return m, nil
 		}
+		if m.hasPatternApproval(msg.request) {
+			msg.response <- domain.PermissionAllowSession
+			close(msg.response)
+			return m, nil
+		}
 		state := permissionState{
 			request:       msg.request,
 			response:      msg.response,
@@ -481,6 +505,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.PasteMsg:
 		if m.permission != nil {
+			if m.permission.patternMode {
+				m.permission.patternInput += msg.Content
+				m.syncLayout()
+			}
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -505,17 +533,29 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 
+	if m.permission.patternMode {
+		return handlePatternPermissionKeys(m, msg)
+	}
+
+	options := permissionOptionsForRequest(m.permission.request)
 	switch msg.String() {
 	case "left", "shift+tab":
-		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex-1, len(permissionOptions))
+		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex-1, len(options))
 		m.syncLayout()
 		return m, nil
 	case "right", "tab":
-		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex+1, len(permissionOptions))
+		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex+1, len(options))
 		m.syncLayout()
 		return m, nil
 	case "enter":
-		m.resolvePermission(permissionOptions[m.permission.selectedIndex].decision)
+		option := options[m.permission.selectedIndex]
+		if option.requiresPattern {
+			m.permission.patternMode = true
+			m.permission.patternInput = ""
+			m.syncLayout()
+			return m, nil
+		}
+		m.resolvePermission(option.decision)
 		return m, nil
 	case "esc":
 		m.resolvePermission(domain.PermissionDeny)
@@ -523,11 +563,17 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch strings.ToLower(msg.String()) {
-	case "1", "2", "3":
+	case "1", "2", "3", "4":
 		idx := int(msg.String()[0] - '1')
-		if idx >= 0 && idx < len(permissionOptions) {
+		if idx >= 0 && idx < len(options) {
 			m.permission.selectedIndex = idx
-			m.resolvePermission(permissionOptions[idx].decision)
+			if options[idx].requiresPattern {
+				m.permission.patternMode = true
+				m.permission.patternInput = ""
+				m.syncLayout()
+				return m, nil
+			}
+			m.resolvePermission(options[idx].decision)
 		}
 	case "y":
 		m.resolvePermission(domain.PermissionAllowOnce)
@@ -535,6 +581,39 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.resolvePermission(domain.PermissionDeny)
 	}
 
+	return m, nil
+}
+
+func handlePatternPermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.permission.patternMode = false
+		m.permission.patternInput = ""
+		m.syncLayout()
+		return m, nil
+	case "enter":
+		patternValue := strings.TrimSpace(m.permission.patternInput)
+		if patternValue == "" {
+			return m, nil
+		}
+		m.patternApprovals = append(m.patternApprovals, newPatternApproval(m.permission.request, patternValue))
+		m.permission.patternMode = false
+		m.permission.patternInput = ""
+		m.resolvePermissionWithLabel(domain.PermissionAllowSession, "パターン許可 ("+patternValue+")")
+		return m, nil
+	case "backspace", "ctrl+h":
+		if len(m.permission.patternInput) > 0 {
+			runes := []rune(m.permission.patternInput)
+			m.permission.patternInput = string(runes[:len(runes)-1])
+			m.syncLayout()
+		}
+		return m, nil
+	}
+
+	if typed := msg.String(); len([]rune(typed)) == 1 {
+		m.permission.patternInput += typed
+		m.syncLayout()
+	}
 	return m, nil
 }
 
@@ -676,6 +755,10 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) resolvePermission(decision domain.PermissionDecision) {
+	m.resolvePermissionWithLabel(decision, "")
+}
+
+func (m *model) resolvePermissionWithLabel(decision domain.PermissionDecision, label string) {
 	if m.permission == nil {
 		return
 	}
@@ -688,7 +771,7 @@ func (m *model) resolvePermission(decision domain.PermissionDecision) {
 		permissionRequesterLabel(m.permission.request),
 		permissionRequesterType(m.permission.request),
 		m.permission.request.Operation,
-		permissionDecisionLabel(decision)+" ("+m.permission.request.Resource+")",
+		fallbackString(label, permissionDecisionLabel(decision))+" ("+m.permission.request.Resource+")",
 	))
 	m.permission.response <- decision
 	close(m.permission.response)
@@ -789,6 +872,7 @@ func (m model) renderPermissionCard() string {
 
 	cardWidth := maxInt(32, m.width-2)
 	resource := trimPathFromEnd(m.permission.request.Resource, cardWidth-4)
+	options := permissionOptionsForRequest(m.permission.request)
 	lines := []string{
 		m.styles.permissionTitle.Render(m.permission.request.Operation),
 		m.styles.permissionPath.Render(resource),
@@ -810,10 +894,22 @@ func (m model) renderPermissionCard() string {
 	if len(m.permission.request.SideEffects) > 0 {
 		lines = append(lines, m.styles.permissionHelp.Render("effects: "+strings.Join(m.permission.request.SideEffects, ", ")))
 	}
-	lines = append(lines,
-		renderPermissionOptions(m.permission.selectedIndex, m.styles.permissionSelected, m.styles.permissionOption),
-		m.styles.permissionHelp.Render("←/→ または Tab で選択 • Enter で確定 • Esc で拒否"),
-	)
+	if m.permission.patternMode {
+		patternValue := m.permission.patternInput
+		if patternValue == "" {
+			patternValue = "例: *.go / internal/*"
+		}
+		lines = append(lines,
+			m.styles.permissionHelp.Render("パターン許可: このセッション中、glob に一致するパスを自動許可"),
+			m.styles.permissionSelected.Render("pattern> "+patternValue),
+			m.styles.permissionHelp.Render("Enter で確定 • Esc で戻る • basename または path glob を指定"),
+		)
+	} else {
+		lines = append(lines,
+			renderPermissionOptions(options, m.permission.selectedIndex, m.styles.permissionSelected, m.styles.permissionOption),
+			m.styles.permissionHelp.Render("←/→ または Tab で選択 • Enter で確定 • Esc で拒否"),
+		)
+	}
 	card := strings.Join(lines, "\n")
 	return m.styles.permissionCard.Width(cardWidth).Render(card)
 }
@@ -861,9 +957,9 @@ func (m model) renderToolLogCard() string {
 	return m.styles.toolLogCard.Width(cardWidth).Render(strings.Join(lines, "\n"))
 }
 
-func renderPermissionOptions(selected int, selectedStyle, baseStyle lipgloss.Style) string {
-	parts := make([]string, 0, len(permissionOptions))
-	for i, option := range permissionOptions {
+func renderPermissionOptions(options []permissionOption, selected int, selectedStyle, baseStyle lipgloss.Style) string {
+	parts := make([]string, 0, len(options))
+	for i, option := range options {
 		label := fmt.Sprintf("%d. %s", i+1, option.label)
 		if i == selected {
 			parts = append(parts, selectedStyle.Render("[ "+label+" ]"))
@@ -902,6 +998,35 @@ func fallbackString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func permissionOptionsForRequest(request domain.PermissionRequest) []permissionOption {
+	if domain.PermissionRequestSupportsPatternApproval(request) {
+		return filePermissionOptions
+	}
+	return defaultPermissionOptions
+}
+
+func newPatternApproval(request domain.PermissionRequest, patternValue string) patternApproval {
+	return patternApproval{
+		toolName:     request.ToolName,
+		action:       request.Action,
+		resourceKind: request.ResourceKind,
+		risk:         request.Risk,
+		pattern:      strings.TrimSpace(patternValue),
+	}
+}
+
+func (m model) hasPatternApproval(request domain.PermissionRequest) bool {
+	for _, approval := range m.patternApprovals {
+		if approval.toolName != request.ToolName || approval.action != request.Action || approval.resourceKind != request.ResourceKind || approval.risk != request.Risk {
+			continue
+		}
+		if domain.PermissionRequestMatchesPattern(request, approval.pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *model) appendToolLog(call domain.ToolCall, result domain.ToolResult) {

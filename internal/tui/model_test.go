@@ -109,6 +109,50 @@ func TestPermissionCardShowsRequester(t *testing.T) {
 	}
 }
 
+func TestPermissionCardUsesFourOptionsForFileRequests(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.permission = &permissionState{
+		request: domain.PermissionRequest{
+			ToolName:     "fs_read",
+			Operation:    "ファイル読み取り",
+			Resource:     "/tmp/a.txt",
+			Action:       "read",
+			ResourceKind: "file",
+			Risk:         "medium",
+			SideEffects:  []string{"llm_disclosure"},
+		},
+		response: make(chan domain.PermissionDecision, 1),
+	}
+
+	card := m.renderPermissionCard()
+	if !strings.Contains(card, "3. ファイルパターン指定で以後許可") || !strings.Contains(card, "4. 拒否") {
+		t.Fatalf("expected four-option file permission card, got %q", card)
+	}
+}
+
+func TestPermissionCardKeepsThreeOptionsForNonFileRequests(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.permission = &permissionState{
+		request: domain.PermissionRequest{
+			ToolName:     "task_run",
+			Operation:    "タスク実行",
+			Resource:     "go:test",
+			Action:       "execute",
+			ResourceKind: "task",
+			Risk:         "high",
+			SideEffects:  []string{"process_spawn"},
+		},
+		response: make(chan domain.PermissionDecision, 1),
+	}
+
+	card := m.renderPermissionCard()
+	if strings.Contains(card, "4. ") || strings.Contains(card, "3. ファイルパターン指定で以後許可") {
+		t.Fatalf("expected three-option non-file permission card, got %q", card)
+	}
+}
+
 func TestResolvePermissionAppendsRequesterToOutput(t *testing.T) {
 	m := newTestModel(t)
 	m.permission = &permissionState{
@@ -324,6 +368,87 @@ func TestPermissionTabDoesNotTriggerCommandCompletion(t *testing.T) {
 	next := modelValue.(model)
 	if next.textarea.Value() != "/he" {
 		t.Fatalf("permission tab should not complete command: %q", next.textarea.Value())
+	}
+}
+
+func TestFilePermissionOptionThreeStartsPatternMode(t *testing.T) {
+	m := newTestModel(t)
+	response := make(chan domain.PermissionDecision, 1)
+	m.permission = &permissionState{
+		request: domain.PermissionRequest{
+			ToolName:     "fs_read",
+			Operation:    "ファイル読み取り",
+			Resource:     "/tmp/a.txt",
+			Action:       "read",
+			ResourceKind: "file",
+			Risk:         "medium",
+		},
+		response: response,
+	}
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Text: "3"})
+	next := modelValue.(model)
+
+	if !next.permission.patternMode {
+		t.Fatal("expected option 3 to open pattern mode")
+	}
+	select {
+	case decision := <-response:
+		t.Fatalf("did not expect immediate resolution, got %s", decision)
+	default:
+	}
+}
+
+func TestPatternPermissionApprovalAutoApprovesMatchingRequest(t *testing.T) {
+	m := newTestModel(t)
+	response := make(chan domain.PermissionDecision, 1)
+	request := domain.PermissionRequest{
+		ToolName:     "fs_read",
+		Operation:    "ファイル読み取り",
+		Resource:     "/tmp/example.txt",
+		Action:       "read",
+		ResourceKind: "file",
+		Risk:         "medium",
+	}
+	m.permission = &permissionState{
+		request:       request,
+		response:      response,
+		selectedIndex: 2,
+		patternMode:   true,
+		patternInput:  "*.txt",
+	}
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	next := modelValue.(model)
+
+	if next.permission != nil {
+		t.Fatalf("expected permission prompt to close, got %+v", next.permission)
+	}
+	if len(next.patternApprovals) != 1 {
+		t.Fatalf("expected pattern approval to be stored, got %+v", next.patternApprovals)
+	}
+	if got := <-response; got != domain.PermissionAllowSession {
+		t.Fatalf("expected allow session decision, got %s", got)
+	}
+
+	followup := make(chan domain.PermissionDecision, 1)
+	modelValue, _ = next.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:     "fs_read",
+			Operation:    "ファイル読み取り",
+			Resource:     "/tmp/another.txt",
+			Action:       "read",
+			ResourceKind: "file",
+			Risk:         "medium",
+		},
+		response: followup,
+	})
+	next = modelValue.(model)
+	if next.permission != nil {
+		t.Fatalf("expected matching pattern approval to skip prompt, got %+v", next.permission)
+	}
+	if got := <-followup; got != domain.PermissionAllowSession {
+		t.Fatalf("expected automatic session approval, got %s", got)
 	}
 }
 
