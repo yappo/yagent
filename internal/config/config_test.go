@@ -47,6 +47,7 @@ allow_paths = ["/tmp"]
 max_parallel_agents = 1
 max_handoff_depth = 3
 default_timeout = "600s"
+enable_planning = true
 
 [agent_catalog]
 paths = ["/tmp/agents"]
@@ -85,6 +86,9 @@ instruction = "custom coder"
 	}
 	if cfg.Execution.DefaultTimeout.Duration != 600*time.Second {
 		t.Fatalf("unexpected default_timeout: %s", cfg.Execution.DefaultTimeout.Duration)
+	}
+	if !cfg.Execution.EnablePlanning {
+		t.Fatal("expected enable_planning to be true")
 	}
 	if cfg.Agents["coder"].Instruction != "custom coder" {
 		t.Fatalf("unexpected coder override: %+v", cfg.Agents["coder"])

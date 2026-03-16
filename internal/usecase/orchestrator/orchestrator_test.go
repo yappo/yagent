@@ -135,6 +135,69 @@ func TestRunTurnDelegatesToBuiltInAgent(t *testing.T) {
 	}
 }
 
+func TestRunTurnCanPlanAndPrefetchReadOnlyBatches(t *testing.T) {
+	approver := &fakeApprover{decision: domain.PermissionAllowOnce}
+	toolCalls := 0
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{
+						ID:   "plan-1",
+						Name: "submit_execution_plan",
+						Arguments: map[string]any{
+							"summary":         "Inspect key files first",
+							"target_files":    []any{"README.md"},
+							"exit_conditions": []any{"Have enough context to answer"},
+							"batches": []any{
+								map[string]any{
+									"purpose": "Read README once",
+									"tool_calls": []any{
+										map[string]any{
+											"name":      "fs_read",
+											"arguments": map[string]any{"path": "README.md"},
+										},
+									},
+								},
+							},
+						},
+					}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
+				},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{Name: "fs_read", ReadOnly: true, ParallelSafe: true}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				toolCalls++
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "readme"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, EnablePlanning: true, Approver: approver},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "Summarize the repo"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "done" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one prefetched tool call, got %d", toolCalls)
+	}
+	if len(approver.requests) == 0 || approver.requests[0].ToolName != "execution_plan" {
+		t.Fatalf("expected execution plan approval, got %+v", approver.requests)
+	}
+}
+
 func TestRunTurnSupportsHandoff(t *testing.T) {
 	service := New(
 		&fakeModelClient{
@@ -215,6 +278,194 @@ func TestRunTurnSupportsEphemeralAgent(t *testing.T) {
 	}
 	if result.Message.Content != "done" {
 		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+}
+
+func TestExecuteToolUsesSessionCacheForReadOnlyTools(t *testing.T) {
+	toolCalls := 0
+	service := New(
+		&fakeModelClient{responses: map[string][]domain.ModelResponse{}},
+		&fakeToolExecutor{
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				toolCalls++
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "cached"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{}},
+		Config{},
+	)
+
+	call := domain.ToolCall{ID: "1", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}
+	_, cached := service.executeTool(context.Background(), domain.AgentSpec{ID: "manager"}, call)
+	if cached {
+		t.Fatal("first call should not be cached")
+	}
+	_, cached = service.executeTool(context.Background(), domain.AgentSpec{ID: "manager"}, call)
+	if !cached {
+		t.Fatal("second call should use cache")
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected underlying tool to run once, got %d", toolCalls)
+	}
+}
+
+func TestRunAgentTransitionsToSynthesizeAfterNoNewInformationRepeats(t *testing.T) {
+	var sawSynthesize bool
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"reviewer": {
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "2", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "3", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, Content: "review complete"}},
+				},
+			},
+			inspect: func(request domain.ModelRequest) {
+				if strings.Contains(request.Instructions, "Execution phase: synthesize") {
+					sawSynthesize = true
+					if len(request.Tools) != 0 {
+						t.Fatalf("expected synthesize phase to disable tools, got %d tools", len(request.Tools))
+					}
+				}
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"reviewer": {{Name: "fs_read", ReadOnly: true, ParallelSafe: true, Metadata: map[string]any{"category": "fs"}}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "same content"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.runAgent(context.Background(), domain.AgentInvocation{
+		RunID:    "reviewer-1",
+		Agent:    domain.AgentSpec{ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 8},
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "review this"}},
+		Context:  domain.ContextPack{TaskBrief: "review"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("runAgent returned error: %v", err)
+	}
+	if result.Message.Content != "review complete" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if !sawSynthesize {
+		t.Fatalf("expected synthesize phase to be reached")
+	}
+	foundNoveltyEvent := false
+	foundSynthesizeEvent := false
+	for _, event := range result.Events {
+		if event.Type == "novelty_exhausted" {
+			foundNoveltyEvent = true
+		}
+		if event.Type == "phase_started" && event.Detail == string(domain.ExecutionPhaseSynthesize) {
+			foundSynthesizeEvent = true
+		}
+	}
+	if !foundNoveltyEvent || !foundSynthesizeEvent {
+		t.Fatalf("expected novelty_exhausted and synthesize events, got %+v", result.Events)
+	}
+}
+
+func TestFsListSeedsCandidateTargetsIntoWorkingSet(t *testing.T) {
+	requestCount := 0
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "fs_list", Arguments: map[string]any{"path": "."}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
+				},
+			},
+			inspect: func(request domain.ModelRequest) {
+				requestCount++
+				if requestCount == 2 && !strings.Contains(request.Instructions, "cmd/main.go") {
+					t.Fatalf("expected discovered fs_list targets in instructions, got:\n%s", request.Instructions)
+				}
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{Name: "fs_list", ReadOnly: true, ParallelSafe: true, Metadata: map[string]any{"category": "fs"}}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				return domain.ToolResult{
+					CallID:  call.ID,
+					Name:    call.Name,
+					Success: true,
+					Output:  `[{"path":"cmd/main.go","type":"file","depth":0},{"path":"internal","type":"directory","depth":0}]`,
+				}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	_, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "inspect repo"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+}
+
+func TestRepeatedBroadDiscoveryIsBlockedWhenPendingTargetsExist(t *testing.T) {
+	toolCalls := 0
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "fs_list", Arguments: map[string]any{"path": "/repo"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "2", Name: "fs_list", Arguments: map[string]any{"path": "/repo"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
+				},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{Name: "fs_list", ReadOnly: true, ParallelSafe: true, Metadata: map[string]any{"category": "fs"}}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				toolCalls++
+				return domain.ToolResult{
+					CallID:  call.ID,
+					Name:    call.Name,
+					Success: true,
+					Output:  `[{"path":"/repo/cmd","type":"directory","depth":0},{"path":"/repo/README.md","type":"file","depth":0}]`,
+				}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "inspect repo"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected repeated broad discovery to be blocked before execution, got %d tool calls", toolCalls)
+	}
+	foundBlocked := false
+	for _, event := range result.Events {
+		if event.Type == "tool_failed" && strings.Contains(event.Detail, "同じ広域探索は不要です") {
+			foundBlocked = true
+			break
+		}
+	}
+	if !foundBlocked {
+		t.Fatalf("expected blocked broad discovery event, got %+v", result.Events)
 	}
 }
 

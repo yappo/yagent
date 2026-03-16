@@ -99,6 +99,7 @@ func Build(configPath string, approver domain.Approver, options BuildOptions) (*
 			MaxHandoffDepth:   cfg.Execution.MaxHandoffDepth,
 			DefaultTimeout:    cfg.Execution.DefaultTimeout.Duration,
 			DefaultModel:      server.Model,
+			EnablePlanning:    cfg.Execution.EnablePlanning,
 			TraceSink:         logger,
 			Approver:          approver,
 		}),

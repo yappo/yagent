@@ -22,13 +22,22 @@ const (
 	AgentModeHandoff AgentMode = "handoff"
 )
 
+type ExecutionPhase string
+
+const (
+	ExecutionPhasePlan       ExecutionPhase = "plan"
+	ExecutionPhaseGather     ExecutionPhase = "gather"
+	ExecutionPhaseSynthesize ExecutionPhase = "synthesize"
+	ExecutionPhaseFinish     ExecutionPhase = "finish"
+)
+
 type Message struct {
-	Role      Role
-	Content   string
-	ToolCalls []ToolCall
+	Role       Role
+	Content    string
+	ToolCalls  []ToolCall
 	ToolCallID string
-	AgentID   string
-	Metadata  map[string]string
+	AgentID    string
+	Metadata   map[string]string
 }
 
 type ToolCall struct {
@@ -77,14 +86,75 @@ type AgentSpec struct {
 }
 
 type ContextPack struct {
+	Phase              ExecutionPhase
 	UserGoal           string
 	TaskBrief          string
 	RelevantFiles      []string
+	FileSummaries      []string
 	ArtifactRefs       []string
 	Constraints        []string
 	RecentSummary      string
 	AvailableToolNames []string
 	ExpectedOutput     map[string]any
+	ApprovedPlan       string
+	OpenQuestions      []string
+	Findings           []string
+	RecentObservations []string
+}
+
+type PlannedToolCall struct {
+	Name      string
+	Arguments map[string]any
+}
+
+type PlannedBatch struct {
+	Purpose   string
+	ToolCalls []PlannedToolCall
+}
+
+type ExecutionPlan struct {
+	Summary        string
+	TargetFiles    []string
+	ExitConditions []string
+	Batches        []PlannedBatch
+}
+
+type CapabilityDescriptor struct {
+	Name string
+	Kind string
+}
+
+type NoveltyDecision struct {
+	NewInformation bool
+	Reason         string
+}
+
+type ToolObservation struct {
+	ToolName    string
+	Capability  CapabilityDescriptor
+	Target      string
+	Discovered  []string
+	Fingerprint string
+	Summary     string
+	Cached      bool
+	Changed     bool
+}
+
+type WorkingSet struct {
+	Phase               ExecutionPhase
+	Plan                *ExecutionPlan
+	OpenQuestions       []string
+	Targets             []string
+	ObservedResources   []string
+	PendingTargets      []string
+	Artifacts           []string
+	Findings            []string
+	Summaries           []string
+	RecentObservations  []ToolObservation
+	NoveltyState        string
+	RepeatCounts        map[string]int
+	SeenFingerprints    map[string]string
+	NoNoveltyIterations int
 }
 
 type AgentInvocation struct {

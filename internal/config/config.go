@@ -37,6 +37,7 @@ type ExecutionConfig struct {
 	MaxParallelAgents int      `toml:"max_parallel_agents"`
 	MaxHandoffDepth   int      `toml:"max_handoff_depth"`
 	DefaultTimeout    Duration `toml:"default_timeout"`
+	EnablePlanning    bool     `toml:"enable_planning"`
 }
 
 type AgentCatalogConfig struct {
@@ -101,6 +102,7 @@ func Default() Config {
 			MaxParallelAgents: 2,
 			MaxHandoffDepth:   2,
 			DefaultTimeout:    Duration{Duration: 120 * time.Second},
+			EnablePlanning:    true,
 		},
 		AgentCatalog: AgentCatalogConfig{
 			Paths: []string{},

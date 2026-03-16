@@ -18,6 +18,7 @@ allow_paths = []
 max_parallel_agents = 2
 max_handoff_depth = 2
 default_timeout = "120s"
+enable_planning = true
 
 [agent_catalog]
 paths = []

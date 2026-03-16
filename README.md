@@ -14,10 +14,13 @@ Bubble Tea / Bubbles を使った対話 UI、permission UI、tool call UI、単�
 - OpenAI 互換の `chat/completions` API に対応
 - Agent Status viewport による実行状況モニター
 - tool call card / tool log card による実行中ツール表示
-- ツールレジストリ経由で `file` `fs` `search` `git` `task` `patch` を実行
+- ツールレジストリ経由で `fs` `search` `git` `task` `patch` を実行
 - Claude Code 風の permission UI
 - `--log <path>` による JSON Lines イベントログ
 - `execution.max_parallel_agents` による並列実行制御 (`min = 1`)
+- planning mode による `plan -> approve -> execute` の2段階実行
+- `fs_read` / `fs_list` / `search_*` / `git_*` のセッションキャッシュ
+- phase-driven gather / synthesize による no-new-information ループ防止
 - `task_list` / `task_run` による安全寄りの Task Catalog
 - `internal/` ベースで責務分離した構成
 
@@ -63,6 +66,7 @@ allow_paths = ["/Users/you/Projects"]
 max_parallel_agents = 2
 max_handoff_depth = 2
 default_timeout = "120s"
+enable_planning = true
 
 [agent_catalog]
 paths = ["~/.config/yagent/agents"]
@@ -84,6 +88,7 @@ instruction = "Review for regressions first."
 - `execution.max_parallel_agents`: 並列実行する subagent 数の上限。`1` で逐次実行
 - `execution.max_handoff_depth`: handoff の最大深度
 - `execution.default_timeout`: agent ごとの LLM 呼び出し timeout
+- `execution.enable_planning`: 実行前に計画を作成し、承認後に read-only batch を先に進める
 - `agent_catalog.paths`: user-defined agent DSL のファイルまたはディレクトリ一覧
 - `agents.<id>.instruction`: built-in agent の instruction 上書き
 - `agents.<id>.model`: built-in agent のモデル上書き
@@ -144,6 +149,43 @@ built-in agent の基本セットは最初から使えますが、追加の DSL 
 `tool_failed` と `agent_failed` には失敗理由も記録されるので、subagent の失敗調査に使えます。  
 権限確認や継続確認が複数同時に発生した場合でも、TUI 側で順番に処理できます。
 
+## 実行効率化
+
+### Planning Mode
+
+`execution.enable_planning = true` のとき、manager は最初に実行計画を作り、承認後に実行へ進みます。
+
+- 計画には `summary`, `target_files`, `exit_conditions`, `batches` が含まれます
+- `batches` に入った read-only tool call は、実行前にまとめて先行実行されます
+- 実行フェーズでは承認済み plan を instruction に渡し、compatible な read-only call をまとめて出すように誘導します
+
+### Phase-Driven Execution
+
+各 agent は内部的に `gather -> synthesize -> finish` の phase を持ちます。
+
+- `gather` 中は追加取得を自動で許可します
+- ただし、同じ capability / target の取得で新情報が増えない場合は `novelty_exhausted` とみなします
+- `novelty_exhausted` が続くと `synthesize` に遷移し、追加 tool call を止めて回答生成を優先します
+- `fs_list` / `search_*` の結果からは候補 path も working set に取り込み、次の focused read/search に進みやすくします
+- cached result は working set に反映し、同じ tool chatter を会話履歴に積み増し続けないようにしています
+
+### Session Cache
+
+セッション中は次の結果をキャッシュします。
+
+- `fs_read`
+- `fs_list`
+- `fs_stat`
+- `search_text`
+- `search_files`
+- `git_status`
+- `git_diff`
+- `git_log`
+- `git_show`
+
+`fs_write`, `fs_remove`, `fs_move`, `patch_apply`, `task_run` が成功すると、関連キャッシュは無効化されます。  
+`fs_read` の結果からは言語非依存の軽量 summary も生成し、次の agent 呼び出し時の context に再利用します。
+
 ## TUI 操作
 
 - `Enter`: 送信
@@ -197,7 +239,7 @@ TUI では会話ログとは別に `Agent Status` viewport を表示し、サブ
 - `elapsed`
 - `ctx`
 
-`ctx` は、参照中の `message + unique file refs + artifact refs` の合計です。  
+`ctx` は、参照中の `message + unique file refs + artifact refs + findings + recent observations` の合計です。  
 `elapsed` は 1 秒単位で表示されます。
 
 ### 継続確認

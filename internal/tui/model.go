@@ -731,7 +731,7 @@ func (m *model) applyStatusEvent(event domain.ExecutionEvent) {
 		node.ContextCount = event.ContextCount
 	}
 	switch event.Type {
-	case "agent_started", "delegate_started", "handoff_started":
+	case "agent_started", "delegate_started", "handoff_started", "phase_started":
 		node.Status = "running"
 	case "llm_called":
 		if node.Status == "" {
@@ -1343,6 +1343,12 @@ func shortType(value string) string {
 		return "start"
 	case "agent_completed":
 		return "done "
+	case "phase_started":
+		return "phase"
+	case "novelty_exhausted":
+		return "novel"
+	case "target_discovered":
+		return "targ "
 	case "delegate_started":
 		return "deleg"
 	case "handoff_started":

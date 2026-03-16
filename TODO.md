@@ -4,6 +4,8 @@
 
 - permission ダイアログの一括承認 UI
 - `fs_list` の探索粒度最適化と重複要求削減
+- plan batch の逸脱時に再計画を要求する stricter guard
+- phase-driven gather の `replan_requested` 条件をさらに洗練する
 - Agent Status viewport から失敗理由の詳細を開けるようにする
 - 会話ログの永続化
 - exec モードでも TUI と同等のイベント要約を見やすく出す
@@ -22,6 +24,8 @@
 - tool observer と approver bridge の責務整理
 - orchestrator の event payload は UI 表示用 detail とログ用 detail が混ざっている
 - `fs_list` の結果をより強く再利用し、同じ探索を繰り返さないようにしたい
+- working set の findings / summaries の圧縮と優先順位づけがまだ粗い
+- 要約キャッシュは現状ヒューリスティックで、ファイル以外の tool 出力 summary も改善余地がある
 - path policy は将来的に glob / rule ベースへ拡張したい
 - task catalog の schema validation と分かりやすいエラーメッセージ整備
 - `exec` コマンドも TUI と同じイベント基盤へさらに寄せたい
