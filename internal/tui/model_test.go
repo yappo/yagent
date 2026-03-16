@@ -1,20 +1,27 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"yagent/internal/domain"
-	chatusecase "yagent/internal/usecase/chat"
 )
+
+type stubOrchestrator struct{}
+
+func (stubOrchestrator) RunTurn(_ context.Context, _ domain.TurnRequest) (domain.TurnResult, error) {
+	return domain.TurnResult{}, nil
+}
 
 func newTestModel(t *testing.T) model {
 	t.Helper()
-	return newModel(chatusecase.NewService(nil, nil, 1), t.TempDir())
+	return newModel(stubOrchestrator{}, t.TempDir())
 }
 
 func TestPermissionRequestState(t *testing.T) {
@@ -33,6 +40,91 @@ func TestPermissionRequestState(t *testing.T) {
 	next := modelValue.(model)
 	if next.permission == nil {
 		t.Fatalf("permission state was not set")
+	}
+}
+
+func TestPermissionRequestsQueueInsteadOfOverwriting(t *testing.T) {
+	m := newTestModel(t)
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+
+	modelValue, _ := m.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:  "directory_list",
+			Operation: "ディレクトリ一覧取得",
+			Resource:  "/tmp/one",
+		},
+		response: first,
+	})
+	next := modelValue.(model)
+
+	modelValue, _ = next.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:  "directory_list",
+			Operation: "ディレクトリ一覧取得",
+			Resource:  "/tmp/two",
+		},
+		response: second,
+	})
+	next = modelValue.(model)
+
+	if next.permission == nil || next.permission.request.Resource != "/tmp/one" {
+		t.Fatalf("expected first permission to remain active, got %+v", next.permission)
+	}
+	if len(next.permissionQueue) != 1 || next.permissionQueue[0].request.Resource != "/tmp/two" {
+		t.Fatalf("expected second permission to be queued, got %+v", next.permissionQueue)
+	}
+
+	next.resolvePermission(domain.PermissionAllowOnce)
+	if next.permission == nil || next.permission.request.Resource != "/tmp/two" {
+		t.Fatalf("expected queued permission to become active, got %+v", next.permission)
+	}
+}
+
+func TestPermissionCardShowsRequester(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.permission = &permissionState{
+		request: domain.PermissionRequest{
+			ToolName:  "file_reader",
+			Operation: "ファイル読み取り",
+			Resource:  "/tmp/a.txt",
+			AgentID:   "researcher",
+		},
+		response: make(chan domain.PermissionDecision, 1),
+	}
+
+	card := m.renderPermissionCard()
+	if !strings.Contains(card, "requester: researcher (subagent)") {
+		t.Fatalf("expected requester in permission card, got %q", card)
+	}
+}
+
+func TestResolvePermissionAppendsRequesterToOutput(t *testing.T) {
+	m := newTestModel(t)
+	m.permission = &permissionState{
+		request: domain.PermissionRequest{
+			ToolName:  "file_reader",
+			Operation: "ファイル読み取り",
+			Resource:  "/tmp/a.txt",
+			AgentID:   "manager",
+		},
+		response: make(chan domain.PermissionDecision, 1),
+	}
+
+	m.resolvePermission(domain.PermissionAllowSession)
+	if len(m.output) == 0 || !strings.Contains(m.output[len(m.output)-1], "manager [main]") {
+		t.Fatalf("expected requester in output, got %+v", m.output)
+	}
+}
+
+func TestChatMessageErrorUsesExecutionLabel(t *testing.T) {
+	m := newTestModel(t)
+
+	modelValue, _ := m.Update(chatMessage{err: context.DeadlineExceeded})
+	next := modelValue.(model)
+	if len(next.output) == 0 || !strings.Contains(next.output[0], "実行エラー:") {
+		t.Fatalf("expected execution error label, got %+v", next.output)
 	}
 }
 
@@ -103,6 +195,16 @@ func TestTabDoesNothingWithoutCandidate(t *testing.T) {
 	}
 }
 
+func TestPasteMsgUpdatesTextarea(t *testing.T) {
+	m := newTestModel(t)
+
+	modelValue, _ := m.Update(tea.PasteMsg{Content: "pasted text"})
+	next := modelValue.(model)
+	if next.textarea.Value() != "pasted text" {
+		t.Fatalf("expected pasted text, got %q", next.textarea.Value())
+	}
+}
+
 func TestPermissionTabDoesNotTriggerCommandCompletion(t *testing.T) {
 	m := newTestModel(t)
 	m.textarea.SetValue("/he")
@@ -137,6 +239,84 @@ func TestViewShowsCommandCandidates(t *testing.T) {
 	}
 	if !strings.Contains(view, "/help") {
 		t.Fatalf("expected /help candidate in view, got %q", view)
+	}
+}
+
+func TestViewKeepsTextareaVisibleWithStatusPane(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 140
+	m.height = 24
+	m.textarea.SetValue("hello world")
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-1",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: time.Now(),
+	})
+	m.syncLayout()
+
+	view := m.View().Content
+	if !strings.Contains(view, "hello world") {
+		t.Fatalf("expected textarea content in view, got %q", view)
+	}
+}
+
+func TestViewKeepsTextareaVisibleWithStackedStatusPane(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 90
+	m.height = 20
+	m.textarea.SetValue("stacked input")
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-1",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: time.Now(),
+	})
+	m.syncLayout()
+
+	view := m.View().Content
+	if !strings.Contains(view, "stacked input") {
+		t.Fatalf("expected textarea content in stacked view, got %q", view)
+	}
+}
+
+func TestMainPaneSeparatorDoesNotWrap(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 140
+	m.height = 24
+	m.output = appendOutputBlock(nil, assistantOutputLabel, "hello")
+	m.syncLayout()
+
+	view := m.renderMainPanels()
+	if strings.Contains(view, "─\n─") {
+		t.Fatalf("expected pane separator to stay on one line, got %q", view)
+	}
+}
+
+func TestStatusAndChatShowMetrics(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 140
+	m.height = 24
+	now := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:        "run-1",
+		AgentID:      "manager",
+		Type:         "agent_started",
+		Timestamp:    now.Add(-2 * time.Second),
+		ContextCount: 3,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:        "run-1",
+		AgentID:      "manager",
+		Type:         "llm_called",
+		Timestamp:    now,
+		ContextCount: 3,
+	})
+	m.syncLayout()
+
+	view := m.renderMainPanels()
+	if !strings.Contains(view, "elapsed") || !strings.Contains(view, "ctx 3") {
+		t.Fatalf("expected metrics in panes, got %q", view)
 	}
 }
 
@@ -212,7 +392,7 @@ func TestPathCandidatesForRelativeFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@R")
 
 	ctx := m.activePathCompletion()
@@ -226,7 +406,7 @@ func TestPathCandidatesForCurrentDirectoryPrefix(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@./")
 
 	ctx := m.activePathCompletion()
@@ -243,7 +423,7 @@ func TestPathCandidatesIncludeDirectoriesAndFiles(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "libexe"), 0o755); err != nil {
 		t.Fatalf("mkdir libexe: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@l")
 
 	ctx := m.activePathCompletion()
@@ -263,7 +443,7 @@ func TestPathCandidatesForDirectoryContents(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "lib", "file.go"), []byte("package lib"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@lib/")
 
 	ctx := m.activePathCompletion()
@@ -280,7 +460,7 @@ func TestPathCandidatesIncludeHiddenEntries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("A=B"), 0o644); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@.")
 
 	ctx := m.activePathCompletion()
@@ -298,7 +478,7 @@ func TestPathCompletionTabCompletesSingleFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write README: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@R")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -313,7 +493,7 @@ func TestPathCompletionTabCompletesDirectoryWithSlash(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "lib"), 0o755); err != nil {
 		t.Fatalf("mkdir lib: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@l")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -331,7 +511,7 @@ func TestPathCompletionTabUsesLongestCommonPrefix(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "libexe"), 0o755); err != nil {
 		t.Fatalf("mkdir libexe: %v", err)
 	}
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.textarea.SetValue("@l")
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
@@ -365,7 +545,7 @@ func TestSubmitPromptStoresNormalizedMessageOnlyForSelectedReference(t *testing.
 		t.Fatalf("write main.go: %v", err)
 	}
 
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	m.selectedRefs["@main.go"] = "main.go"
 	modelValue, _ := submitPrompt(m, "@main.go の概要を見せて")
 	next := modelValue.(model)
@@ -384,7 +564,7 @@ func TestSubmitPromptKeepsManualAtReferenceUnchanged(t *testing.T) {
 		t.Fatalf("write main.go: %v", err)
 	}
 
-	m := newModel(chatusecase.NewService(nil, nil, 1), dir)
+	m := newModel(stubOrchestrator{}, dir)
 	modelValue, _ := submitPrompt(m, "@main.go の概要を見せて")
 	next := modelValue.(model)
 

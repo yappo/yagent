@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"yagent/internal/domain"
-	chatusecase "yagent/internal/usecase/chat"
 )
 
 type chatMessage struct {
@@ -22,6 +22,10 @@ type chatMessage struct {
 }
 
 type loadingTickMsg struct{}
+
+type statusEventMsg struct {
+	event domain.ExecutionEvent
+}
 
 type permissionState struct {
 	request       domain.PermissionRequest
@@ -40,7 +44,7 @@ type slashCommand struct {
 }
 
 type model struct {
-	runner           *chatusecase.Service
+	runner           domain.Orchestrator
 	workingDir       string
 	selectedRefs     map[string]string
 	messages         []domain.Message
@@ -50,12 +54,34 @@ type model struct {
 	width            int
 	height           int
 	viewport         viewport.Model
+	statusViewport   viewport.Model
 	textarea         textarea.Model
 	history          []string
 	historyIndex     int
 	permission       *permissionState
+	permissionQueue  []permissionState
 	sessionApprovals map[string]bool
+	status           statusState
+	statusEvents     <-chan domain.ExecutionEvent
+	cancelStatus     func()
 	styles           styles
+}
+
+type statusState struct {
+	nodes      map[string]*agentStatusNode
+	rootRunIDs []string
+	recent     []domain.ExecutionEvent
+}
+
+type agentStatusNode struct {
+	RunID        string
+	ParentRunID  string
+	AgentID      string
+	Status       string
+	Detail       string
+	StartedAt    time.Time
+	UpdatedAt    time.Time
+	ContextCount int
 }
 
 type styles struct {
@@ -94,9 +120,12 @@ const (
 	assistantOutputLabel = "__ASSISTANT__"
 	loadingInterval      = 100 * time.Millisecond
 	maxComposerHeight    = 6
+	paneChromeHeight     = 3
+	stackedPaneGap       = 1
+	paneHorizontalFrame  = 4
 )
 
-func newModel(runner *chatusecase.Service, workingDir string) model {
+func newModel(runner domain.Orchestrator, workingDir string) model {
 	ta := textarea.New()
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行, Enter で送信, /exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
@@ -120,9 +149,16 @@ func newModel(runner *chatusecase.Service, workingDir string) model {
 		workingDir:       workingDir,
 		selectedRefs:     map[string]string{},
 		viewport:         viewport.New(),
+		statusViewport:   viewport.New(),
 		textarea:         ta,
 		history:          []string{},
 		sessionApprovals: map[string]bool{},
+		status: statusState{
+			nodes: map[string]*agentStatusNode{},
+		},
+	}
+	if stream, ok := runner.(domain.ExecutionEventStream); ok {
+		m.statusEvents, m.cancelStatus = stream.SubscribeEvents()
 	}
 	m.styles = defaultStyles()
 	return m
@@ -159,7 +195,7 @@ func defaultStyles() styles {
 }
 
 func (m model) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(textarea.Blink, listenStatusEvents(m.statusEvents))
 }
 
 func (m *model) syncComposer() {
@@ -190,14 +226,30 @@ func (m *model) syncLayout() {
 		footerHeight += m.permissionCardHeight()
 	}
 	headerHeight := 3
-	m.viewport.SetWidth(m.width)
-	m.viewport.SetHeight(maxInt(3, m.height-headerHeight-footerHeight))
+	chatWidth, statusWidth, stacked := layoutWidths(m.width)
+	mainHeight := maxInt(3, m.height-headerHeight-footerHeight)
+	if stacked {
+		contentHeight := maxInt(3, mainHeight-(paneChromeHeight*2)-stackedPaneGap)
+		statusHeight := maxInt(3, minInt(8, contentHeight/3))
+		chatHeight := maxInt(3, contentHeight-statusHeight)
+		m.statusViewport.SetWidth(chatWidth)
+		m.statusViewport.SetHeight(statusHeight)
+		m.viewport.SetWidth(chatWidth)
+		m.viewport.SetHeight(chatHeight)
+	} else {
+		m.viewport.SetWidth(chatWidth)
+		m.viewport.SetHeight(maxInt(3, mainHeight-paneChromeHeight))
+		m.statusViewport.SetWidth(statusWidth)
+		m.statusViewport.SetHeight(maxInt(3, mainHeight-paneChromeHeight))
+	}
 	m.refreshViewport()
 }
 
 func (m *model) refreshViewport() {
 	m.viewport.SetContent(m.renderLog())
+	m.statusViewport.SetContent(m.renderStatus())
 	m.viewport.GotoBottom()
+	m.statusViewport.GotoTop()
 }
 
 func (m model) renderLog() string {
@@ -258,10 +310,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			close(msg.response)
 			return m, nil
 		}
-		m.permission = &permissionState{
+		state := permissionState{
 			request:       msg.request,
 			response:      msg.response,
 			selectedIndex: 0,
+		}
+		if m.permission == nil {
+			m.permission = &state
+		} else {
+			m.permissionQueue = append(m.permissionQueue, state)
 		}
 		m.syncLayout()
 		return m, nil
@@ -283,8 +340,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case chatMessage:
 		m.loading = false
 		if msg.err != nil {
-			m.output = append(m.output, "LLM サーバーとの通信に失敗しました: "+msg.err.Error())
-			m.messages = m.messages[:len(m.messages)-1]
+			m.output = append(m.output, "実行エラー: "+msg.err.Error())
+			if len(m.messages) > 0 {
+				m.messages = m.messages[:len(m.messages)-1]
+			}
 			m.refreshViewport()
 			return m, nil
 		}
@@ -295,6 +354,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.output = appendOutputBlock(m.output, assistantOutputLabel, msg.content)
 		m.refreshViewport()
 		return m, nil
+
+	case statusEventMsg:
+		m.applyStatusEvent(msg.event)
+		m.refreshViewport()
+		return m, listenStatusEvents(m.statusEvents)
+
+	case tea.PasteMsg:
+		if m.permission != nil {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		m.reconcileSelectedRefs()
+		m.syncLayout()
+		return m, cmd
 
 	case tea.KeyMsg:
 		if m.permission != nil {
@@ -469,7 +543,7 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 	m.refreshViewport()
 
 	send := func() tea.Msg {
-		result, err := m.runner.Run(context.Background(), chatusecase.Input{
+		result, err := m.runner.RunTurn(context.Background(), domain.TurnRequest{
 			Messages: m.messages,
 		})
 		return chatMessage{content: result.Message.Content, err: err}
@@ -487,15 +561,69 @@ func (m *model) resolvePermission(decision domain.PermissionDecision) {
 		m.sessionApprovals[approvalKey(m.permission.request)] = true
 	}
 
-	m.output = append(m.output, fmt.Sprintf("%s %s を%s",
+	m.output = append(m.output, fmt.Sprintf("%s [%s] %s を%s",
+		permissionRequesterLabel(m.permission.request),
+		permissionRequesterType(m.permission.request),
 		m.permission.request.Operation,
-		m.permission.request.Resource,
-		permissionDecisionLabel(decision),
+		permissionDecisionLabel(decision)+" ("+m.permission.request.Resource+")",
 	))
 	m.permission.response <- decision
 	close(m.permission.response)
-	m.permission = nil
+	if len(m.permissionQueue) > 0 {
+		next := m.permissionQueue[0]
+		m.permissionQueue = m.permissionQueue[1:]
+		m.permission = &next
+	} else {
+		m.permission = nil
+	}
 	m.syncLayout()
+}
+
+func (m *model) applyStatusEvent(event domain.ExecutionEvent) {
+	node, ok := m.status.nodes[event.RunID]
+	if !ok {
+		node = &agentStatusNode{
+			RunID:       event.RunID,
+			ParentRunID: event.ParentRunID,
+			AgentID:     event.AgentID,
+		}
+		m.status.nodes[event.RunID] = node
+		if event.ParentRunID == "" {
+			m.status.rootRunIDs = appendUnique(m.status.rootRunIDs, event.RunID)
+		}
+	}
+	if node.AgentID == "" {
+		node.AgentID = event.AgentID
+	}
+	if node.ParentRunID == "" {
+		node.ParentRunID = event.ParentRunID
+	}
+	if node.StartedAt.IsZero() {
+		node.StartedAt = event.Timestamp
+	}
+	node.UpdatedAt = event.Timestamp
+	node.Detail = event.Detail
+	if event.ContextCount > 0 {
+		node.ContextCount = event.ContextCount
+	}
+	switch event.Type {
+	case "agent_started", "delegate_started", "handoff_started":
+		node.Status = "running"
+	case "llm_called":
+		if node.Status == "" {
+			node.Status = "thinking"
+		}
+	case "tool_called":
+		node.Status = "working"
+	case "tool_failed", "agent_failed":
+		node.Status = "failed"
+	case "agent_completed":
+		node.Status = "done"
+	}
+	m.status.recent = append([]domain.ExecutionEvent{event}, m.status.recent...)
+	if len(m.status.recent) > 8 {
+		m.status.recent = m.status.recent[:8]
+	}
 }
 
 func permissionDecisionLabel(decision domain.PermissionDecision) string {
@@ -523,12 +651,19 @@ func (m model) renderPermissionCard() string {
 
 	cardWidth := maxInt(32, m.width-2)
 	resource := trimPathFromEnd(m.permission.request.Resource, cardWidth-4)
-	card := strings.Join([]string{
+	lines := []string{
 		m.styles.permissionTitle.Render(m.permission.request.Operation),
 		m.styles.permissionPath.Render(resource),
+		m.styles.permissionHelp.Render("requester: " + permissionRequesterDisplay(m.permission.request)),
+	}
+	if m.permission.request.Purpose != "" {
+		lines = append(lines, m.styles.permissionHelp.Render("purpose: "+m.permission.request.Purpose))
+	}
+	lines = append(lines,
 		renderPermissionOptions(m.permission.selectedIndex, m.styles.permissionSelected, m.styles.permissionOption),
 		m.styles.permissionHelp.Render("←/→ または Tab で選択 • Enter で確定 • Esc で拒否"),
-	}, "\n")
+	)
+	card := strings.Join(lines, "\n")
 	return m.styles.permissionCard.Width(cardWidth).Render(card)
 }
 
@@ -591,8 +726,9 @@ func (m model) View() tea.View {
 	sb.WriteString(m.styles.separator.Render(strings.Repeat("─", maxInt(1, m.width))))
 	sb.WriteString("\n\n")
 	offsetY += 3
-	sb.WriteString(m.viewport.View())
-	offsetY += lipgloss.Height(m.viewport.View())
+	mainView := m.renderMainPanels()
+	sb.WriteString(mainView)
+	offsetY += lipgloss.Height(mainView)
 	sb.WriteString("\n")
 	offsetY++
 	if m.permission != nil {
@@ -618,4 +754,280 @@ func (m model) View() tea.View {
 		view.Cursor = cursor
 	}
 	return view
+}
+
+func (m model) renderMainPanels() string {
+	chatTitle := "Chat"
+	if metrics := m.currentRunMetrics(); metrics != "" {
+		chatTitle += "  " + metrics
+	}
+	chatPane := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1).
+		Width(maxInt(1, m.viewport.Width()+paneHorizontalFrame)).
+		Render(chatTitle + "\n" + m.viewport.View())
+	statusTitle := "Agent Status"
+	if metrics := m.currentRunMetrics(); metrics != "" {
+		statusTitle += "  " + metrics
+	}
+	statusPane := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1).
+		Width(maxInt(1, m.statusViewport.Width()+paneHorizontalFrame)).
+		Render(statusTitle + "\n" + m.statusViewport.View())
+
+	_, _, stacked := layoutWidths(m.width)
+	if stacked {
+		return chatPane + "\n" + statusPane
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, chatPane, statusPane)
+}
+
+func (m model) renderStatus() string {
+	if len(m.status.nodes) == 0 {
+		return "まだサブエージェントは動いていません。"
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("running %d  done %d  failed %d", m.countStatus("running", "working", "thinking"), m.countStatus("done"), m.countStatus("failed")))
+	lines = append(lines, "")
+
+	rootIDs := append([]string(nil), m.status.rootRunIDs...)
+	sort.Strings(rootIDs)
+	for _, runID := range rootIDs {
+		lines = append(lines, m.renderStatusTree(runID, "", true)...)
+	}
+
+	if len(m.status.recent) > 0 {
+		lines = append(lines, "", "Recent")
+		for _, event := range m.status.recent {
+			line := fmt.Sprintf("%s %s %s", event.Timestamp.Format("15:04:05"), shortType(event.Type), event.AgentID)
+			if event.Detail != "" {
+				line += "  " + trimPathFromEnd(event.Detail, maxInt(20, m.statusViewport.Width()-12))
+			}
+			lines = append(lines, line)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m model) renderStatusTree(runID, prefix string, last bool) []string {
+	node, ok := m.status.nodes[runID]
+	if !ok {
+		return nil
+	}
+	branch := "├─ "
+	nextPrefix := prefix + "│  "
+	if last {
+		branch = "└─ "
+		nextPrefix = prefix + "   "
+	}
+	if prefix == "" {
+		branch = ""
+		nextPrefix = ""
+	}
+
+	line := fmt.Sprintf("%s%s  %s  %s", prefix+branch, titleCase(node.AgentID), statusLabel(node.Status), formatNodeMetrics(node))
+	if node.Detail != "" {
+		line += "  " + trimPathFromEnd(strings.TrimSpace(node.Detail), maxInt(16, m.statusViewport.Width()-10))
+	}
+	lines := []string{line}
+
+	children := m.childRunIDs(runID)
+	for idx, childID := range children {
+		lines = append(lines, m.renderStatusTree(childID, nextPrefix, idx == len(children)-1)...)
+	}
+	return lines
+}
+
+func (m model) childRunIDs(parentRunID string) []string {
+	var ids []string
+	for runID, node := range m.status.nodes {
+		if node.ParentRunID == parentRunID {
+			ids = append(ids, runID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (m model) countStatus(statuses ...string) int {
+	allowed := map[string]bool{}
+	for _, status := range statuses {
+		allowed[status] = true
+	}
+	count := 0
+	for _, node := range m.status.nodes {
+		if allowed[node.Status] {
+			count++
+		}
+	}
+	return count
+}
+
+func listenStatusEvents(ch <-chan domain.ExecutionEvent) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		event, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return statusEventMsg{event: event}
+	}
+}
+
+func layoutWidths(totalWidth int) (int, int, bool) {
+	if totalWidth < 110 {
+		return maxInt(1, totalWidth), maxInt(1, totalWidth), true
+	}
+	statusWidth := minInt(42, maxInt(30, totalWidth/3))
+	chatWidth := maxInt(40, totalWidth-statusWidth-1)
+	return chatWidth, statusWidth, false
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, current := range values {
+		if current == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func statusLabel(status string) string {
+	switch status {
+	case "running", "working":
+		return "[running]"
+	case "thinking":
+		return "[thinking]"
+	case "done":
+		return "[done]"
+	case "failed":
+		return "[failed]"
+	default:
+		return "[queued]"
+	}
+}
+
+func shortType(value string) string {
+	switch value {
+	case "agent_started":
+		return "start"
+	case "agent_completed":
+		return "done "
+	case "delegate_started":
+		return "deleg"
+	case "handoff_started":
+		return "hand "
+	case "tool_called":
+		return "tool "
+	case "tool_failed":
+		return "fail "
+	case "agent_failed":
+		return "afail"
+	default:
+		return value
+	}
+}
+
+func titleCase(value string) string {
+	if value == "" {
+		return ""
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
+}
+
+func permissionRequesterDisplay(request domain.PermissionRequest) string {
+	label := permissionRequesterLabel(request)
+	if permissionRequesterType(request) == "main" {
+		return label + " (main)"
+	}
+	return label + " (subagent)"
+}
+
+func permissionRequesterLabel(request domain.PermissionRequest) string {
+	switch request.AgentID {
+	case "", "manager":
+		return "manager"
+	default:
+		return request.AgentID
+	}
+}
+
+func permissionRequesterType(request domain.PermissionRequest) string {
+	switch request.AgentID {
+	case "", "manager":
+		return "main"
+	default:
+		return "subagent"
+	}
+}
+
+func (m model) currentRunMetrics() string {
+	node := m.currentRootNode()
+	if node == nil {
+		return ""
+	}
+	return formatMetrics(node.StartedAt, node.UpdatedAt, node.Status, node.ContextCount)
+}
+
+func (m model) currentRootNode() *agentStatusNode {
+	if len(m.status.rootRunIDs) == 0 {
+		return nil
+	}
+	runID := m.status.rootRunIDs[len(m.status.rootRunIDs)-1]
+	return m.status.nodes[runID]
+}
+
+func formatNodeMetrics(node *agentStatusNode) string {
+	return formatMetrics(node.StartedAt, node.UpdatedAt, node.Status, node.ContextCount)
+}
+
+func formatMetrics(startedAt, updatedAt time.Time, status string, contextCount int) string {
+	parts := []string{}
+	if !startedAt.IsZero() {
+		end := updatedAt
+		if status != "done" && status != "failed" {
+			end = time.Now()
+		}
+		if end.Before(startedAt) {
+			end = startedAt
+		}
+		parts = append(parts, "elapsed "+formatDuration(end.Sub(startedAt)))
+	}
+	if contextCount > 0 {
+		parts = append(parts, fmt.Sprintf("ctx %d", contextCount))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func formatDuration(duration time.Duration) string {
+	if duration < 0 {
+		duration = 0
+	}
+	if duration < time.Minute {
+		seconds := int(duration / time.Second)
+		if duration%time.Second != 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		return fmt.Sprintf("%ds", seconds)
+	}
+	minutes := int(duration / time.Minute)
+	seconds := int((duration % time.Minute) / time.Second)
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
 }

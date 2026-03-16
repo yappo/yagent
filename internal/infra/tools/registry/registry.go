@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"yagent/internal/domain"
+	filetools "yagent/internal/infra/tools/file"
 )
 
 type Registry struct {
@@ -24,9 +25,12 @@ func (r *Registry) Register(tool domain.Tool) {
 	r.tools[tool.Definition().Name] = tool
 }
 
-func (r *Registry) Definitions() []domain.ToolDefinition {
+func (r *Registry) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 	names := make([]string, 0, len(r.tools))
 	for name := range r.tools {
+		if !isAllowed(agent, name) {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -38,7 +42,16 @@ func (r *Registry) Definitions() []domain.ToolDefinition {
 	return definitions
 }
 
-func (r *Registry) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
+func (r *Registry) Execute(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+	if !isAllowed(agent, call.Name) {
+		return domain.ToolResult{
+			CallID:  call.ID,
+			Name:    call.Name,
+			Success: false,
+			Output:  fmt.Sprintf("エラー: agent %q はツール %q を使用できません", agent.ID, call.Name),
+		}
+	}
+
 	tool, ok := r.tools[call.Name]
 	if !ok {
 		return domain.ToolResult{
@@ -49,5 +62,22 @@ func (r *Registry) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		}
 	}
 
+	ctx = filetoolContext(ctx, agent, call)
 	return tool.Execute(ctx, call)
+}
+
+func isAllowed(agent domain.AgentSpec, toolName string) bool {
+	if len(agent.AllowedTools) == 0 {
+		return true
+	}
+	for _, allowed := range agent.AllowedTools {
+		if allowed == toolName {
+			return true
+		}
+	}
+	return false
+}
+
+func filetoolContext(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall) context.Context {
+	return filetools.WithExecutionContext(ctx, agent.ID, call.Purpose)
 }

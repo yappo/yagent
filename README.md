@@ -1,16 +1,22 @@
 # yagent
 
 yagent は OpenAI 互換 API を使ってローカルまたはリモートの LLM と対話する、TUI 中心の AI coding agent です。  
-Bubble Tea / Bubbles を使った対話 UI、ツール呼び出し、ファイル操作の許可 UI、単発実行 CLI を備えています。
+Bubble Tea / Bubbles を使った対話 UI、ファイル操作の許可 UI、単発実行 CLI に加えて、宣言的 Agent DSL による動的サブエージェント実行を備えています。
 
 ## 特徴
 
 - `yagent --config <file>` でそのまま TUI 起動
 - `yagent exec --prompt ...` で単発実行
+- Orchestrator-first のサブエージェント実行
+- built-in agent catalog と user-defined agent DSL
+- built-in agent に加えて ephemeral agent の即席生成
 - Bubble Tea / Bubbles ベースの TUI
 - OpenAI 互換の `chat/completions` API に対応
-- ツールレジストリ経由で file read / write を実行
+- Agent Status viewport による実行状況モニター
+- ツールレジストリ経由で file read / write / directory list を実行
 - Claude Code 風の permission UI
+- `--log <path>` による JSON Lines イベントログ
+- `execution.max_parallel_agents` による並列実行制御 (`min = 1`)
 - `internal/` ベースで責務分離した構成
 
 ## コマンド
@@ -18,6 +24,9 @@ Bubble Tea / Bubbles を使った対話 UI、ツール呼び出し、ファイ�
 ```bash
 # TUI を起動
 yagent
+
+# イベントログをファイルに保存
+yagent --log yagent.log
 
 # 設定ファイル付きで TUI を起動
 yagent --config ~/.yagent.toml
@@ -27,6 +36,9 @@ yagent tui --config ~/.yagent.toml
 
 # 単発実行
 yagent exec --config ~/.yagent.toml --prompt "こんにちは"
+
+# 単発実行 + イベントログ
+yagent exec --log yagent.log --prompt "こんにちは"
 ```
 
 ## 設定ファイル
@@ -39,18 +51,88 @@ default = "lmstudio"
 name = "lmstudio"
 url = "http://127.0.0.1:1234"
 token = ""
+timeout = "20m"
 
 [file]
 allow_paths = ["/Users/you/Projects"]
+
+[execution]
+max_parallel_agents = 2
+max_handoff_depth = 2
+default_timeout = "120s"
+
+[agent_catalog]
+paths = ["~/.config/yagent/agents"]
+
+[agents.coder]
+model = "gpt-5"
+
+[agents.reviewer]
+instruction = "Review for regressions first."
 ```
 
 ### 設定項目
 
 - `server.default`: 使用するサーバー名
 - `server.servers`: 接続先一覧
+- `server.servers[].timeout`: LLM client の HTTP timeout。未設定時は `20m`
 - `file.allow_paths`: ツールからアクセス可能なパス一覧
+- `execution.max_parallel_agents`: 並列実行する subagent 数の上限。`1` で逐次実行
+- `execution.max_handoff_depth`: handoff の最大深度
+- `execution.default_timeout`: agent ごとの LLM 呼び出し timeout
+- `agent_catalog.paths`: user-defined agent DSL のファイルまたはディレクトリ一覧
+- `agents.<id>.instruction`: built-in agent の instruction 上書き
+- `agents.<id>.model`: built-in agent のモデル上書き
+- `agents.<id>.allowed_tools`: built-in agent の tool allowlist 上書き
+- `agents.<id>.disabled`: built-in agent の無効化
 
 起動時のカレントディレクトリは自動で許可パスに追加されます。
+
+### Agent DSL
+
+user-defined agent は TOML で定義します。
+
+```toml
+id = "docs-writer"
+name = "Docs Writer"
+description = "README や設計メモの更新を担当"
+instruction = "Write concise docs with concrete examples."
+mode = "tool"
+allowed_tools = ["file_reader"]
+read_only = true
+max_turns = 4
+timeout = "30s"
+tags = ["docs"]
+```
+
+標準では次の built-in agent を同梱しています。
+
+- `manager`
+- `planner`
+- `researcher`
+- `coder`
+- `tester`
+- `reviewer`
+
+`agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
+built-in agent の基本セットは最初から使えますが、追加の DSL で repo 専用 agent を拡張する前提です。
+
+### 実行ログ
+
+`--log <path>` を指定すると、実行イベントを JSON Lines 形式で出力します。
+
+- `execution_event.agent_started`
+- `execution_event.llm_called`
+- `execution_event.tool_called`
+- `execution_event.tool_failed`
+- `execution_event.agent_failed`
+- `execution_event.agent_completed`
+- `execution_event.agent_continued`
+- `permission.requested`
+- `permission.resolved`
+
+`tool_failed` と `agent_failed` には失敗理由も記録されるので、subagent の失敗調査に使えます。
+権限確認や継続確認が複数同時に発生した場合でも、TUI 側で順番に処理できます。
 
 ## TUI 操作
 
@@ -79,7 +161,33 @@ allow_paths = ["/Users/you/Projects"]
 - このセッションで許可
 - 拒否
 
-`このセッションで許可` は、同じツール・同じファイルに対してのみ再利用されます。
+`このセッションで許可` は、同じツール・同じファイルに対してのみ再利用されます。  
+サブエージェント導入後も permission の判定ルール自体は変わりません。
+permission card には、どの agent が要求したかも表示されます。
+
+### Agent Status
+
+TUI では会話ログとは別に `Agent Status` viewport を表示し、サブエージェントの状態を監視できます。
+
+- 実行中 / 完了 / 失敗した agent 数
+- 親子関係を含む agent ツリー
+- handoff / delegate の流れ
+- 直近イベント
+- `elapsed`
+- `ctx`
+
+`ctx` は、参照中の `message + unique file refs + artifact refs` の合計です。  
+`elapsed` は 1 秒単位で表示されます。
+
+### 継続確認
+
+built-in agent の既定 `max_turns` は `200` です。  
+上限に達すると、permission UI と同じ導線で「継続実行するか」を確認します。
+
+- 許可するとその agent の turn カウンタをリセットして続行
+- 拒否すると `agent_failed` として終了
+
+権限確認と継続確認の待ち時間は agent timeout に含まれません。
 
 ## アーキテクチャ
 
@@ -91,10 +199,21 @@ internal/
   cli/       Cobra command 定義
   config/    TOML 設定読込
   domain/    中核型と interface
-  infra/     LLM client / tools 実装
+  infra/     LLM client / tools / agent catalog 実装
   tui/       Bubble Tea / Bubbles の UI
-  usecase/   会話実行ロジック
+  usecase/   orchestrator / 実行ロジック
 ```
+
+### 実行モデル
+
+- `manager` がユーザー入力を受ける
+- リポジトリ全体の調査や品質レポートのような広域タスクでは、`manager` は `planner` / `researcher` への委譲を優先する
+- `delegate_to_<agent>` で bounded task を subagent に委譲
+- `handoff_to_<agent>` で専門 agent に現在ターンを handoff
+- `run_ephemeral_agent` で一時的な subagent を即席生成
+- リポジトリ探索には `directory_list` を優先し、単純な一覧取得のためにスクリプト生成へ逃がさない
+- `planner -> coder -> planner` のような再委譲ループは orchestrator で抑止
+- 並列化は非破壊系 task のみ。書き込み系は常に直列化
 
 ### ツール拡張
 
@@ -119,9 +238,10 @@ go test ./...
 ## テスト方針
 
 - `internal/config`: 設定読込テスト
+- `internal/infra/agents/catalog`: built-in catalog / user DSL 読込テスト
 - `internal/infra/llm`: fake server を使った HTTP クライアントテスト
 - `internal/infra/tools`: file tool / registry のユニットテスト
-- `internal/usecase/chat`: tool loop を含む会話実行テスト
+- `internal/usecase/orchestrator`: delegation / handoff / ephemeral agent の実行テスト
 - `internal/tui`: state transition と viewport / permission UI のテスト
 
 ## ライセンス

@@ -6,10 +6,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	chatusecase "yagent/internal/usecase/chat"
+	"yagent/internal/domain"
 )
 
-func Run(runner *chatusecase.Service, approver *ApproverBridge, workingDir string) error {
+func Run(runner domain.Orchestrator, approver *ApproverBridge, workingDir string) error {
 	m := newModel(runner, workingDir)
 	program := tea.NewProgram(m)
 	approver.Attach(program)

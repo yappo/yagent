@@ -14,6 +14,9 @@ type PermissionRequest struct {
 	ToolName  string
 	Operation string
 	Resource  string
+	AgentID   string
+	Purpose   string
+	Task      string
 }
 
 type Approver interface {
