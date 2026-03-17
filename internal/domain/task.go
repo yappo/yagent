@@ -2,11 +2,11 @@ package domain
 
 import "context"
 
-type TaskKind string
+type TaskSpecKind string
 
 const (
-	TaskKindCommand   TaskKind = "command"
-	TaskKindMCPServer TaskKind = "mcp_server"
+	TaskSpecKindCommand   TaskSpecKind = "command"
+	TaskSpecKindMCPServer TaskSpecKind = "mcp_server"
 )
 
 type MCPTransport string
@@ -42,7 +42,7 @@ type MCPServerSpec struct {
 type TaskDefinition struct {
 	ID          string
 	Description string
-	Kind        TaskKind
+	Kind        TaskSpecKind
 	Command     *CommandTaskSpec
 	MCPServer   *MCPServerSpec
 	Source      string

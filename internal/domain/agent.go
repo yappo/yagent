@@ -77,6 +77,10 @@ type AgentSpec struct {
 	MaxTurns           int
 	TokenBudget        int
 	Tags               []string
+	TaskKinds          []TaskKind
+	Capabilities       []string
+	PreferredPhases    []RunPhase
+	ScopeHints         []string
 	PhasePolicies      []PhasePolicy
 	VerificationPolicy VerificationPolicy
 	BuiltIn            bool
@@ -99,6 +103,7 @@ type RunContext struct {
 	RecentSummary       string
 	AvailableToolNames  []string
 	EnabledCapabilities []string
+	AgentInventory      []AgentInventoryEntry
 	ExpectedOutput      map[string]any
 	ResumeSource        string
 }

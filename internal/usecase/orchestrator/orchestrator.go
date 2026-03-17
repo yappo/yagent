@@ -111,10 +111,52 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	if !ok {
 		return domain.TurnResult{}, fmt.Errorf("manager agent が見つかりません")
 	}
-	manager = s.withManagerDelegationBias(manager, run.Messages)
+	prompt := strings.TrimSpace(run.UserGoal)
+	if prompt == "" {
+		prompt = strings.TrimSpace(latestUserMessage(request.Messages))
+	}
+	inventory := s.buildAgentInventory()
+	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "planner", "Agent inventory", "agent_inventory", inventoryArtifactSummary(inventory)))
+	_ = s.saveRun(ctx, run)
 
 	var allEvents []domain.ExecutionEvent
 	if s.config.DisablePhaseHarness {
+		run.ExecutionPlan = disabledHarnessExecutionPlan(prompt)
+		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
+		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "manager", "Execution plan", "execution_plan", stablePlanJSON(run.ExecutionPlan)))
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
+		result, events, err := s.runDirectPhase(ctx, run, manager, request)
+		allEvents = append(allEvents, events...)
+		if err != nil {
+			run.Status = domain.RunStatusFailed
+			_ = s.saveRun(ctx, run)
+			return domain.TurnResult{}, err
+		}
+		run.Status = domain.RunStatusCompleted
+		run.CurrentPhase = domain.RunPhaseExecute
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
+		artifact := domain.RunArtifact{
+			ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
+			Name:      "Final response",
+			Kind:      "final_response",
+			Phase:     domain.RunPhaseExecute,
+			AgentID:   result.Message.AgentID,
+			Summary:   truncateSummary(result.Message.Content),
+			Content:   result.Message.Content,
+			CreatedAt: time.Now(),
+		}
+		run.Artifacts = append(run.Artifacts, artifact)
+		if s.config.MemoryStore != nil {
+			_ = s.rememberRun(ctx, run)
+		}
+		_ = s.saveRun(ctx, run)
+		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
+	}
+	if shouldBypassPlanner(prompt) {
+		run.ExecutionPlan = directConversationPlan(prompt)
+		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
+		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "manager", "Execution plan", "execution_plan", stablePlanJSON(run.ExecutionPlan)))
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
 		result, events, err := s.runDirectPhase(ctx, run, manager, request)
 		allEvents = append(allEvents, events...)
 		if err != nil {
@@ -143,7 +185,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
 	}
 
-	planResult, planEvents, err := s.runPlanPhase(ctx, run, request)
+	executionPlan, planEvents, err := s.runPlanPhase(ctx, run, request, inventory)
 	allEvents = append(allEvents, planEvents...)
 	if err != nil {
 		run.Status = domain.RunStatusFailed
@@ -151,7 +193,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		return domain.TurnResult{}, err
 	}
 
-	executionResult, executeEvents, err := s.runExecutePhase(ctx, run, manager, request, planResult)
+	executionResult, executeEvents, err := s.runExecutePhase(ctx, run, executionPlan, request)
 	allEvents = append(allEvents, executeEvents...)
 	if err != nil {
 		run.Status = domain.RunStatusFailed
@@ -160,31 +202,33 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	}
 
 	finalExecution := executionResult
-	for attempt := 1; attempt <= s.config.MaxVerificationAttempts; attempt++ {
-		verification, verifyEvents, err := s.runVerifyPhase(ctx, run, request, finalExecution, attempt)
-		allEvents = append(allEvents, verifyEvents...)
-		if err != nil {
-			run.Status = domain.RunStatusFailed
-			_ = s.saveRun(ctx, run)
-			return domain.TurnResult{}, err
+	if len(executionPlan.Verify) > 0 {
+		for attempt := 1; attempt <= s.config.MaxVerificationAttempts; attempt++ {
+			verification, verifyEvents, err := s.runVerifyPhase(ctx, run, executionPlan, request, finalExecution, attempt)
+			allEvents = append(allEvents, verifyEvents...)
+			if err != nil {
+				run.Status = domain.RunStatusFailed
+				_ = s.saveRun(ctx, run)
+				return domain.TurnResult{}, err
+			}
+			if verification.Status == "pass" {
+				break
+			}
+			if attempt >= s.config.MaxVerificationAttempts {
+				break
+			}
+			repaired, recoverEvents, err := s.runRecoverPhase(ctx, run, executionPlan, request, verification, attempt+1)
+			allEvents = append(allEvents, recoverEvents...)
+			if err != nil {
+				run.Status = domain.RunStatusFailed
+				_ = s.saveRun(ctx, run)
+				return domain.TurnResult{}, err
+			}
+			finalExecution = repaired
 		}
-		if verification.Status == "pass" {
-			break
-		}
-		if attempt >= s.config.MaxVerificationAttempts {
-			break
-		}
-		repaired, recoverEvents, err := s.runRecoverPhase(ctx, run, request, verification, attempt+1)
-		allEvents = append(allEvents, recoverEvents...)
-		if err != nil {
-			run.Status = domain.RunStatusFailed
-			_ = s.saveRun(ctx, run)
-			return domain.TurnResult{}, err
-		}
-		finalExecution = repaired
 	}
 
-	final, finalizeEvents, err := s.runFinalizePhase(ctx, run, manager, request, finalExecution)
+	final, finalizeEvents, err := s.runFinalizePhase(ctx, run, executionPlan, request, finalExecution)
 	allEvents = append(allEvents, finalizeEvents...)
 	if err != nil {
 		run.Status = domain.RunStatusFailed
@@ -193,19 +237,19 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	}
 
 	run.Status = domain.RunStatusCompleted
-	run.CurrentPhase = domain.RunPhaseFinalize
+	run.CurrentPhase = lastExecutionPlanPhase(executionPlan)
 	artifact := domain.RunArtifact{
 		ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
 		Name:      "Final response",
 		Kind:      "final_response",
-		Phase:     domain.RunPhaseFinalize,
+		Phase:     run.CurrentPhase,
 		AgentID:   final.Message.AgentID,
 		Summary:   truncateSummary(final.Message.Content),
 		Content:   final.Message.Content,
 		CreatedAt: time.Now(),
 	}
 	run.Artifacts = append(run.Artifacts, artifact)
-	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseFinalize, final.Message.Content))
+	run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
 	_ = s.rememberRun(ctx, run)
 	_ = s.saveRun(ctx, run)
 	return domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}, nil
@@ -274,7 +318,7 @@ func (s *Service) runAgent(ctx context.Context, invocation domain.AgentInvocatio
 			llmCtx, cancel := context.WithTimeout(ctx, s.timeoutFor(invocation.Agent))
 			response, err := s.model.Generate(llmCtx, domain.ModelRequest{
 				Agent:        invocation.Agent,
-				Instructions: invocation.Agent.Instruction,
+				Instructions: buildInvocationInstructions(invocation.Agent.Instruction, invocation.Context),
 				Messages:     messages,
 				Phase:        invocation.Phase,
 				Model:        s.modelName(invocation),
@@ -977,13 +1021,6 @@ func defaultPurpose(call domain.ToolCall) string {
 		return task
 	}
 	return call.Name
-}
-
-func countContextItems(messages []domain.Message, context domain.ContextPack) int {
-	messageCount := len(messages)
-	fileCount := len(uniqueStrings(append([]string(nil), context.RelevantFiles...)))
-	artifactCount := len(uniqueStrings(append([]string(nil), context.ArtifactRefs...)))
-	return messageCount + fileCount + artifactCount
 }
 
 func extractRelevantFiles(messages []domain.Message) []string {

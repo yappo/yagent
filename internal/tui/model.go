@@ -1497,6 +1497,34 @@ func (m model) listPlan() []string {
 	if run == nil {
 		return []string{"(no run loaded)"}
 	}
+	if run.ExecutionPlan != nil {
+		items := []string{
+			fmt.Sprintf("mode=%s task=%s source=%s", fallbackString(run.ExecutionPlan.Mode, "-"), fallbackString(string(run.ExecutionPlan.TaskKind), "-"), fallbackString(run.ExecutionPlan.Source, "-")),
+			"primary: " + describeAssignment(run.ExecutionPlan.Primary),
+		}
+		if run.ExecutionPlan.Plan != nil {
+			items = append(items, "plan: "+describeAssignment(*run.ExecutionPlan.Plan))
+		}
+		if len(run.ExecutionPlan.Preparation) > 0 {
+			items = append(items, "preparation: "+describeAssignments(run.ExecutionPlan.Preparation))
+		}
+		if len(run.ExecutionPlan.Verify) > 0 {
+			items = append(items, "verify: "+describeAssignments(run.ExecutionPlan.Verify))
+		}
+		if run.ExecutionPlan.Recovery != nil {
+			items = append(items, "recovery: "+describeAssignment(*run.ExecutionPlan.Recovery))
+		}
+		if run.ExecutionPlan.Finalize != nil {
+			items = append(items, "finalize: "+describeAssignment(*run.ExecutionPlan.Finalize))
+		}
+		if reason := strings.TrimSpace(run.ExecutionPlan.FallbackReason); reason != "" {
+			items = append(items, "fallback: "+reason)
+		}
+		for _, node := range run.Plan {
+			items = append(items, fmt.Sprintf("step: %s [%s]", node.Title, node.Status))
+		}
+		return items
+	}
 	if len(run.Plan) == 0 {
 		return []string{"(no plan available)"}
 	}
@@ -1869,6 +1897,55 @@ func (m model) renderPlanPanel() string {
 		lines = append(lines, "", "(no run loaded)")
 		return strings.Join(lines, "\n")
 	}
+	if m.lastRun.ExecutionPlan != nil {
+		plan := m.lastRun.ExecutionPlan
+		width := maxInt(24, m.statusViewport.Width()-6)
+		lines = append(lines, "", "Execution plan")
+		lines = append(lines, wrapContent(fmt.Sprintf("mode=%s  task=%s  source=%s", fallbackString(plan.Mode, "-"), fallbackString(string(plan.TaskKind), "-"), fallbackString(plan.Source, "-")), width))
+		if summary := strings.TrimSpace(plan.Summary); summary != "" {
+			lines = append(lines, wrapContent(summary, width))
+		}
+		if reason := strings.TrimSpace(plan.FallbackReason); reason != "" {
+			lines = append(lines, wrapContent("fallback: "+reason, width))
+		}
+		if plan.Plan != nil {
+			lines = append(lines, "", "Plan owner")
+			lines = append(lines, wrapContent("- "+describeAssignment(*plan.Plan), width))
+		}
+		if len(plan.Preparation) > 0 {
+			lines = append(lines, "", "Preparation")
+			for _, item := range plan.Preparation {
+				lines = append(lines, wrapContent("- "+describeAssignment(item), width))
+			}
+		}
+		lines = append(lines, "", "Primary")
+		lines = append(lines, wrapContent("- "+describeAssignment(plan.Primary), width))
+		if len(plan.Verify) > 0 {
+			lines = append(lines, "", "Verification")
+			for _, item := range plan.Verify {
+				lines = append(lines, wrapContent("- "+describeAssignment(item), width))
+			}
+		}
+		if plan.Recovery != nil {
+			lines = append(lines, "", "Recovery")
+			lines = append(lines, wrapContent("- "+describeAssignment(*plan.Recovery), width))
+		}
+		if plan.Finalize != nil {
+			lines = append(lines, "", "Finalize")
+			lines = append(lines, wrapContent("- "+describeAssignment(*plan.Finalize), width))
+		}
+		if len(m.lastRun.Plan) > 0 {
+			lines = append(lines, "", "Steps")
+			for idx, node := range m.lastRun.Plan {
+				line := fmt.Sprintf("%d. [%s] %s", idx+1, fallbackString(node.Status, "pending"), node.Title)
+				lines = append(lines, wrapContent(trimPathFromEnd(line, width), width))
+				if description := strings.TrimSpace(node.Description); description != "" {
+					lines = append(lines, wrapContent("   agent: "+trimPathFromEnd(description, width), width))
+				}
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
 	if len(m.lastRun.Plan) == 0 {
 		lines = append(lines, "", "(no plan available)")
 		return strings.Join(lines, "\n")
@@ -1956,6 +2033,22 @@ func (m model) renderMemoryPanel() string {
 		lines = append(lines, "", "(memory is empty)")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func describeAssignment(item domain.PlannedAgentAssignment) string {
+	text := fallbackString(item.AgentID, "-")
+	if reason := strings.TrimSpace(item.Reason); reason != "" {
+		text += " - " + reason
+	}
+	return text
+}
+
+func describeAssignments(items []domain.PlannedAgentAssignment) string {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, describeAssignment(item))
+	}
+	return strings.Join(parts, " | ")
 }
 
 func (m model) renderStatusTree(runID, prefix string, last bool) []string {

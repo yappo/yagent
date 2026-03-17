@@ -46,32 +46,69 @@ func (s *Service) saveRun(ctx context.Context, run *domain.RunState) error {
 	return s.config.RunStore.SaveRun(ctx, run)
 }
 
-func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, request domain.TurnRequest) (domain.AgentResult, []domain.ExecutionEvent, error) {
+func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, request domain.TurnRequest, inventory []domain.AgentInventoryEntry) (*domain.ExecutionPlan, []domain.ExecutionEvent, error) {
 	run.CurrentPhase = domain.RunPhasePlan
 	run.Attempt = 1
 	_ = s.saveRun(ctx, run)
-	if !s.config.ForcePlanner {
-		result := domain.AgentResult{
-			Status:  "completed",
-			Message: domain.Message{Role: domain.RoleAssistant, AgentID: "planner", Content: "Planner skipped by configuration."},
-			Summary: "Planner skipped by configuration.",
-		}
-		return result, nil, nil
-	}
+
 	planner, ok := s.catalog.Resolve("planner")
 	if !ok {
-		return domain.AgentResult{}, nil, fmt.Errorf("planner agent が見つかりません")
+		plan := buildFallbackExecutionPlan(inventory, "planner agent was not available")
+		run.ExecutionPlan = plan
+		run.Plan = planNodesFromExecutionPlan(plan)
+		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, fallbackString(plan.Primary.AgentID, "manager"), "Execution plan", "execution_plan", stablePlanJSON(plan)))
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
+		_ = s.saveRun(ctx, run)
+		return plan, nil, nil
 	}
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, planner, request, domain.RunPhasePlan, 1, run.Messages, "Create a detailed execution plan before implementation."), 0)
+
+	invocation := s.phaseInvocation(run, planner, request, domain.RunPhasePlan, 1, plannerMessages(run.Messages, inventory), "Create the execution plan for this request.")
+	invocation.Context.AgentInventory = inventory
+	invocation.Context.ExpectedOutput = plannerOutputContract()
+	invocation.Context.TaskBrief = "Create the execution plan for this request and return strict JSON only."
+	result, err := s.runAgent(ctx, invocation, 0)
+	events := append([]domain.ExecutionEvent(nil), result.Events...)
 	if err != nil {
-		return domain.AgentResult{}, nil, err
+		plan := buildFallbackExecutionPlan(inventory, "planner call failed: "+err.Error())
+		run.ExecutionPlan = plan
+		run.Plan = planNodesFromExecutionPlan(plan)
+		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, planner.ID, "Execution plan", "execution_plan", stablePlanJSON(plan)))
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
+		_ = s.saveRun(ctx, run)
+		return plan, events, nil
 	}
-	run.Plan = extractPlan(result.Message.Content)
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, planner.ID, "Execution plan", "plan", result.Message.Content))
-	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, result.Message.Content))
+
+	plan, parseErr := parseExecutionPlan(result.Message.Content)
+	if parseErr == nil {
+		parseErr = validateAndNormalizeExecutionPlan(plan, inventory)
+	}
+	if parseErr != nil {
+		repairMessages := plannerMessages(run.Messages, inventory)
+		repairMessages = phaseMessages(repairMessages, repairPromptForPlan(result.Message.Content, parseErr))
+		repairInvocation := s.phaseInvocation(run, planner, request, domain.RunPhasePlan, 1, repairMessages, "Repair the invalid execution plan JSON and return strict JSON only.")
+		repairInvocation.Context.AgentInventory = inventory
+		repairInvocation.Context.ExpectedOutput = plannerOutputContract()
+		repaired, repairErr := s.runAgent(ctx, repairInvocation, 0)
+		events = append(events, repaired.Events...)
+		if repairErr == nil {
+			plan, parseErr = parseExecutionPlan(repaired.Message.Content)
+			if parseErr == nil {
+				parseErr = validateAndNormalizeExecutionPlan(plan, inventory)
+			}
+		}
+	}
+	if parseErr != nil {
+		plan = buildFallbackExecutionPlan(inventory, defaultFallbackPlanReason(parseErr))
+	}
+
+	run.ExecutionPlan = plan
+	run.Plan = planNodesFromExecutionPlan(plan)
+	markPlanNodeStatus(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "done")
+	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "Execution plan", "execution_plan", stablePlanJSON(plan)))
+	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 	s.maybeCompactRun(run)
 	_ = s.saveRun(ctx, run)
-	return result, result.Events, nil
+	return plan, events, nil
 }
 
 func (s *Service) runDirectPhase(ctx context.Context, run *domain.RunState, manager domain.AgentSpec, request domain.TurnRequest) (domain.AgentResult, []domain.ExecutionEvent, error) {
@@ -83,6 +120,7 @@ func (s *Service) runDirectPhase(ctx context.Context, run *domain.RunState, mana
 	if err != nil {
 		return domain.AgentResult{}, nil, err
 	}
+	markPlanNodeStatus(run, domain.RunPhaseExecute, result.Message.AgentID, "done")
 	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
 	s.maybeCompactRun(run)
@@ -90,29 +128,49 @@ func (s *Service) runDirectPhase(ctx context.Context, run *domain.RunState, mana
 	return result, result.Events, nil
 }
 
-func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, manager domain.AgentSpec, request domain.TurnRequest, plan domain.AgentResult) (domain.AgentResult, []domain.ExecutionEvent, error) {
+func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest) (domain.AgentResult, []domain.ExecutionEvent, error) {
 	run.CurrentPhase = domain.RunPhaseExecute
 	run.Attempt = 1
 	_ = s.saveRun(ctx, run)
 
 	messages := cloneMessages(run.Messages)
-	if strings.TrimSpace(plan.Message.Content) != "" && plan.Message.Content != "Planner skipped by configuration." {
-		messages = phaseMessages(messages, "Planning summary:\n"+plan.Message.Content)
+	if plan == nil {
+		return domain.AgentResult{}, nil, fmt.Errorf("execution plan がありません")
 	}
-	if s.config.ForceResearcher {
-		if researcher, ok := s.catalog.Resolve("researcher"); ok {
-			research, err := s.runAgent(ctx, s.phaseInvocation(run, researcher, request, domain.RunPhaseExecute, 1, messages, "Inspect the repository and return only findings needed for implementation."), 0)
-			if err == nil {
-				messages = phaseMessages(messages, "Research summary:\n"+research.Message.Content)
-				run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, researcher.ID, "Research summary", "research", research.Message.Content))
-			}
+	messages = phaseMessages(messages, "Execution plan:\n"+stablePlanJSON(plan))
+
+	for _, item := range plan.Preparation {
+		agent, ok := s.catalog.Resolve(item.AgentID)
+		if !ok {
+			continue
+		}
+		prepTask := fallbackString(strings.TrimSpace(item.Reason), fmt.Sprintf("Prepare focused context for the primary agent %s. Return only findings that materially help the task.", fallbackString(plan.Primary.AgentID, "manager")))
+		invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseExecute, 1, messages, prepTask)
+		invocation.Context.ExpectedOutput = map[string]any{
+			"goal": "Return only the findings that materially help the primary agent.",
+		}
+		research, err := s.runAgent(ctx, invocation, 0)
+		if err == nil {
+			messages = phaseMessages(messages, agent.Name+" summary:\n"+research.Message.Content)
+			run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, agent.ID, agent.Name+" summary", "research", research.Message.Content))
+			markPlanNodeStatus(run, domain.RunPhaseExecute, agent.ID, "done")
 		}
 	}
 
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, manager, request, domain.RunPhaseExecute, 1, messages, "Coordinate implementation. Use subagents and tools when needed, then produce the implementation result."), 0)
+	primaryID := fallbackString(plan.Primary.AgentID, "manager")
+	primary, ok := s.catalog.Resolve(primaryID)
+	if !ok {
+		return domain.AgentResult{}, nil, fmt.Errorf("primary agent %q が見つかりません", primaryID)
+	}
+	taskBrief := fallbackString(strings.TrimSpace(plan.Primary.Reason), "Handle the request directly using the prepared context and available tools.")
+	if primary.ID == "manager" {
+		taskBrief = fallbackString(strings.TrimSpace(plan.Primary.Reason), "Coordinate execution using the prepared context and produce the implementation result.")
+	}
+	result, err := s.runAgent(ctx, s.phaseInvocation(run, primary, request, domain.RunPhaseExecute, 1, messages, taskBrief), 0)
 	if err != nil {
 		return domain.AgentResult{}, nil, err
 	}
+	markPlanNodeStatus(run, domain.RunPhaseExecute, primary.ID, "done")
 	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
@@ -121,21 +179,24 @@ func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, man
 	return result, result.Events, nil
 }
 
-func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, request domain.TurnRequest, execution domain.AgentResult, attempt int) (domain.VerificationResult, []domain.ExecutionEvent, error) {
+func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, execution domain.AgentResult, attempt int) (domain.VerificationResult, []domain.ExecutionEvent, error) {
 	run.CurrentPhase = domain.RunPhaseVerify
 	run.Attempt = attempt
 	_ = s.saveRun(ctx, run)
 
-	input := phaseMessages(run.Messages, "Execution summary:\n"+execution.Message.Content)
+	input := phaseMessages(run.Messages, "Execution summary:\n"+execution.Message.Content, "Execution plan:\n"+stablePlanJSON(plan))
 	results := []domain.VerificationResult{}
 	allEvents := []domain.ExecutionEvent{}
-	for _, agentID := range []string{"tester", "reviewer"} {
-		agent, ok := s.catalog.Resolve(agentID)
+	for _, item := range plan.Verify {
+		agent, ok := s.catalog.Resolve(item.AgentID)
 		if !ok {
 			continue
 		}
 		agent = withVerificationInstruction(agent)
-		result, err := s.runAgent(ctx, s.phaseInvocation(run, agent, request, domain.RunPhaseVerify, attempt, input, "Verify the latest implementation. Return VERIFICATION_STATUS, SUMMARY, and REPAIR_BRIEF."), 0)
+		taskBrief := fallbackString(strings.TrimSpace(item.Reason), "Verify the latest implementation. Return VERIFICATION_STATUS, SUMMARY, and REPAIR_BRIEF.")
+		invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseVerify, attempt, input, taskBrief)
+		invocation.Context.ExpectedOutput = verificationOutputContract()
+		result, err := s.runAgent(ctx, invocation, 0)
 		if err != nil {
 			return domain.VerificationResult{}, allEvents, err
 		}
@@ -144,6 +205,7 @@ func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, requ
 		allEvents = append(allEvents, result.Events...)
 		run.Verification = append(run.Verification, parsed)
 		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseVerify, agent.ID, agent.Name+" verification", "verification", result.Message.Content))
+		markPlanNodeStatus(run, domain.RunPhaseVerify, agent.ID, "done")
 	}
 	merged := mergeVerification(results, attempt)
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseVerify, merged.Summary))
@@ -152,20 +214,27 @@ func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, requ
 	return merged, allEvents, nil
 }
 
-func (s *Service) runRecoverPhase(ctx context.Context, run *domain.RunState, request domain.TurnRequest, verification domain.VerificationResult, attempt int) (domain.AgentResult, []domain.ExecutionEvent, error) {
+func (s *Service) runRecoverPhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, verification domain.VerificationResult, attempt int) (domain.AgentResult, []domain.ExecutionEvent, error) {
 	run.CurrentPhase = domain.RunPhaseRecover
 	run.Attempt = attempt
 	_ = s.saveRun(ctx, run)
 
-	coder, ok := s.catalog.Resolve("coder")
+	if plan == nil || plan.Recovery == nil {
+		return domain.AgentResult{}, nil, fmt.Errorf("recovery plan がありません")
+	}
+	coder, ok := s.catalog.Resolve(fallbackString(plan.Recovery.AgentID, "coder"))
 	if !ok {
-		return domain.AgentResult{}, nil, fmt.Errorf("coder agent が見つかりません")
+		return domain.AgentResult{}, nil, fmt.Errorf("recovery agent %q が見つかりません", plan.Recovery.AgentID)
 	}
 	repairPrompt := strings.TrimSpace("Repair the implementation using this brief:\n" + verification.RepairBrief)
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, coder, request, domain.RunPhaseRecover, attempt, phaseMessages(run.Messages, repairPrompt), repairPrompt), 0)
+	taskBrief := fallbackString(strings.TrimSpace(plan.Recovery.Reason), repairPrompt)
+	invocation := s.phaseInvocation(run, coder, request, domain.RunPhaseRecover, attempt, phaseMessages(run.Messages, repairPrompt, "Execution plan:\n"+stablePlanJSON(plan)), taskBrief)
+	invocation.Context.ExpectedOutput = repairOutputContract()
+	result, err := s.runAgent(ctx, invocation, 0)
 	if err != nil {
 		return domain.AgentResult{}, nil, err
 	}
+	markPlanNodeStatus(run, domain.RunPhaseRecover, coder.ID, "done")
 	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseRecover, coder.ID, "Recovery result", "recovery", result.Message.Content))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseRecover, result.Message.Content))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: coder.ID, Content: result.Message.Content})
@@ -174,20 +243,27 @@ func (s *Service) runRecoverPhase(ctx context.Context, run *domain.RunState, req
 	return result, result.Events, nil
 }
 
-func (s *Service) runFinalizePhase(ctx context.Context, run *domain.RunState, manager domain.AgentSpec, request domain.TurnRequest, execution domain.AgentResult) (domain.AgentResult, []domain.ExecutionEvent, error) {
-	if len(run.Verification) == 0 {
+func (s *Service) runFinalizePhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, execution domain.AgentResult) (domain.AgentResult, []domain.ExecutionEvent, error) {
+	if plan == nil || plan.Finalize == nil || plan.Finalize.AgentID == "" {
 		return execution, execution.Events, nil
+	}
+	manager, ok := s.catalog.Resolve(plan.Finalize.AgentID)
+	if !ok {
+		return domain.AgentResult{}, nil, fmt.Errorf("finalize agent %q が見つかりません", plan.Finalize.AgentID)
 	}
 	run.CurrentPhase = domain.RunPhaseFinalize
 	_ = s.saveRun(ctx, run)
 	input := phaseMessages(run.Messages,
 		"Execution summary:\n"+execution.Message.Content,
 		"Verification summary:\n"+latestVerificationSummary(run),
+		"Execution plan:\n"+stablePlanJSON(plan),
 	)
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, manager, request, domain.RunPhaseFinalize, run.Attempt, input, "Summarize the completed work, verification status, and remaining risks."), 0)
+	taskBrief := fallbackString(strings.TrimSpace(plan.Finalize.Reason), "Summarize the completed work, verification status, and remaining risks.")
+	result, err := s.runAgent(ctx, s.phaseInvocation(run, manager, request, domain.RunPhaseFinalize, run.Attempt, input, taskBrief), 0)
 	if err != nil {
 		return domain.AgentResult{}, nil, err
 	}
+	markPlanNodeStatus(run, domain.RunPhaseFinalize, manager.ID, "done")
 	s.maybeCompactRun(run)
 	return result, result.Events, nil
 }
@@ -217,13 +293,17 @@ func (s *Service) phaseInvocation(run *domain.RunState, agent domain.AgentSpec, 
 func (s *Service) buildContext(run *domain.RunState, agent domain.AgentSpec, phase domain.RunPhase, messages []domain.Message) domain.RunContext {
 	allTools := append(s.tools.Definitions(agent), s.agentToolDefinitions(agent)...)
 	if s.config.ContextEngine == nil {
+		userGoal := latestUserMessage(messages)
+		if run != nil && strings.TrimSpace(run.UserGoal) != "" {
+			userGoal = run.UserGoal
+		}
 		return domain.RunContext{
-			UserGoal:           latestUserMessage(messages),
+			UserGoal:           userGoal,
 			CurrentPhase:       phase,
-			TaskBrief:          latestUserMessage(messages),
+			TaskBrief:          userGoal,
 			RecentMessages:     cloneMessages(messages),
 			RelevantFiles:      extractRelevantFiles(messages),
-			RecentSummary:      latestUserMessage(messages),
+			RecentSummary:      userGoal,
 			AvailableToolNames: toolNames(allTools),
 		}
 	}

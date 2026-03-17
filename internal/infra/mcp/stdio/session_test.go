@@ -34,7 +34,7 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 	logger := &captureLogger{}
 	task := domain.TaskDefinition{
 		ID:   "docs",
-		Kind: domain.TaskKindMCPServer,
+		Kind: domain.TaskSpecKindMCPServer,
 		MCPServer: &domain.MCPServerSpec{
 			Transport: domain.MCPTransportStdio,
 			Command:   os.Args[0],
@@ -89,7 +89,7 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 func TestSessionInitializeFailsOnInvalidPayload(t *testing.T) {
 	task := domain.TaskDefinition{
 		ID:   "broken",
-		Kind: domain.TaskKindMCPServer,
+		Kind: domain.TaskSpecKindMCPServer,
 		MCPServer: &domain.MCPServerSpec{
 			Transport: domain.MCPTransportStdio,
 			Command:   os.Args[0],

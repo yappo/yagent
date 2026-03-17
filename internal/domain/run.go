@@ -84,6 +84,7 @@ type RunState struct {
 	UserGoal            string               `json:"user_goal,omitempty"`
 	ConversationSummary string               `json:"conversation_summary,omitempty"`
 	Messages            []Message            `json:"messages,omitempty"`
+	ExecutionPlan       *ExecutionPlan       `json:"execution_plan,omitempty"`
 	Plan                []PlanNode           `json:"plan,omitempty"`
 	Artifacts           []RunArtifact        `json:"artifacts,omitempty"`
 	Checkpoints         []RunCheckpoint      `json:"checkpoints,omitempty"`

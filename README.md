@@ -24,6 +24,7 @@ MCP Server についても、そのまま無造作に露出させるのではな
 - `yagent exec --resume latest --profile strong` のような resume / routing 指定
 - `yagent benchmark --feature-profile legacy --feature-profile current --prompt ...` で feature flag 差分を比較
 - Orchestrator-first のサブエージェント実行
+- planner-driven execution plan で必要な agent だけを選択
 - `intake -> plan -> execute -> verify -> recover -> finalize` の run harness
 - adaptive context compaction と lightweight repo memory
 - role / phase ベースの model routing
@@ -196,6 +197,8 @@ model の優先順は次です。
 yagent には最初からいくつかの built-in agent が入っていますが、リポジトリ固有の役割は TOML で追加できます。  
 この TOML を README では `Agent DSL` と呼んでいます。
 
+planner-driven execution plan では、この Agent DSL で定義した metadata も agent inventory に入ります。`task_kinds` `capabilities` `preferred_phases` `scope_hints` を明示しておくと、planner が built-in agent と同じ基準で user-defined agent を選びやすくなります。
+
 Agent DSL を使うと、たとえば次のような専用 agent を追加できます。
 
 - ドキュメント更新専用 agent
@@ -224,12 +227,18 @@ id = "docs-writer"
 name = "Docs Writer"
 description = "README や設計メモの更新を担当"
 instruction = "Write concise docs with concrete examples."
-mode = "tool"
-allowed_tools = ["fs_read"]
-read_only = true
+mode = "handoff"
+allowed_tools = ["fs_read", "fs_write", "patch_apply"]
+read_only = false
 max_turns = 4
 timeout = "30s"
 tags = ["docs"]
+task_kinds = ["docs", "mutate"]
+capabilities = ["documentation"]
+preferred_phases = ["execute", "recover"]
+scope_hints = ["README", "design docs"]
+verification_required = true
+verification_max_attempts = 2
 ```
 
 主な項目の意味:
@@ -246,6 +255,11 @@ tags = ["docs"]
 - `timeout`: その agent の LLM 呼び出し timeout
 - `routing_profile`: その agent をどの routing profile で実行するか
 - `tags`: 人間向けの整理用ラベル
+- `task_kinds`: その agent が向いている要求種別。`question` `research` `docs` `review` `test` `mutate` を指定
+- `capabilities`: planner に見せる能力ラベル
+- `preferred_phases`: その agent が入りやすい phase。`plan` `execute` `verify` `recover` `finalize`
+- `scope_hints`: planner に伝える担当範囲のヒント
+- `verification_required` / `verification_max_attempts`: その agent を primary にしたときの verify policy
 
 `agents.<id>` では built-in agent の instruction / model / allowed tools / disabled を上書きできます。  
 built-in agent の基本セットは最初から使えますが、追加の DSL で repo 専用 agent を拡張する前提です。
@@ -476,12 +490,15 @@ internal/
 ### 実行モデル
 
 - `manager` がユーザー入力を受ける
-- リポジトリ全体の調査や品質レポートのような広域タスクでは、`manager` は `planner` / `researcher` への委譲を優先する
+- `planner` が agent inventory を見て execution plan を作り、必要な agent を選ぶ
+- user-defined agent も built-in agent と同じ inventory として plan に組み込まれる
+- planner が無効な plan を返した場合は orchestrator が検証し、必要なら保守的な fallback に切り替える
+- それ以外は `planner` が agent inventory を見て structured な execution plan を返す
 - `delegate_to_<agent>` で bounded task を subagent に委譲
 - `handoff_to_<agent>` で専門 agent に現在ターンを handoff
 - `run_ephemeral_agent` で一時的な subagent を即席生成
 - リポジトリ探索には `fs_list` を優先し、単純な一覧取得のためにスクリプト生成へ逃がさない
-- `planner -> coder -> planner` のような再委譲ループは orchestrator で抑止
+- planner の返した plan は orchestrator が validate し、無効なら 1 回だけ repair を要求して、それでもだめなら deterministic fallback に落とす
 - 並列化は非破壊系 task のみ。書き込み系は常に直列化
 
 ### ツール

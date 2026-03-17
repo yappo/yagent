@@ -72,7 +72,7 @@ func TestRunToolAddsNetworkSideEffect(t *testing.T) {
 		"go:test": {
 			ID:          "go:test",
 			Description: "Go version",
-			Kind:        domain.TaskKindCommand,
+			Kind:        domain.TaskSpecKindCommand,
 			Command: &domain.CommandTaskSpec{
 				Command:      "go",
 				Args:         []string{"version"},
@@ -101,7 +101,7 @@ func TestBindToolRejectsCommandTask(t *testing.T) {
 		"go:test": {
 			ID:          "go:test",
 			Description: "Go test",
-			Kind:        domain.TaskKindCommand,
+			Kind:        domain.TaskSpecKindCommand,
 			Command:     &domain.CommandTaskSpec{Command: "go"},
 		},
 	}}, &fakeBindings{}, nil, nil)
@@ -120,7 +120,7 @@ func TestListToolIncludesMCPBindingState(t *testing.T) {
 		"docs": {
 			ID:          "docs",
 			Description: "Docs MCP",
-			Kind:        domain.TaskKindMCPServer,
+			Kind:        domain.TaskSpecKindMCPServer,
 			MCPServer: &domain.MCPServerSpec{
 				Command: "npx",
 			},

@@ -30,7 +30,7 @@ func NewMCPBindings(factory domain.MCPSessionFactory) *MCPBindings {
 }
 
 func (b *MCPBindings) Bind(ctx context.Context, task domain.TaskDefinition) ([]domain.MCPToolDescriptor, error) {
-	if task.Kind != domain.TaskKindMCPServer || task.MCPServer == nil {
+	if task.Kind != domain.TaskSpecKindMCPServer || task.MCPServer == nil {
 		return nil, fmt.Errorf("MCP server task ではありません: %s", task.ID)
 	}
 

@@ -126,7 +126,7 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		}
 		_, info.Bound = bound[item.ID]
 		switch item.Kind {
-		case domain.TaskKindCommand:
+		case domain.TaskSpecKindCommand:
 			if item.Command != nil {
 				info.Command = item.Command.Command
 				info.Args = append([]string(nil), item.Command.Args...)
@@ -134,7 +134,7 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 				info.Risk = item.Command.Risk
 				info.AllowNetwork = item.Command.AllowNetwork
 			}
-		case domain.TaskKindMCPServer:
+		case domain.TaskSpecKindMCPServer:
 			info.BindRequired = true
 			if item.MCPServer != nil {
 				info.Command = item.MCPServer.Command
@@ -158,7 +158,7 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	if !ok {
 		return failure(call, fmt.Sprintf("登録されていない task_id です: %s", taskID))
 	}
-	if taskDef.Kind != domain.TaskKindCommand || taskDef.Command == nil {
+	if taskDef.Kind != domain.TaskSpecKindCommand || taskDef.Command == nil {
 		return failure(call, fmt.Sprintf("task_run では command task だけ実行できます: %s", taskID))
 	}
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
@@ -204,7 +204,7 @@ func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 	if !ok {
 		return failure(call, fmt.Sprintf("登録されていない task_id です: %s", taskID))
 	}
-	if taskDef.Kind != domain.TaskKindMCPServer {
+	if taskDef.Kind != domain.TaskSpecKindMCPServer {
 		return failure(call, fmt.Sprintf("task_bind では MCP server task だけ bind できます: %s", taskID))
 	}
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
@@ -252,13 +252,13 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 		description  = taskDef.Description
 	)
 	switch taskDef.Kind {
-	case domain.TaskKindCommand:
+	case domain.TaskSpecKindCommand:
 		if taskDef.Command != nil {
 			allowNetwork = taskDef.Command.AllowNetwork
 			command = taskDef.Command.Command
 			args = append(args, taskDef.Command.Args...)
 		}
-	case domain.TaskKindMCPServer:
+	case domain.TaskSpecKindMCPServer:
 		if taskDef.MCPServer != nil {
 			allowNetwork = taskDef.MCPServer.AllowNetwork
 			command = taskDef.MCPServer.Command

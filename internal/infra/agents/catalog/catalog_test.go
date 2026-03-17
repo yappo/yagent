@@ -49,4 +49,57 @@ read_only = true
 	if spec.Name != "Docs Writer" {
 		t.Fatalf("unexpected name: %s", spec.Name)
 	}
+	if len(spec.TaskKinds) == 0 {
+		t.Fatalf("expected task kinds to be normalized")
+	}
+	if len(spec.PreferredPhases) == 0 {
+		t.Fatalf("expected preferred phases to be normalized")
+	}
+}
+
+func TestLoadUserAgentsSupportsPlannerMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docs-writer.toml")
+	content := `
+id = "docs-writer"
+name = "Docs Writer"
+instruction = "Write docs"
+mode = "handoff"
+allowed_tools = ["fs_read", "fs_write", "patch_apply"]
+read_only = false
+task_kinds = ["docs", "mutate"]
+capabilities = ["documentation"]
+preferred_phases = ["execute", "recover"]
+scope_hints = ["README", "design docs"]
+verification_required = true
+verification_max_attempts = 3
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	catalog := New(nil)
+	if err := catalog.LoadUserAgents([]string{dir}); err != nil {
+		t.Fatalf("LoadUserAgents returned error: %v", err)
+	}
+
+	spec, ok := catalog.Resolve("docs-writer")
+	if !ok {
+		t.Fatalf("docs-writer not loaded")
+	}
+	if len(spec.TaskKinds) != 2 || spec.TaskKinds[0] != "docs" {
+		t.Fatalf("unexpected task kinds: %+v", spec.TaskKinds)
+	}
+	if len(spec.Capabilities) == 0 || spec.Capabilities[0] != "documentation" {
+		t.Fatalf("unexpected capabilities: %+v", spec.Capabilities)
+	}
+	if len(spec.PreferredPhases) != 2 || spec.PreferredPhases[0] != "execute" {
+		t.Fatalf("unexpected preferred phases: %+v", spec.PreferredPhases)
+	}
+	if len(spec.ScopeHints) != 2 {
+		t.Fatalf("unexpected scope hints: %+v", spec.ScopeHints)
+	}
+	if !spec.VerificationPolicy.Required || spec.VerificationPolicy.MaxAttempts != 3 {
+		t.Fatalf("unexpected verification policy: %+v", spec.VerificationPolicy)
+	}
 }

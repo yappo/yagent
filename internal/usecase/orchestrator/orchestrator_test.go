@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,9 @@ func (f *fakeModelClient) Generate(_ context.Context, request domain.ModelReques
 	}
 	agentID := request.Agent.ID
 	idx := f.indexes[agentID]
+	if idx >= len(f.responses[agentID]) {
+		panic(fmt.Sprintf("missing fake response for agent %q at index %d", agentID, idx))
+	}
 	response := f.responses[agentID][idx]
 	f.indexes[agentID] = idx + 1
 	return response, nil
@@ -243,8 +247,8 @@ func TestRunTurnCanDisablePhaseHarness(t *testing.T) {
 	if result.Message.Content != "done directly" {
 		t.Fatalf("unexpected result: %q", result.Message.Content)
 	}
-	if result.Run == nil || len(result.Run.Plan) != 0 || len(result.Run.Verification) != 0 {
-		t.Fatalf("expected harness phases to be skipped, got %+v", result.Run)
+	if result.Run == nil || result.Run.ExecutionPlan == nil || result.Run.ExecutionPlan.Source != "disabled_harness" || len(result.Run.Verification) != 0 {
+		t.Fatalf("expected disabled harness execution plan, got %+v", result.Run)
 	}
 }
 
@@ -448,8 +452,8 @@ func TestRunTurnCountsMessageAndFileContext(t *testing.T) {
 	if len(result.Events) == 0 {
 		t.Fatalf("expected events")
 	}
-	if result.Events[0].ContextCount != 3 {
-		t.Fatalf("expected context count 3, got %d", result.Events[0].ContextCount)
+	if result.Events[0].ContextCount != 4 {
+		t.Fatalf("expected context count 4, got %d", result.Events[0].ContextCount)
 	}
 }
 
@@ -458,24 +462,13 @@ func TestPlannerCannotDelegateToCoder(t *testing.T) {
 		&fakeModelClient{
 			responses: map[string][]domain.ModelResponse{
 				"manager": {{
-					Message: domain.Message{
-						Role: domain.RoleAssistant,
-						ToolCalls: []domain.ToolCall{{
-							ID:   "1",
-							Name: "delegate_to_planner",
-							Arguments: map[string]any{
-								"task": "Inspect cmd directory",
-							},
-						}},
-					},
-				}, {
 					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
 				}},
 				"planner": {{
 					Message: domain.Message{
 						Role: domain.RoleAssistant,
 						ToolCalls: []domain.ToolCall{{
-							ID:   "2",
+							ID:   "1",
 							Name: "delegate_to_coder",
 							Arguments: map[string]any{
 								"task": "Write a script",
@@ -483,7 +476,24 @@ func TestPlannerCannotDelegateToCoder(t *testing.T) {
 						}},
 					},
 				}, {
-					Message: domain.Message{Role: domain.RoleAssistant, Content: "planner done"},
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "direct",
+  "task_kind": "question",
+  "summary": "Answer directly after planning.",
+  "primary": {
+    "agent_id": "manager",
+    "reason": "Respond directly to the user."
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Execute primary task",
+      "phase": "execute",
+      "agent_id": "manager"
+    }
+  ]
+}`},
 				}},
 			},
 		},
@@ -647,24 +657,71 @@ func TestToolExecutionDoesNotUseDeadlineContext(t *testing.T) {
 	}
 }
 
-func TestRunTurnBiasesManagerTowardDelegationForBroadResearchTask(t *testing.T) {
-	var managerInstruction string
+func TestRunTurnPlannerReceivesAgentInventory(t *testing.T) {
+	var plannerInstruction string
 	service := New(
 		&fakeModelClient{
 			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "assisted",
+  "task_kind": "research",
+  "summary": "Use the repo analyst before answering.",
+  "plan": {
+    "agent_id": "planner",
+    "reason": "Select the execution path."
+  },
+  "preparation": [
+    {
+      "agent_id": "repo-analyst",
+      "reason": "Inspect the repository and summarize the relevant areas."
+    }
+  ],
+  "primary": {
+    "agent_id": "manager",
+    "reason": "Answer the user with the prepared findings."
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Create execution plan",
+      "phase": "plan",
+      "agent_id": "planner"
+    },
+    {
+      "id": "step-2",
+      "title": "Prepare focused context",
+      "phase": "execute",
+      "agent_id": "repo-analyst"
+    },
+    {
+      "id": "step-3",
+      "title": "Execute primary task",
+      "phase": "execute",
+      "agent_id": "manager"
+    }
+  ]
+}`},
+				}},
+				"repo-analyst": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "internal/ 以下を中心に確認しました"},
+				}},
 				"manager": {{
 					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
 				}},
 			},
 			inspect: func(request domain.ModelRequest) {
-				if request.Agent.ID == "manager" {
-					managerInstruction = request.Instructions
+				if request.Agent.ID == "planner" {
+					plannerInstruction = request.Instructions
 				}
 			},
 		},
 		&fakeToolExecutor{},
 		fakeCatalog{agents: map[string]domain.AgentSpec{
-			"manager": {ID: "manager", Mode: domain.AgentModeManager, Instruction: "base", MaxTurns: 4},
+			"manager":      {ID: "manager", Mode: domain.AgentModeManager, Instruction: "base", MaxTurns: 4},
+			"planner":      {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"repo-analyst": {ID: "repo-analyst", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4, Description: "internal/ 以下の調査に強い agent", Tags: []string{"research", "analysis"}},
 		}},
 		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
 	)
@@ -675,11 +732,183 @@ func TestRunTurnBiasesManagerTowardDelegationForBroadResearchTask(t *testing.T) 
 	if err != nil {
 		t.Fatalf("RunTurn returned error: %v", err)
 	}
-	if !strings.Contains(managerInstruction, "actively use subagents") {
-		t.Fatalf("expected manager instruction to bias delegation, got %q", managerInstruction)
+	if !strings.Contains(plannerInstruction, "Agent inventory") {
+		t.Fatalf("expected planner instruction to include inventory, got %q", plannerInstruction)
 	}
-	if !strings.Contains(managerInstruction, "planner and/or researcher") {
-		t.Fatalf("expected manager instruction to mention planner/researcher, got %q", managerInstruction)
+	if !strings.Contains(plannerInstruction, "repo-analyst") {
+		t.Fatalf("expected planner instruction to mention user-defined agent, got %q", plannerInstruction)
+	}
+}
+
+func TestRunTurnDoesNotUseLocalKeywordBypassForGreeting(t *testing.T) {
+	seenAgents := []string{}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "direct",
+  "task_kind": "casual",
+  "summary": "Reply directly to the greeting.",
+  "primary": {
+    "agent_id": "manager",
+    "reason": "Respond to the user directly."
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Execute primary task",
+      "phase": "execute",
+      "agent_id": "manager"
+    }
+  ]
+}`},
+				}},
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "こんにちは！"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				seenAgents = append(seenAgents, request.Agent.ID)
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager":  {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"planner":  {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"coder":    {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+			"tester":   {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"reviewer": {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "こんにちわ！"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "こんにちは！" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if len(seenAgents) != 2 || seenAgents[0] != "planner" || seenAgents[1] != "manager" {
+		t.Fatalf("expected planner then manager, got %+v", seenAgents)
+	}
+}
+
+func TestRunTurnUsesMatchingUserDefinedAgentBeforePrimaryExecution(t *testing.T) {
+	seenAgents := []string{}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "full",
+  "task_kind": "docs",
+  "summary": "Use the docs specialist to prepare context, then let coder update the file and reviewer verify it.",
+  "plan": {
+    "agent_id": "planner",
+    "reason": "Create the execution plan."
+  },
+  "preparation": [
+    {
+      "agent_id": "docs-writer",
+      "reason": "Prepare the README-specific context."
+    }
+  ],
+  "primary": {
+    "agent_id": "coder",
+    "reason": "Apply the requested README update."
+  },
+  "verify": [
+    {
+      "agent_id": "reviewer",
+      "reason": "Check the documentation update for regressions."
+    }
+  ],
+  "finalize": {
+    "agent_id": "manager",
+    "reason": "Summarize the completed update."
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Create execution plan",
+      "phase": "plan",
+      "agent_id": "planner"
+    },
+    {
+      "id": "step-2",
+      "title": "Prepare focused context",
+      "phase": "execute",
+      "agent_id": "docs-writer"
+    },
+    {
+      "id": "step-3",
+      "title": "Execute primary task",
+      "phase": "execute",
+      "agent_id": "coder"
+    },
+    {
+      "id": "step-4",
+      "title": "Verify latest result",
+      "phase": "verify",
+      "agent_id": "reviewer"
+    },
+    {
+      "id": "step-5",
+      "title": "Summarize the completed work",
+      "phase": "finalize",
+      "agent_id": "manager"
+    }
+  ]
+}`},
+				}},
+				"docs-writer": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "README の変更観点を整理しました"},
+				}},
+				"coder": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "README を更新しました"},
+				}},
+				"reviewer": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: docs update looks good\nREPAIR_BRIEF: none"},
+				}},
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "README を更新し、確認も完了しました"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				seenAgents = append(seenAgents, request.Agent.ID)
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager":     {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"planner":     {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"coder":       {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+			"reviewer":    {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"docs-writer": {ID: "docs-writer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4, Description: "README や設計メモの更新を担当", Tags: []string{"docs", "readme"}},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "README を更新して"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "README を更新し、確認も完了しました" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+	if len(seenAgents) < 5 {
+		t.Fatalf("expected planner, docs-writer, coder, reviewer, manager sequence, got %+v", seenAgents)
+	}
+	if seenAgents[0] != "planner" || seenAgents[1] != "docs-writer" || seenAgents[2] != "coder" || seenAgents[3] != "reviewer" || seenAgents[4] != "manager" {
+		t.Fatalf("unexpected agent sequence: %+v", seenAgents)
 	}
 }
 
@@ -769,18 +998,79 @@ func TestRunTurnRunsVerificationAndRecoveryLoop(t *testing.T) {
 	service := New(
 		&fakeModelClient{
 			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "full",
+  "task_kind": "mutate",
+  "summary": "Implement the change, then run tester and reviewer before summarizing.",
+  "plan": {
+    "agent_id": "planner",
+    "reason": "Create the execution plan."
+  },
+  "primary": {
+    "agent_id": "coder",
+    "reason": "Implement the requested change."
+  },
+  "verify": [
+    {
+      "agent_id": "tester",
+      "reason": "Run validation and catch missing regression handling."
+    },
+    {
+      "agent_id": "reviewer",
+      "reason": "Review the implementation for regressions."
+    }
+  ],
+  "recovery": {
+    "agent_id": "coder",
+    "reason": "Repair the implementation using the verification brief."
+  },
+  "finalize": {
+    "agent_id": "manager",
+    "reason": "Summarize the repaired implementation."
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Create execution plan",
+      "phase": "plan",
+      "agent_id": "planner"
+    },
+    {
+      "id": "step-2",
+      "title": "Execute primary task",
+      "phase": "execute",
+      "agent_id": "coder"
+    },
+    {
+      "id": "step-3",
+      "title": "Verify latest result",
+      "phase": "verify",
+      "agent_id": "tester"
+    },
+    {
+      "id": "step-4",
+      "title": "Verify latest result",
+      "phase": "verify",
+      "agent_id": "reviewer"
+    },
+    {
+      "id": "step-5",
+      "title": "Repair from verification brief",
+      "phase": "recover",
+      "agent_id": "coder"
+    },
+    {
+      "id": "step-6",
+      "title": "Summarize the completed work",
+      "phase": "finalize",
+      "agent_id": "manager"
+    }
+  ]
+}`},
+				}},
 				"manager": {{
-					Message: domain.Message{
-						Role: domain.RoleAssistant,
-						ToolCalls: []domain.ToolCall{{
-							ID:   "1",
-							Name: "handoff_to_coder",
-							Arguments: map[string]any{
-								"task": "Implement the change",
-							},
-						}},
-					},
-				}, {
 					Message: domain.Message{Role: domain.RoleAssistant, Content: "final summary"},
 				}},
 				"coder": {{
@@ -803,6 +1093,7 @@ func TestRunTurnRunsVerificationAndRecoveryLoop(t *testing.T) {
 		&fakeToolExecutor{},
 		fakeCatalog{agents: map[string]domain.AgentSpec{
 			"manager":  {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"planner":  {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
 			"coder":    {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
 			"tester":   {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
 			"reviewer": {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
