@@ -89,8 +89,11 @@ func (t *tool) Definition() domain.ToolDefinition {
 		required = append(required, "target")
 	}
 	return domain.ToolDefinition{
-		Name:        t.name,
-		Description: t.description,
+		Name:             t.name,
+		Description:      t.description,
+		CapabilityGroup:  "git_read",
+		Risk:             "medium",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type":       "object",
 			"properties": props,

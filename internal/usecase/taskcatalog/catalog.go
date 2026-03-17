@@ -126,7 +126,7 @@ func loadFile(path string, baseDir string) ([]domain.TaskDefinition, error) {
 		result = append(result, domain.TaskDefinition{
 			ID:          entry.ID,
 			Description: entry.Description,
-			Kind:        domain.TaskKindCommand,
+			Kind:        domain.TaskSpecKindCommand,
 			Command: &domain.CommandTaskSpec{
 				Command:      entry.Command,
 				Args:         append([]string(nil), entry.Args...),
@@ -156,7 +156,7 @@ func loadFile(path string, baseDir string) ([]domain.TaskDefinition, error) {
 		result = append(result, domain.TaskDefinition{
 			ID:          entry.ID,
 			Description: entry.Description,
-			Kind:        domain.TaskKindMCPServer,
+			Kind:        domain.TaskSpecKindMCPServer,
 			MCPServer: &domain.MCPServerSpec{
 				Transport:    transport,
 				Command:      entry.Command,
@@ -223,7 +223,7 @@ func task(id, desc, command string, args []string, cwd, risk string, allowNetwor
 	return domain.TaskDefinition{
 		ID:          id,
 		Description: desc,
-		Kind:        domain.TaskKindCommand,
+		Kind:        domain.TaskSpecKindCommand,
 		Command: &domain.CommandTaskSpec{
 			Command:      command,
 			Args:         append([]string(nil), args...),

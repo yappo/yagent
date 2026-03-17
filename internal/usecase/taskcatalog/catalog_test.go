@@ -40,7 +40,7 @@ args = ["test", "./..."]
 	if task.Description != "repo override" {
 		t.Fatalf("expected repo override, got %+v", task)
 	}
-	if task.Kind != domain.TaskKindCommand || task.Command == nil || task.Command.Command != "go" {
+	if task.Kind != domain.TaskSpecKindCommand || task.Command == nil || task.Command.Command != "go" {
 		t.Fatalf("expected command task, got %+v", task)
 	}
 }
@@ -73,7 +73,7 @@ include_tools = ["search_docs"]
 	if !ok {
 		t.Fatalf("expected docs mcp server")
 	}
-	if task.Kind != domain.TaskKindMCPServer || task.MCPServer == nil {
+	if task.Kind != domain.TaskSpecKindMCPServer || task.MCPServer == nil {
 		t.Fatalf("expected mcp server task, got %+v", task)
 	}
 	if task.MCPServer.Transport != domain.MCPTransportStdio {

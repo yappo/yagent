@@ -14,6 +14,8 @@ import (
 func newExecCommand(configPath *string, logPath *string) *cobra.Command {
 	var prompt string
 	var model string
+	var profile string
+	var resumeID string
 	var stream bool
 
 	command := &cobra.Command{
@@ -31,6 +33,8 @@ func newExecCommand(configPath *string, logPath *string) *cobra.Command {
 			result, err := container.Orchestrator.RunTurn(cmd.Context(), domain.TurnRequest{
 				Messages: []domain.Message{{Role: domain.RoleUser, Content: prompt}},
 				Model:    model,
+				Profile:  profile,
+				ResumeID: resumeID,
 				Stream:   stream,
 			})
 			if err != nil {
@@ -44,6 +48,8 @@ func newExecCommand(configPath *string, logPath *string) *cobra.Command {
 
 	command.Flags().StringVar(&prompt, "prompt", "", "AI に送信するプロンプト")
 	command.Flags().StringVar(&model, "model", "", "使用するモデル名")
+	command.Flags().StringVar(&profile, "profile", "", "routing profile 名")
+	command.Flags().StringVar(&resumeID, "resume", "", "復元する run id。latest も指定できます")
 	command.Flags().BoolVar(&stream, "stream", false, "ストリーミング応答を有効にする")
 	_ = command.MarkFlagRequired("prompt")
 

@@ -23,12 +23,12 @@ const (
 )
 
 type Message struct {
-	Role      Role
-	Content   string
-	ToolCalls []ToolCall
+	Role       Role
+	Content    string
+	ToolCalls  []ToolCall
 	ToolCallID string
-	AgentID   string
-	Metadata  map[string]string
+	AgentID    string
+	Metadata   map[string]string
 }
 
 type ToolCall struct {
@@ -47,6 +47,11 @@ type ToolDefinition struct {
 	ReadOnly         bool
 	ParallelSafe     bool
 	MutatesWorkspace bool
+	CapabilityGroup  string
+	Risk             string
+	CostHint         string
+	RequiresApproval bool
+	DiscoveryOnly    bool
 }
 
 type ToolResult struct {
@@ -57,42 +62,63 @@ type ToolResult struct {
 }
 
 type AgentSpec struct {
-	ID            string
-	Name          string
-	Description   string
-	Instruction   string
-	Mode          AgentMode
-	AllowedTools  []string
-	ReadOnly      bool
-	InputSchema   map[string]any
-	OutputSchema  map[string]any
-	Model         string
-	Timeout       time.Duration
-	MaxTurns      int
-	TokenBudget   int
-	Tags          []string
-	BuiltIn       bool
-	Disabled      bool
-	AllowOverride bool
+	ID                 string
+	Name               string
+	Description        string
+	Instruction        string
+	Mode               AgentMode
+	AllowedTools       []string
+	ReadOnly           bool
+	InputSchema        map[string]any
+	OutputSchema       map[string]any
+	Model              string
+	RoutingProfile     string
+	Timeout            time.Duration
+	MaxTurns           int
+	TokenBudget        int
+	Tags               []string
+	TaskKinds          []TaskKind
+	Capabilities       []string
+	PreferredPhases    []RunPhase
+	ScopeHints         []string
+	PhasePolicies      []PhasePolicy
+	VerificationPolicy VerificationPolicy
+	BuiltIn            bool
+	Disabled           bool
+	AllowOverride      bool
 }
 
-type ContextPack struct {
-	UserGoal           string
-	TaskBrief          string
-	RelevantFiles      []string
-	ArtifactRefs       []string
-	Constraints        []string
-	RecentSummary      string
-	AvailableToolNames []string
-	ExpectedOutput     map[string]any
+type RunContext struct {
+	UserGoal            string
+	CurrentPhase        RunPhase
+	TaskBrief           string
+	RecentMessages      []Message
+	StableFacts         []string
+	RelevantFiles       []string
+	ArtifactRefs        []string
+	Constraints         []string
+	UnresolvedTODOs     []string
+	RecentFailures      []string
+	VerificationNotes   []string
+	RecentSummary       string
+	AvailableToolNames  []string
+	EnabledCapabilities []string
+	AgentInventory      []AgentInventoryEntry
+	ExpectedOutput      map[string]any
+	ResumeSource        string
 }
+
+type ContextPack = RunContext
 
 type AgentInvocation struct {
 	RunID       string
 	ParentRunID string
 	Agent       AgentSpec
 	Messages    []Message
-	Context     ContextPack
+	Context     RunContext
+	Phase       RunPhase
+	Attempt     int
+	RootRunID   string
 	Model       string
 	Stream      bool
 }
@@ -110,7 +136,12 @@ type ExecutionEvent struct {
 	ParentRunID  string
 	AgentID      string
 	Type         string
+	Phase        RunPhase
+	Attempt      int
+	Status       string
 	Detail       string
+	ArtifactRef  string
+	Metrics      map[string]any
 	Timestamp    time.Time
 	ContextCount int
 }
@@ -118,12 +149,15 @@ type ExecutionEvent struct {
 type TurnRequest struct {
 	Messages []Message
 	Model    string
+	Profile  string
+	ResumeID string
 	Stream   bool
 }
 
 type TurnResult struct {
 	Message Message
 	Events  []ExecutionEvent
+	Run     *RunState
 }
 
 type AgentCatalog interface {
@@ -140,6 +174,7 @@ type ModelRequest struct {
 	Agent        AgentSpec
 	Instructions string
 	Messages     []Message
+	Phase        RunPhase
 	Model        string
 	Stream       bool
 	Tools        []ToolDefinition

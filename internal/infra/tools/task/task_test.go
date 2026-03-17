@@ -55,7 +55,7 @@ func (f *fakeBindings) CallTool(context.Context, string, string, map[string]any)
 }
 
 func TestRunToolRejectsUnknownTask(t *testing.T) {
-	tool := NewRunTool(fakeCatalog{items: map[string]domain.TaskDefinition{}}, nil, nil)
+	tool := NewRunTool(fakeCatalog{items: map[string]domain.TaskDefinition{}}, nil, nil, nil)
 	result := tool.Execute(context.Background(), domain.ToolCall{
 		ID:        "1",
 		Name:      "task_run",
@@ -72,7 +72,7 @@ func TestRunToolAddsNetworkSideEffect(t *testing.T) {
 		"go:test": {
 			ID:          "go:test",
 			Description: "Go version",
-			Kind:        domain.TaskKindCommand,
+			Kind:        domain.TaskSpecKindCommand,
 			Command: &domain.CommandTaskSpec{
 				Command:      "go",
 				Args:         []string{"version"},
@@ -82,7 +82,7 @@ func TestRunToolAddsNetworkSideEffect(t *testing.T) {
 				Timeout:      60,
 			},
 		},
-	}}, nilPolicyEngine{}, approver)
+	}}, nilPolicyEngine{}, approver, nil)
 	result := tool.Execute(context.Background(), domain.ToolCall{
 		ID:        "1",
 		Name:      "task_run",
@@ -101,7 +101,7 @@ func TestBindToolRejectsCommandTask(t *testing.T) {
 		"go:test": {
 			ID:          "go:test",
 			Description: "Go test",
-			Kind:        domain.TaskKindCommand,
+			Kind:        domain.TaskSpecKindCommand,
 			Command:     &domain.CommandTaskSpec{Command: "go"},
 		},
 	}}, &fakeBindings{}, nil, nil)
@@ -120,7 +120,7 @@ func TestListToolIncludesMCPBindingState(t *testing.T) {
 		"docs": {
 			ID:          "docs",
 			Description: "Docs MCP",
-			Kind:        domain.TaskKindMCPServer,
+			Kind:        domain.TaskSpecKindMCPServer,
 			MCPServer: &domain.MCPServerSpec{
 				Command: "npx",
 			},

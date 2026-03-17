@@ -44,7 +44,12 @@ func (l *Logger) Append(_ context.Context, event domain.ExecutionEvent) error {
 		"run_id":        event.RunID,
 		"parent_run_id": event.ParentRunID,
 		"agent_id":      event.AgentID,
+		"phase":         event.Phase,
+		"attempt":       event.Attempt,
+		"status":        event.Status,
 		"detail":        event.Detail,
+		"artifact_ref":  event.ArtifactRef,
+		"metrics":       event.Metrics,
 		"context_count": event.ContextCount,
 	}
 	return l.Write("execution_event."+event.Type, fields)

@@ -9,6 +9,7 @@
 - exec モードでも TUI と同等のイベント要約を見やすく出す
 - モデル切り替え UI
 - ストリーミング応答対応
+- benchmark 結果の CSV / artifact 保存
 - permission policy の設定ファイル対応
 - permission card に差分プレビューや変更件数を出す
 - tool call card を複数同時表示・履歴表示できるようにする

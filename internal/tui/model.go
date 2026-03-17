@@ -19,6 +19,7 @@ import (
 
 type chatMessage struct {
 	content string
+	run     *domain.RunState
 	err     error
 }
 
@@ -68,14 +69,26 @@ type slashCommand struct {
 	description string
 }
 
+type sidePanel string
+
+const (
+	sidePanelRunGraph     sidePanel = "graph"
+	sidePanelPlan         sidePanel = "plan"
+	sidePanelVerification sidePanel = "verification"
+	sidePanelMemory       sidePanel = "memory"
+)
+
 type model struct {
 	runner           domain.Orchestrator
 	tools            domain.ToolExecutor
 	taskCatalog      domain.TaskCatalog
 	mcpBindings      domain.MCPConnectionManager
 	agentCatalog     domain.AgentCatalog
+	runStore         domain.RunStateStore
+	memoryStore      domain.RepoMemoryStore
 	workingDir       string
 	defaultModel     string
+	lastRun          *domain.RunState
 	selectedRefs     map[string]string
 	messages         []domain.Message
 	output           []string
@@ -95,6 +108,7 @@ type model struct {
 	permissionQueue  []permissionState
 	sessionApprovals map[string]bool
 	patternApprovals []patternApproval
+	activePanel      sidePanel
 	status           statusState
 	statusEvents     <-chan domain.ExecutionEvent
 	cancelStatus     func()
@@ -115,7 +129,10 @@ type agentStatusNode struct {
 	ParentRunID  string
 	AgentID      string
 	Status       string
+	Phase        domain.RunPhase
+	Attempt      int
 	Detail       string
+	ArtifactRef  string
 	StartedAt    time.Time
 	UpdatedAt    time.Time
 	ContextCount int
@@ -145,9 +162,19 @@ type styles struct {
 	commandHint        lipgloss.Style
 	commandCandidate   lipgloss.Style
 	commandSelected    lipgloss.Style
+	panelTab           lipgloss.Style
+	panelTabActive     lipgloss.Style
+	panelMeta          lipgloss.Style
 }
 
 var loadingFrames = []string{"◐", "◓", "◑", "◒"}
+
+var sidePanels = []sidePanel{
+	sidePanelRunGraph,
+	sidePanelPlan,
+	sidePanelVerification,
+	sidePanelMemory,
+}
 
 var defaultPermissionOptions = []permissionOption{
 	{label: "今回だけ許可", decision: domain.PermissionAllowOnce},
@@ -168,6 +195,13 @@ var slashCommands = []slashCommand{
 	{name: "/tasks", description: "登録済み task 一覧を表示"},
 	{name: "/mcp", description: "bind 済み MCP tool 一覧を表示"},
 	{name: "/agents", description: "利用可能な agent 一覧を表示"},
+	{name: "/graph", description: "Run Graph panel を表示"},
+	{name: "/plan", description: "直近 run の plan を表示"},
+	{name: "/verification", description: "直近 run の verification を表示"},
+	{name: "/artifacts", description: "直近 run の artifacts を表示"},
+	{name: "/memory", description: "repo memory を表示"},
+	{name: "/resume", description: "最新 run を会話に復元"},
+	{name: "/approvals", description: "approval 状態を表示"},
 	{name: "/clear", description: "会話ログをクリア"},
 	{name: "/exit", description: "yagent を終了"},
 }
@@ -183,6 +217,10 @@ const (
 )
 
 func newModel(runner domain.Orchestrator, workingDir string, defaultModel string, tools domain.ToolExecutor, taskCatalog domain.TaskCatalog, mcpBindings domain.MCPConnectionManager, agentCatalog domain.AgentCatalog) model {
+	return newModelWithStores(runner, workingDir, defaultModel, tools, taskCatalog, mcpBindings, agentCatalog, nil, nil)
+}
+
+func newModelWithStores(runner domain.Orchestrator, workingDir string, defaultModel string, tools domain.ToolExecutor, taskCatalog domain.TaskCatalog, mcpBindings domain.MCPConnectionManager, agentCatalog domain.AgentCatalog, runStore domain.RunStateStore, memoryStore domain.RepoMemoryStore) model {
 	ta := textarea.New()
 	ta.Placeholder = "質問を入力... (Ctrl+J で改行, Enter で送信, /exit または Ctrl+C で終了)"
 	ta.CharLimit = 50000
@@ -207,6 +245,8 @@ func newModel(runner domain.Orchestrator, workingDir string, defaultModel string
 		taskCatalog:      taskCatalog,
 		mcpBindings:      mcpBindings,
 		agentCatalog:     agentCatalog,
+		runStore:         runStore,
+		memoryStore:      memoryStore,
 		workingDir:       workingDir,
 		defaultModel:     defaultModel,
 		selectedRefs:     map[string]string{},
@@ -216,6 +256,7 @@ func newModel(runner domain.Orchestrator, workingDir string, defaultModel string
 		textarea:         ta,
 		history:          []string{},
 		sessionApprovals: map[string]bool{},
+		activePanel:      sidePanelRunGraph,
 		status: statusState{
 			nodes: map[string]*agentStatusNode{},
 		},
@@ -272,6 +313,15 @@ func defaultStyles() styles {
 			Background(lipgloss.Color("110")).
 			Bold(true).
 			Padding(0, 1),
+		panelTab: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("248")).
+			Padding(0, 1),
+		panelTabActive: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("232")).
+			Background(lipgloss.Color("180")).
+			Bold(true).
+			Padding(0, 1),
+		panelMeta: lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Italic(true),
 	}
 }
 
@@ -504,6 +554,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Role:    domain.RoleAssistant,
 			Content: msg.content,
 		})
+		if msg.run != nil {
+			m.lastRun = msg.run
+			m.statusDirty = true
+		}
 		m.output = appendOutputBlock(m.output, assistantOutputLabel, msg.content)
 		m.logDirty = true
 		m.refreshViewport()
@@ -630,6 +684,12 @@ func handlePatternPermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if delta, ok := panelNavigationDelta(msg); ok {
+		m.cyclePanel(delta)
+		m.syncLayout()
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -751,10 +811,60 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
+	case "/graph":
+		m.setActivePanel(sidePanelRunGraph)
+		m.output = append(m.output, "Run Graph panel を表示します")
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/plan":
+		m.setActivePanel(sidePanelPlan)
+		m.output = append(m.output, formatSlashList("Current plan", m.listPlan())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/verification":
+		m.setActivePanel(sidePanelVerification)
+		m.output = append(m.output, formatSlashList("Verification", m.listVerification())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/artifacts":
+		m.output = append(m.output, formatSlashList("Run artifacts", m.listArtifacts())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/memory":
+		m.setActivePanel(sidePanelMemory)
+		m.output = append(m.output, formatSlashList("Repo memory", m.listMemory())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/resume":
+		lines := m.resumeLatest()
+		m.output = append(m.output, lines...)
+		m.statusDirty = true
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
+	case "/approvals":
+		m.output = append(m.output, formatSlashList("Approvals", m.listApprovals())...)
+		m.logDirty = true
+		m.textarea.Reset()
+		m.syncLayout()
+		return m, nil
 	case "/clear":
 		m.messages = nil
+		m.lastRun = nil
 		m.output = []string{"チャット履歴をクリアしました"}
 		m.logDirty = true
+		m.statusDirty = true
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
@@ -784,7 +894,7 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 			Messages: m.messages,
 			Model:    m.defaultModel,
 		})
-		return chatMessage{content: result.Message.Content, err: err}
+		return chatMessage{content: result.Message.Content, run: result.Run, err: err}
 	}
 
 	return m, tea.Batch(send, loadingTick())
@@ -846,8 +956,16 @@ func (m *model) applyStatusEvent(event domain.ExecutionEvent) {
 	}
 	node.UpdatedAt = event.Timestamp
 	node.Detail = event.Detail
+	node.Phase = event.Phase
+	if event.Attempt > 0 {
+		node.Attempt = event.Attempt
+	}
+	node.ArtifactRef = event.ArtifactRef
 	if event.ContextCount > 0 {
 		node.ContextCount = event.ContextCount
+	}
+	if event.Status != "" {
+		node.Status = event.Status
 	}
 	switch event.Type {
 	case "agent_started", "delegate_started", "handoff_started":
@@ -1034,6 +1152,22 @@ func fallbackString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func cloneDomainMessages(messages []domain.Message) []domain.Message {
+	out := make([]domain.Message, 0, len(messages))
+	for _, message := range messages {
+		item := message
+		item.ToolCalls = append([]domain.ToolCall(nil), message.ToolCalls...)
+		if message.Metadata != nil {
+			item.Metadata = map[string]string{}
+			for key, value := range message.Metadata {
+				item.Metadata[key] = value
+			}
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func permissionOptionsForRequest(request domain.PermissionRequest) []permissionOption {
@@ -1358,6 +1492,141 @@ func (m model) listAgents() []string {
 	return items
 }
 
+func (m model) listPlan() []string {
+	run := m.lastRun
+	if run == nil {
+		return []string{"(no run loaded)"}
+	}
+	if run.ExecutionPlan != nil {
+		items := []string{
+			fmt.Sprintf("mode=%s task=%s source=%s", fallbackString(run.ExecutionPlan.Mode, "-"), fallbackString(string(run.ExecutionPlan.TaskKind), "-"), fallbackString(run.ExecutionPlan.Source, "-")),
+			"primary: " + describeAssignment(run.ExecutionPlan.Primary),
+		}
+		if run.ExecutionPlan.Plan != nil {
+			items = append(items, "plan: "+describeAssignment(*run.ExecutionPlan.Plan))
+		}
+		if len(run.ExecutionPlan.Preparation) > 0 {
+			items = append(items, "preparation: "+describeAssignments(run.ExecutionPlan.Preparation))
+		}
+		if len(run.ExecutionPlan.Verify) > 0 {
+			items = append(items, "verify: "+describeAssignments(run.ExecutionPlan.Verify))
+		}
+		if run.ExecutionPlan.Recovery != nil {
+			items = append(items, "recovery: "+describeAssignment(*run.ExecutionPlan.Recovery))
+		}
+		if run.ExecutionPlan.Finalize != nil {
+			items = append(items, "finalize: "+describeAssignment(*run.ExecutionPlan.Finalize))
+		}
+		if reason := strings.TrimSpace(run.ExecutionPlan.FallbackReason); reason != "" {
+			items = append(items, "fallback: "+reason)
+		}
+		for _, node := range run.Plan {
+			items = append(items, fmt.Sprintf("step: %s [%s]", node.Title, node.Status))
+		}
+		return items
+	}
+	if len(run.Plan) == 0 {
+		return []string{"(no plan available)"}
+	}
+	items := make([]string, 0, len(run.Plan))
+	for _, node := range run.Plan {
+		items = append(items, fmt.Sprintf("%s [%s]", node.Title, node.Status))
+	}
+	return items
+}
+
+func (m model) listArtifacts() []string {
+	run := m.lastRun
+	if run == nil {
+		return []string{"(no run loaded)"}
+	}
+	if len(run.Artifacts) == 0 {
+		return []string{"(no artifacts available)"}
+	}
+	items := make([]string, 0, len(run.Artifacts))
+	for _, artifact := range run.Artifacts {
+		items = append(items, fmt.Sprintf("%s - %s - %s", artifact.Phase, artifact.Name, fallbackString(artifact.Summary, "(no summary)")))
+	}
+	return items
+}
+
+func (m model) listVerification() []string {
+	run := m.lastRun
+	if run == nil {
+		return []string{"(no run loaded)"}
+	}
+	if len(run.Verification) == 0 {
+		return []string{"(no verification available)"}
+	}
+	items := make([]string, 0, len(run.Verification))
+	for _, item := range run.Verification {
+		line := fmt.Sprintf("try %d %s [%s]", item.Attempt, item.SourceAgent, item.Status)
+		if summary := strings.TrimSpace(item.Summary); summary != "" {
+			line += " - " + summary
+		}
+		items = append(items, line)
+	}
+	return items
+}
+
+func (m model) listMemory() []string {
+	if m.memoryStore == nil {
+		return []string{"(memory store unavailable)"}
+	}
+	memory, err := m.memoryStore.LoadMemory(context.Background())
+	if err != nil {
+		return []string{"failed to load memory: " + err.Error()}
+	}
+	items := []string{}
+	for _, constraint := range memory.Constraints {
+		items = append(items, "constraint: "+constraint)
+	}
+	for _, command := range memory.SuccessfulCommands {
+		items = append(items, "command: "+fallbackString(command.Summary, command.Command))
+	}
+	for _, artifact := range memory.RecentArtifacts {
+		items = append(items, "artifact: "+artifact)
+	}
+	if len(items) == 0 {
+		return []string{"(memory is empty)"}
+	}
+	return items
+}
+
+func (m model) listApprovals() []string {
+	items := []string{
+		fmt.Sprintf("session approvals: %d", len(m.sessionApprovals)),
+		fmt.Sprintf("pattern approvals: %d", len(m.patternApprovals)),
+	}
+	if m.permission != nil {
+		items = append(items, "pending approval: "+m.permission.request.Operation+" ("+m.permission.request.Resource+")")
+	}
+	return items
+}
+
+func (m *model) resumeLatest() []string {
+	if m.runStore == nil {
+		return []string{"resume unavailable: run store is not configured"}
+	}
+	run, err := m.runStore.LoadLatestRun(context.Background())
+	if err != nil {
+		return []string{"resume failed: " + err.Error()}
+	}
+	if run == nil {
+		return []string{"resume failed: no previous run found"}
+	}
+	m.lastRun = run
+	m.messages = cloneDomainMessages(run.Messages)
+	lines := []string{
+		fmt.Sprintf("Resumed run %s", run.ID),
+		fmt.Sprintf("phase=%s status=%s attempt=%d", run.CurrentPhase, run.Status, run.Attempt),
+	}
+	if summary := strings.TrimSpace(run.ConversationSummary); summary != "" {
+		lines = append(lines, "summary: "+summary)
+	}
+	return lines
+}
+
 func formatSlashList(title string, items []string) []string {
 	if len(items) == 0 {
 		return []string{title + ":", "  (なし)"}
@@ -1371,10 +1640,67 @@ func formatSlashList(title string, items []string) []string {
 	return lines
 }
 
+func panelNavigationDelta(msg tea.KeyMsg) (int, bool) {
+	key := msg.Key()
+	if key.Mod.Contains(tea.ModCtrl) {
+		switch key.Code {
+		case tea.KeyLeft:
+			return -1, true
+		case tea.KeyRight:
+			return 1, true
+		case 'h':
+			return -1, true
+		case 'l':
+			return 1, true
+		}
+	}
+	if key.Mod.Contains(tea.ModAlt) {
+		switch key.Code {
+		case '[':
+			return -1, true
+		case ']':
+			return 1, true
+		}
+	}
+	return 0, false
+}
+
+func (m model) pendingApprovalCount() int {
+	count := len(m.permissionQueue)
+	if m.permission != nil {
+		count++
+	}
+	return count
+}
+
+func (m model) latestArtifactSummary() string {
+	if m.lastRun == nil || len(m.lastRun.Artifacts) == 0 {
+		return ""
+	}
+	artifact := m.lastRun.Artifacts[len(m.lastRun.Artifacts)-1]
+	return artifact.Name + " (" + fallbackString(artifact.Summary, artifact.Kind) + ")"
+}
+
+func (m model) latestBlockedReason() string {
+	for _, event := range m.status.recent {
+		if event.Type == "agent_failed" || event.Type == "tool_failed" {
+			return trimPathFromEnd(strings.TrimSpace(event.Detail), maxInt(24, m.statusViewport.Width()-8))
+		}
+	}
+	if m.lastRun != nil {
+		for idx := len(m.lastRun.Verification) - 1; idx >= 0; idx-- {
+			if strings.EqualFold(m.lastRun.Verification[idx].Status, "fail") {
+				return trimPathFromEnd(strings.TrimSpace(m.lastRun.Verification[idx].Summary), maxInt(24, m.statusViewport.Width()-8))
+			}
+		}
+	}
+	return ""
+}
+
 func (m model) View() tea.View {
 	var sb strings.Builder
 	offsetY := 0
-	sb.WriteString(m.styles.hint.Render("入力： コマンド：/help, /clear, /exit | Alt+↑/↓ と PgUp/PgDn でログ"))
+	sb.WriteString(m.styles.hint.Render("入力： /help, /graph, /plan, /verification, /memory, /resume, /clear, /exit | Ctrl+←/→ または Ctrl+H/L / Alt+[/] で panel 切替 | Alt+↑/↓ と PgUp/PgDn でログ"))
 	sb.WriteString("\n")
 	sb.WriteString(m.styles.separator.Render(strings.Repeat("─", maxInt(1, m.width))))
 	sb.WriteString("\n\n")
@@ -1432,13 +1758,13 @@ func (m model) renderMainPanels() string {
 		Padding(0, 1).
 		Width(maxInt(1, m.viewport.Width()+paneHorizontalFrame)).
 		Render(chatTitle + "\n" + m.viewport.View())
-	statusTitle := "Agent Status"
+	sideTitle := m.renderPanelTabs()
 	statusPane := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1).
 		Width(maxInt(1, m.statusViewport.Width()+paneHorizontalFrame)).
-		Render(statusTitle + "\n" + m.statusViewport.View())
+		Render(sideTitle + "\n" + m.statusViewport.View())
 
 	_, _, stacked := layoutWidths(m.width)
 	if stacked {
@@ -1448,15 +1774,27 @@ func (m model) renderMainPanels() string {
 }
 
 func (m model) renderStatus() string {
+	switch m.activePanel {
+	case sidePanelPlan:
+		return m.renderPlanPanel()
+	case sidePanelVerification:
+		return m.renderVerificationPanel()
+	case sidePanelMemory:
+		return m.renderMemoryPanel()
+	default:
+		return m.renderRunGraphPanel()
+	}
+}
+
+func (m model) renderRunGraphPanel() string {
 	if len(m.status.nodes) == 0 {
-		return "まだサブエージェントは動いていません。"
+		lines := m.renderPanelSummary()
+		lines = append(lines, "", "まだサブエージェントは動いていません。")
+		return strings.Join(lines, "\n")
 	}
 
-	var lines []string
-	if metrics := m.currentRunMetrics(); metrics != "" {
-		lines = append(lines, metrics)
-	}
-	lines = append(lines, fmt.Sprintf("running %d  done %d  failed %d", m.countStatus("running", "working", "thinking"), m.countStatus("done"), m.countStatus("failed")))
+	lines := m.renderPanelSummary()
+	lines = append(lines, "", fmt.Sprintf("running %d  done %d  failed %d", m.countStatus("running", "working", "thinking"), m.countStatus("done"), m.countStatus("failed")))
 	lines = append(lines, "")
 
 	rootIDs := append([]string(nil), m.status.rootRunIDs...)
@@ -1479,6 +1817,240 @@ func (m model) renderStatus() string {
 	return strings.Join(lines, "\n")
 }
 
+func (m *model) setActivePanel(panel sidePanel) {
+	if m.activePanel == panel {
+		return
+	}
+	m.activePanel = panel
+	m.statusDirty = true
+}
+
+func (m *model) cyclePanel(delta int) {
+	if len(sidePanels) == 0 {
+		return
+	}
+	index := 0
+	for idx, panel := range sidePanels {
+		if panel == m.activePanel {
+			index = idx
+			break
+		}
+	}
+	next := wrapIndex(index+delta, len(sidePanels))
+	m.setActivePanel(sidePanels[next])
+}
+
+func (m model) renderPanelTabs() string {
+	parts := make([]string, 0, len(sidePanels))
+	for _, panel := range sidePanels {
+		label := m.panelTitle(panel)
+		if panel == m.activePanel {
+			parts = append(parts, m.styles.panelTabActive.Render(label))
+			continue
+		}
+		parts = append(parts, m.styles.panelTab.Render(label))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (m model) panelTitle(panel sidePanel) string {
+	switch panel {
+	case sidePanelPlan:
+		return "Plan"
+	case sidePanelVerification:
+		return "Verification"
+	case sidePanelMemory:
+		return "Memory"
+	default:
+		return "Run Graph"
+	}
+}
+
+func (m model) renderPanelSummary() []string {
+	lines := []string{}
+	if m.lastRun != nil {
+		lines = append(lines, m.styles.panelMeta.Render(fmt.Sprintf(
+			"run %s  phase=%s  status=%s  attempt=%d",
+			m.lastRun.ID,
+			fallbackString(string(m.lastRun.CurrentPhase), "-"),
+			fallbackString(string(m.lastRun.Status), "-"),
+			maxInt(1, m.lastRun.Attempt),
+		)))
+	} else if metrics := m.currentRunMetrics(); metrics != "" {
+		lines = append(lines, m.styles.panelMeta.Render(metrics))
+	} else {
+		lines = append(lines, m.styles.panelMeta.Render("run (not loaded)"))
+	}
+	lines = append(lines, m.styles.panelMeta.Render(fmt.Sprintf("pending approvals %d", m.pendingApprovalCount())))
+	if artifact := m.latestArtifactSummary(); artifact != "" {
+		lines = append(lines, m.styles.panelMeta.Render("latest artifact: "+artifact))
+	}
+	if reason := m.latestBlockedReason(); reason != "" {
+		lines = append(lines, m.styles.panelMeta.Render("blocked: "+reason))
+	}
+	return lines
+}
+
+func (m model) renderPlanPanel() string {
+	lines := m.renderPanelSummary()
+	if m.lastRun == nil {
+		lines = append(lines, "", "(no run loaded)")
+		return strings.Join(lines, "\n")
+	}
+	if m.lastRun.ExecutionPlan != nil {
+		plan := m.lastRun.ExecutionPlan
+		width := maxInt(24, m.statusViewport.Width()-6)
+		lines = append(lines, "", "Execution plan")
+		lines = append(lines, wrapContent(fmt.Sprintf("mode=%s  task=%s  source=%s", fallbackString(plan.Mode, "-"), fallbackString(string(plan.TaskKind), "-"), fallbackString(plan.Source, "-")), width))
+		if summary := strings.TrimSpace(plan.Summary); summary != "" {
+			lines = append(lines, wrapContent(summary, width))
+		}
+		if reason := strings.TrimSpace(plan.FallbackReason); reason != "" {
+			lines = append(lines, wrapContent("fallback: "+reason, width))
+		}
+		if plan.Plan != nil {
+			lines = append(lines, "", "Plan owner")
+			lines = append(lines, wrapContent("- "+describeAssignment(*plan.Plan), width))
+		}
+		if len(plan.Preparation) > 0 {
+			lines = append(lines, "", "Preparation")
+			for _, item := range plan.Preparation {
+				lines = append(lines, wrapContent("- "+describeAssignment(item), width))
+			}
+		}
+		lines = append(lines, "", "Primary")
+		lines = append(lines, wrapContent("- "+describeAssignment(plan.Primary), width))
+		if len(plan.Verify) > 0 {
+			lines = append(lines, "", "Verification")
+			for _, item := range plan.Verify {
+				lines = append(lines, wrapContent("- "+describeAssignment(item), width))
+			}
+		}
+		if plan.Recovery != nil {
+			lines = append(lines, "", "Recovery")
+			lines = append(lines, wrapContent("- "+describeAssignment(*plan.Recovery), width))
+		}
+		if plan.Finalize != nil {
+			lines = append(lines, "", "Finalize")
+			lines = append(lines, wrapContent("- "+describeAssignment(*plan.Finalize), width))
+		}
+		if len(m.lastRun.Plan) > 0 {
+			lines = append(lines, "", "Steps")
+			for idx, node := range m.lastRun.Plan {
+				line := fmt.Sprintf("%d. [%s] %s", idx+1, fallbackString(node.Status, "pending"), node.Title)
+				lines = append(lines, wrapContent(trimPathFromEnd(line, width), width))
+				if description := strings.TrimSpace(node.Description); description != "" {
+					lines = append(lines, wrapContent("   agent: "+trimPathFromEnd(description, width), width))
+				}
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	if len(m.lastRun.Plan) == 0 {
+		lines = append(lines, "", "(no plan available)")
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines, "", "Plan")
+	width := maxInt(24, m.statusViewport.Width()-6)
+	for idx, node := range m.lastRun.Plan {
+		line := fmt.Sprintf("%d. [%s] %s", idx+1, fallbackString(node.Status, "pending"), node.Title)
+		lines = append(lines, wrapContent(trimPathFromEnd(line, width), width))
+		if description := strings.TrimSpace(node.Description); description != "" {
+			lines = append(lines, "   "+wrapContent(trimPathFromEnd(description, width), width))
+		}
+	}
+	if checkpoints := tailCheckpoints(m.lastRun.Checkpoints, 4); len(checkpoints) > 0 {
+		lines = append(lines, "", "Recent checkpoints")
+		for _, checkpoint := range checkpoints {
+			lines = append(lines, wrapContent(fmt.Sprintf("%s  %s", checkpoint.Phase, fallbackString(checkpoint.Summary, "(no summary)")), width))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) renderVerificationPanel() string {
+	lines := m.renderPanelSummary()
+	if m.lastRun == nil {
+		lines = append(lines, "", "(no run loaded)")
+		return strings.Join(lines, "\n")
+	}
+	if len(m.lastRun.Verification) == 0 {
+		lines = append(lines, "", "(no verification available)")
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines, "", "Verification")
+	width := maxInt(24, m.statusViewport.Width()-6)
+	for _, item := range m.lastRun.Verification {
+		header := fmt.Sprintf("try %d  %s  %s", item.Attempt, item.SourceAgent, strings.ToUpper(fallbackString(item.Status, "unknown")))
+		lines = append(lines, trimPathFromEnd(header, width))
+		if summary := strings.TrimSpace(item.Summary); summary != "" {
+			lines = append(lines, wrapContent("  "+trimPathFromEnd(summary, width), width))
+		}
+		if brief := strings.TrimSpace(item.RepairBrief); brief != "" {
+			lines = append(lines, wrapContent("  repair: "+trimPathFromEnd(brief, width), width))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) renderMemoryPanel() string {
+	lines := m.renderPanelSummary()
+	if m.memoryStore == nil {
+		lines = append(lines, "", "(memory store unavailable)")
+		return strings.Join(lines, "\n")
+	}
+	memory, err := m.memoryStore.LoadMemory(context.Background())
+	if err != nil {
+		lines = append(lines, "", "failed to load memory: "+err.Error())
+		return strings.Join(lines, "\n")
+	}
+	if memory == nil {
+		lines = append(lines, "", "(memory is empty)")
+		return strings.Join(lines, "\n")
+	}
+
+	width := maxInt(24, m.statusViewport.Width()-6)
+	appendSection := func(title string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		lines = append(lines, "", title)
+		for _, item := range items {
+			lines = append(lines, wrapContent("- "+trimPathFromEnd(strings.TrimSpace(item), width), width))
+		}
+	}
+	appendSection("Constraints", memory.Constraints)
+	appendSection("Failure patterns", memory.FailurePatterns)
+	commands := make([]string, 0, len(memory.SuccessfulCommands))
+	for _, item := range memory.SuccessfulCommands {
+		commands = append(commands, fallbackString(item.Summary, item.Command))
+	}
+	appendSection("Successful commands", commands)
+	appendSection("Recent artifacts", memory.RecentArtifacts)
+	if len(lines) == len(m.renderPanelSummary()) {
+		lines = append(lines, "", "(memory is empty)")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func describeAssignment(item domain.PlannedAgentAssignment) string {
+	text := fallbackString(item.AgentID, "-")
+	if reason := strings.TrimSpace(item.Reason); reason != "" {
+		text += " - " + reason
+	}
+	return text
+}
+
+func describeAssignments(items []domain.PlannedAgentAssignment) string {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, describeAssignment(item))
+	}
+	return strings.Join(parts, " | ")
+}
+
 func (m model) renderStatusTree(runID, prefix string, last bool) []string {
 	node, ok := m.status.nodes[runID]
 	if !ok {
@@ -1496,6 +2068,12 @@ func (m model) renderStatusTree(runID, prefix string, last bool) []string {
 	}
 
 	line := fmt.Sprintf("%s%s  %s  %s", prefix+branch, titleCase(node.AgentID), statusLabel(node.Status), formatNodeMetrics(node))
+	if node.Phase != "" {
+		line += "  " + string(node.Phase)
+	}
+	if node.Attempt > 0 {
+		line += fmt.Sprintf("  try %d", node.Attempt)
+	}
 	if node.Detail != "" {
 		line += "  " + trimPathFromEnd(strings.TrimSpace(node.Detail), maxInt(16, m.statusViewport.Width()-10))
 	}
@@ -1569,6 +2147,13 @@ func appendUnique(values []string, value string) []string {
 		}
 	}
 	return append(values, value)
+}
+
+func tailCheckpoints(items []domain.RunCheckpoint, limit int) []domain.RunCheckpoint {
+	if limit <= 0 || len(items) <= limit {
+		return append([]domain.RunCheckpoint(nil), items...)
+	}
+	return append([]domain.RunCheckpoint(nil), items[len(items)-limit:]...)
 }
 
 func statusLabel(status string) string {

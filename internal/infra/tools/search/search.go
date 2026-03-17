@@ -38,8 +38,11 @@ func NewFilesTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver
 
 func (t *textTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "search_text",
-		Description: "基点ディレクトリ配下のテキストを検索します。",
+		Name:             "search_text",
+		Description:      "基点ディレクトリ配下のテキストを検索します。",
+		CapabilityGroup:  "search",
+		Risk:             "medium",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -55,8 +58,11 @@ func (t *textTool) Definition() domain.ToolDefinition {
 
 func (t *filesTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "search_files",
-		Description: "基点ディレクトリ配下からファイル名パターンに一致するファイルを探します。",
+		Name:             "search_files",
+		Description:      "基点ディレクトリ配下からファイル名パターンに一致するファイルを探します。",
+		CapabilityGroup:  "search",
+		Risk:             "medium",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

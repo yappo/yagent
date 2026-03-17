@@ -21,6 +21,7 @@ func NewRootCommand() *cobra.Command {
 	root.PersistentFlags().StringVar(&logPath, "log", "", "イベントログの出力先")
 	root.AddCommand(newTUICommand(&configPath, &logPath))
 	root.AddCommand(newExecCommand(&configPath, &logPath))
+	root.AddCommand(newBenchmarkCommand(&configPath, &logPath))
 
 	return root
 }

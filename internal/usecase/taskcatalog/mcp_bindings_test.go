@@ -23,8 +23,10 @@ func (f *fakeSession) Initialize(context.Context) error { return nil }
 func (f *fakeSession) ListTools(context.Context) ([]domain.MCPToolDescriptor, error) {
 	return append([]domain.MCPToolDescriptor(nil), f.tools...), nil
 }
-func (f *fakeSession) CallTool(context.Context, string, map[string]any) (string, error) { return "ok", nil }
-func (f *fakeSession) Close() error                                                      { return nil }
+func (f *fakeSession) CallTool(context.Context, string, map[string]any) (string, error) {
+	return "ok", nil
+}
+func (f *fakeSession) Close() error { return nil }
 
 func TestMCPBindingsApplyFiltersAndQualifyNames(t *testing.T) {
 	bindings := NewMCPBindings(fakeSessionFactory{session: &fakeSession{
@@ -35,7 +37,7 @@ func TestMCPBindingsApplyFiltersAndQualifyNames(t *testing.T) {
 	}})
 	task := domain.TaskDefinition{
 		ID:   "docs:v1",
-		Kind: domain.TaskKindMCPServer,
+		Kind: domain.TaskSpecKindMCPServer,
 		MCPServer: &domain.MCPServerSpec{
 			ToolPrefix:   "docs.api/v1",
 			ParallelSafe: true,

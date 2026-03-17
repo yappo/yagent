@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	"yagent/internal/domain"
@@ -21,21 +22,22 @@ type runTool struct {
 	catalog  domain.TaskCatalog
 	engine   domain.PolicyEngine
 	approver domain.Approver
+	memory   domain.RepoMemoryStore
 }
 
 type bindTool struct {
-	catalog   domain.TaskCatalog
-	bindings  domain.MCPConnectionManager
-	engine    domain.PolicyEngine
-	approver  domain.Approver
+	catalog  domain.TaskCatalog
+	bindings domain.MCPConnectionManager
+	engine   domain.PolicyEngine
+	approver domain.Approver
 }
 
 func NewListTool(catalog domain.TaskCatalog, bindings domain.MCPConnectionManager) domain.Tool {
 	return &listTool{catalog: catalog, bindings: bindings}
 }
 
-func NewRunTool(catalog domain.TaskCatalog, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
-	return &runTool{catalog: catalog, engine: engine, approver: approver}
+func NewRunTool(catalog domain.TaskCatalog, engine domain.PolicyEngine, approver domain.Approver, memory domain.RepoMemoryStore) domain.Tool {
+	return &runTool{catalog: catalog, engine: engine, approver: approver, memory: memory}
 }
 
 func NewBindTool(catalog domain.TaskCatalog, bindings domain.MCPConnectionManager, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
@@ -44,8 +46,10 @@ func NewBindTool(catalog domain.TaskCatalog, bindings domain.MCPConnectionManage
 
 func (t *listTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "task_list",
-		Description: "実行可能な登録済み task 一覧を返します。task_run の前に確認してください。",
+		Name:            "task_list",
+		Description:     "実行可能な登録済み task 一覧を返します。task_run の前に確認してください。",
+		CapabilityGroup: "task_read",
+		Risk:            "low",
 		Parameters: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
@@ -56,8 +60,12 @@ func (t *listTool) Definition() domain.ToolDefinition {
 
 func (t *runTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "task_run",
-		Description: "task_list に存在する task_id だけを実行します。自由コマンドは実行できません。",
+		Name:             "task_run",
+		Description:      "task_list に存在する task_id だけを実行します。自由コマンドは実行できません。",
+		CapabilityGroup:  "task_exec",
+		Risk:             "high",
+		RequiresApproval: true,
+		MutatesWorkspace: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -71,8 +79,11 @@ func (t *runTool) Definition() domain.ToolDefinition {
 
 func (t *bindTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "task_bind",
-		Description: "task_list に存在する MCP server task を bind して、その server の tool を利用可能にします。",
+		Name:             "task_bind",
+		Description:      "task_list に存在する MCP server task を bind して、その server の tool を利用可能にします。",
+		CapabilityGroup:  "mcp",
+		Risk:             "high",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -115,7 +126,7 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		}
 		_, info.Bound = bound[item.ID]
 		switch item.Kind {
-		case domain.TaskKindCommand:
+		case domain.TaskSpecKindCommand:
 			if item.Command != nil {
 				info.Command = item.Command.Command
 				info.Args = append([]string(nil), item.Command.Args...)
@@ -123,7 +134,7 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 				info.Risk = item.Command.Risk
 				info.AllowNetwork = item.Command.AllowNetwork
 			}
-		case domain.TaskKindMCPServer:
+		case domain.TaskSpecKindMCPServer:
 			info.BindRequired = true
 			if item.MCPServer != nil {
 				info.Command = item.MCPServer.Command
@@ -147,7 +158,7 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	if !ok {
 		return failure(call, fmt.Sprintf("登録されていない task_id です: %s", taskID))
 	}
-	if taskDef.Kind != domain.TaskKindCommand || taskDef.Command == nil {
+	if taskDef.Kind != domain.TaskSpecKindCommand || taskDef.Command == nil {
 		return failure(call, fmt.Sprintf("task_run では command task だけ実行できます: %s", taskID))
 	}
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
@@ -173,6 +184,14 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	if stderr.Len() > 0 {
 		output += "\n[stderr]\n" + stderr.String()
 	}
+	if t.memory != nil && taskDef.Command != nil {
+		_ = t.memory.RecordCommand(ctx, domain.CommandMemoryEntry{
+			Command: taskDef.Command.Command + " " + strings.Join(taskDef.Command.Args, " "),
+			Cwd:     taskDef.Command.Cwd,
+			Summary: "task " + taskDef.ID,
+			Success: true,
+		})
+	}
 	return success(call, output)
 }
 
@@ -185,7 +204,7 @@ func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 	if !ok {
 		return failure(call, fmt.Sprintf("登録されていない task_id です: %s", taskID))
 	}
-	if taskDef.Kind != domain.TaskKindMCPServer {
+	if taskDef.Kind != domain.TaskSpecKindMCPServer {
 		return failure(call, fmt.Sprintf("task_bind では MCP server task だけ bind できます: %s", taskID))
 	}
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
@@ -204,14 +223,14 @@ func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		return failure(call, err.Error())
 	}
 	result := map[string]any{
-		"task_id":      taskDef.ID,
-		"kind":         taskDef.Kind,
-		"tool_count":   len(tools),
-		"tool_names":   toolNames(tools),
-		"description":  taskDef.Description,
-		"bound_tools":  len(t.bindings.BoundTools()),
-		"bind_status":  "ready",
-		"source":       taskDef.Source,
+		"task_id":     taskDef.ID,
+		"kind":        taskDef.Kind,
+		"tool_count":  len(tools),
+		"tool_names":  toolNames(tools),
+		"description": taskDef.Description,
+		"bound_tools": len(t.bindings.BoundTools()),
+		"bind_status": "ready",
+		"source":      taskDef.Source,
 	}
 	return marshalSuccess(call, result)
 }
@@ -233,13 +252,13 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 		description  = taskDef.Description
 	)
 	switch taskDef.Kind {
-	case domain.TaskKindCommand:
+	case domain.TaskSpecKindCommand:
 		if taskDef.Command != nil {
 			allowNetwork = taskDef.Command.AllowNetwork
 			command = taskDef.Command.Command
 			args = append(args, taskDef.Command.Args...)
 		}
-	case domain.TaskKindMCPServer:
+	case domain.TaskSpecKindMCPServer:
 		if taskDef.MCPServer != nil {
 			allowNetwork = taskDef.MCPServer.AllowNetwork
 			command = taskDef.MCPServer.Command

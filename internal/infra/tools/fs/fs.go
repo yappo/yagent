@@ -78,8 +78,11 @@ func NewMoveTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver 
 
 func (t *readTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "fs_read",
-		Description: "指定したテキストファイルを読み取ります。offset と limit_bytes で範囲指定できます。",
+		Name:             "fs_read",
+		Description:      "指定したテキストファイルを読み取ります。offset と limit_bytes で範囲指定できます。",
+		CapabilityGroup:  "fs_read",
+		Risk:             "medium",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -95,8 +98,12 @@ func (t *readTool) Definition() domain.ToolDefinition {
 
 func (t *writeTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "fs_write",
-		Description: "指定したファイルを書き込みます。create と overwrite を明示してください。",
+		Name:             "fs_write",
+		Description:      "指定したファイルを書き込みます。create と overwrite を明示してください。",
+		CapabilityGroup:  "fs_write",
+		Risk:             "high",
+		RequiresApproval: true,
+		MutatesWorkspace: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -113,8 +120,11 @@ func (t *writeTool) Definition() domain.ToolDefinition {
 
 func (t *listTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "fs_list",
-		Description: "指定ディレクトリ配下のエントリ一覧を返します。",
+		Name:             "fs_list",
+		Description:      "指定ディレクトリ配下のエントリ一覧を返します。",
+		CapabilityGroup:  "fs_read",
+		Risk:             "medium",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -131,8 +141,11 @@ func (t *listTool) Definition() domain.ToolDefinition {
 
 func (t *statTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "fs_stat",
-		Description: "指定 path のメタデータを返します。",
+		Name:             "fs_stat",
+		Description:      "指定 path のメタデータを返します。",
+		CapabilityGroup:  "fs_read",
+		Risk:             "low",
+		RequiresApproval: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -146,8 +159,12 @@ func (t *statTool) Definition() domain.ToolDefinition {
 
 func (t *removeTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "fs_remove",
-		Description: "ファイルまたはディレクトリを削除します。ディレクトリ削除には recursive=true が必要です。",
+		Name:             "fs_remove",
+		Description:      "ファイルまたはディレクトリを削除します。ディレクトリ削除には recursive=true が必要です。",
+		CapabilityGroup:  "fs_write",
+		Risk:             "high",
+		RequiresApproval: true,
+		MutatesWorkspace: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -163,8 +180,12 @@ func (t *removeTool) Definition() domain.ToolDefinition {
 
 func (t *moveTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name:        "fs_move",
-		Description: "ファイルを移動またはリネームします。",
+		Name:             "fs_move",
+		Description:      "ファイルを移動またはリネームします。",
+		CapabilityGroup:  "fs_write",
+		Risk:             "high",
+		RequiresApproval: true,
+		MutatesWorkspace: true,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
