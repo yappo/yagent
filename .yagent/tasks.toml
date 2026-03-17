@@ -1,0 +1,17 @@
+[[tasks]]
+id = "go:test"
+description = "Go のテストを実行"
+command = "go"
+args = ["test", "./..."]
+risk = "medium"
+allow_network = false
+timeout = 300
+
+[[tasks]]
+id = "go:build"
+description = "Go のビルドを実行"
+command = "go"
+args = ["build", "./..."]
+risk = "medium"
+allow_network = false
+timeout = 300
