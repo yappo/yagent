@@ -351,6 +351,34 @@ func TestToolEventFinishAppendsToolLog(t *testing.T) {
 	}
 }
 
+func TestToolLogsKeepRecentEntriesOnly(t *testing.T) {
+	m := newTestModel(t)
+	for i := 0; i < maxToolLogEntries+3; i++ {
+		modelValue, _ := m.Update(toolEventMsg{event: domain.ToolEvent{
+			Phase: "finish",
+			Call: domain.ToolCall{
+				Name: "task_run",
+				Arguments: map[string]any{
+					"task_id": fmt.Sprintf("task-%02d", i),
+				},
+			},
+			Result: domain.ToolResult{
+				Name:    "task_run",
+				Success: true,
+				Output:  fmt.Sprintf("line %d", i),
+			},
+		}})
+		m = modelValue.(model)
+	}
+
+	if len(m.toolLogs) != maxToolLogEntries {
+		t.Fatalf("expected %d tool logs, got %d", maxToolLogEntries, len(m.toolLogs))
+	}
+	if strings.Contains(m.toolLogs[0].title, "task-00") {
+		t.Fatalf("expected oldest tool log to be pruned, got %+v", m.toolLogs)
+	}
+}
+
 func TestSlashPlanSwitchesPanel(t *testing.T) {
 	m := newTestModel(t)
 	m.lastRun = &domain.RunState{
@@ -595,6 +623,32 @@ func TestTypingDoesNotDirtyLogOrStatusViewports(t *testing.T) {
 	}
 }
 
+func TestHeightOnlyCompletionLayoutChangeDoesNotDirtyLogOrStatus(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.height = 30
+	m.appendOutputBlock(assistantOutputLabel, "hello")
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-1",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: time.Now(),
+	})
+	m.syncLayout()
+	m.logDirty = false
+	m.panelCache[m.activePanel] = panelRenderCache{dirty: false, width: m.statusViewport.Width(), content: m.renderStatus()}
+	m.textarea.SetValue("/he")
+
+	_ = m.syncAfterComposerChange(false)
+
+	if m.logDirty {
+		t.Fatal("expected height-only change not to dirty chat log")
+	}
+	if m.panelCache[m.activePanel].dirty {
+		t.Fatal("expected height-only change not to dirty active panel cache")
+	}
+}
+
 func TestPermissionTabDoesNotTriggerCommandCompletion(t *testing.T) {
 	m := newTestModel(t)
 	m.textarea.SetValue("/he")
@@ -702,6 +756,7 @@ func TestViewShowsCommandCandidates(t *testing.T) {
 	m.width = 80
 	m.height = 24
 	m.textarea.SetValue("/he")
+	m.refreshCompletionState(false)
 	m.syncLayout()
 
 	view := m.View().Content
@@ -710,6 +765,112 @@ func TestViewShowsCommandCandidates(t *testing.T) {
 	}
 	if !strings.Contains(view, "/help") {
 		t.Fatalf("expected /help candidate in view, got %q", view)
+	}
+}
+
+func TestNormalTypingDoesNotReadPathCompletion(t *testing.T) {
+	originalReadDir := readDirEntries
+	defer func() { readDirEntries = originalReadDir }()
+
+	readCalls := 0
+	readDirEntries = func(string) ([]os.DirEntry, error) {
+		readCalls++
+		return nil, nil
+	}
+
+	m := newTestModel(t)
+	modelValue, _ := m.Update(tea.KeyPressMsg{Text: "a"})
+	next := modelValue.(model)
+
+	if readCalls != 0 {
+		t.Fatalf("expected normal typing not to read dirs, got %d", readCalls)
+	}
+	if next.hasCompletionCandidates() {
+		t.Fatal("expected normal typing not to produce completion candidates")
+	}
+}
+
+func TestPathCompletionDebouncesDirectoryReads(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+
+	originalReadDir := readDirEntries
+	defer func() { readDirEntries = originalReadDir }()
+
+	readCalls := 0
+	readDirEntries = func(path string) ([]os.DirEntry, error) {
+		readCalls++
+		return originalReadDir(path)
+	}
+
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
+	modelValue, _ := m.Update(tea.KeyPressMsg{Text: "@"})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(tea.KeyPressMsg{Text: "R"})
+	next = modelValue.(model)
+
+	if readCalls != 0 {
+		t.Fatalf("expected debounce to avoid immediate reads, got %d", readCalls)
+	}
+	if next.hasCompletionCandidates() {
+		t.Fatal("expected candidates to stay hidden before debounce fires")
+	}
+	if next.completion.pendingSeq == 0 {
+		t.Fatal("expected pending debounce sequence")
+	}
+
+	modelValue, _ = next.Update(pathCompletionDebounceMsg{seq: next.completion.pendingSeq})
+	next = modelValue.(model)
+	if readCalls != 1 {
+		t.Fatalf("expected one read after debounce, got %d", readCalls)
+	}
+	if !next.hasCompletionCandidates() {
+		t.Fatal("expected candidates after debounce")
+	}
+	if next.completion.ctx.candidates[0].display != "README.md" {
+		t.Fatalf("unexpected candidates: %+v", next.completion.ctx.candidates)
+	}
+
+	_ = next.View()
+	if readCalls != 1 {
+		t.Fatalf("expected cached completion in view, got %d reads", readCalls)
+	}
+}
+
+func TestTabBypassesPendingPathDebounce(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+
+	originalReadDir := readDirEntries
+	defer func() { readDirEntries = originalReadDir }()
+
+	readCalls := 0
+	readDirEntries = func(path string) ([]os.DirEntry, error) {
+		readCalls++
+		return originalReadDir(path)
+	}
+
+	m := newModel(stubOrchestrator{}, dir, "", nil, nil, nil, nil)
+	modelValue, _ := m.Update(tea.KeyPressMsg{Text: "@"})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(tea.KeyPressMsg{Text: "R"})
+	next = modelValue.(model)
+
+	if readCalls != 0 {
+		t.Fatalf("expected no reads before tab, got %d", readCalls)
+	}
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	next = modelValue.(model)
+	if readCalls != 1 {
+		t.Fatalf("expected tab to trigger one immediate read, got %d", readCalls)
+	}
+	if next.textarea.Value() != "@README.md" {
+		t.Fatalf("expected @README.md, got %q", next.textarea.Value())
 	}
 }
 
@@ -1331,6 +1492,91 @@ func TestApplyStatusEventReordersChildrenWhenRunBecomesActive(t *testing.T) {
 	children = m.status.children["root"]
 	if len(children) != 2 || children[0] != "done-child" || children[1] != "active-child" {
 		t.Fatalf("unexpected reordered child ordering: %+v", children)
+	}
+}
+
+func TestApplyStatusEventPrunesOldTerminalRoots(t *testing.T) {
+	m := newTestModel(t)
+	base := time.Now()
+	for i := 0; i < maxTerminalRootRuns+3; i++ {
+		m.applyStatusEvent(domain.ExecutionEvent{
+			RunID:     fmt.Sprintf("done-%02d", i),
+			AgentID:   "manager",
+			Type:      "agent_completed",
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "active-root",
+		AgentID:   "coder",
+		Type:      "agent_started",
+		Timestamp: base.Add(100 * time.Second),
+	})
+
+	if len(m.status.rootRunIDs) != maxTerminalRootRuns+1 {
+		t.Fatalf("expected active root plus %d terminal roots, got %d", maxTerminalRootRuns, len(m.status.rootRunIDs))
+	}
+	if _, ok := m.status.nodes["done-00"]; ok {
+		t.Fatal("expected oldest terminal root to be pruned")
+	}
+	if _, ok := m.status.nodes["active-root"]; !ok {
+		t.Fatal("expected active root to be retained")
+	}
+}
+
+func TestApplyStatusEventPrunesOldTerminalChildren(t *testing.T) {
+	m := newTestModel(t)
+	base := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "root",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: base,
+	})
+	for i := 0; i < maxTerminalChildren+3; i++ {
+		m.applyStatusEvent(domain.ExecutionEvent{
+			RunID:       fmt.Sprintf("done-child-%02d", i),
+			ParentRunID: "root",
+			AgentID:     "coder",
+			Type:        "agent_completed",
+			Timestamp:   base.Add(time.Duration(i+1) * time.Second),
+		})
+	}
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "active-child",
+		ParentRunID: "root",
+		AgentID:     "reviewer",
+		Type:        "tool_called",
+		Timestamp:   base.Add(100 * time.Second),
+	})
+
+	children := m.status.children["root"]
+	if len(children) != maxTerminalChildren+1 {
+		t.Fatalf("expected active child plus %d terminal children, got %d", maxTerminalChildren, len(children))
+	}
+	if _, ok := m.status.nodes["done-child-00"]; ok {
+		t.Fatal("expected oldest terminal child to be pruned")
+	}
+	if _, ok := m.status.nodes["active-child"]; !ok {
+		t.Fatal("expected active child to be retained")
+	}
+}
+
+func TestApplyStatusEventSummarizesJSONDetail(t *testing.T) {
+	m := newTestModel(t)
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "root",
+		AgentID:   "manager",
+		Type:      "tool_called",
+		Timestamp: time.Now(),
+		Detail:    `{"status":"ok","path":"internal/tui/model.go","count":12}`,
+	})
+	detail := m.status.nodes["root"].Detail
+	if strings.Contains(detail, `{"status"`) {
+		t.Fatalf("expected JSON detail to be summarized, got %q", detail)
+	}
+	if !strings.Contains(detail, "status=ok") || !strings.Contains(detail, "path=internal/tui/model.go") {
+		t.Fatalf("expected summarized detail, got %q", detail)
 	}
 }
 

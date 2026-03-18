@@ -6,10 +6,20 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
+
+const (
+	pathCompletionDebounceInterval = 120 * time.Millisecond
+	pathCompletionCacheTTL         = time.Second
+	maxPathCompletionCacheDirs     = 16
+)
+
+var readDirEntries = os.ReadDir
 
 type completionKind string
 
@@ -34,15 +44,85 @@ type completionContext struct {
 	candidates []completionCandidate
 }
 
-func (m model) hasCompletionCandidates() bool {
-	ctx := m.activeCompletion()
-	return ctx != nil && len(ctx.candidates) > 0
+type completionState struct {
+	ctx          *completionContext
+	rendered     string
+	height       int
+	pendingSeq   int
+	nextSeq      int
+	pendingToken string
+	pendingDir   string
+	pathDirs     map[string]pathDirSnapshot
 }
 
-func (m *model) applyCompletion() {
-	ctx := m.activeCompletion()
+type pathCompletionDebounceMsg struct {
+	seq int
+}
+
+type pathCompletionQuery struct {
+	start        int
+	end          int
+	token        string
+	rawDirPart   string
+	fragment     string
+	absSearchDir string
+}
+
+type pathDirSnapshot struct {
+	loadedAt time.Time
+	entries  []pathDirEntry
+}
+
+type pathDirEntry struct {
+	name  string
+	isDir bool
+}
+
+func pathCompletionDebounceCmd(seq int) tea.Cmd {
+	return tea.Tick(pathCompletionDebounceInterval, func(time.Time) tea.Msg {
+		return pathCompletionDebounceMsg{seq: seq}
+	})
+}
+
+func batchCmds(cmds ...tea.Cmd) tea.Cmd {
+	filtered := make([]tea.Cmd, 0, len(cmds))
+	for _, cmd := range cmds {
+		if cmd != nil {
+			filtered = append(filtered, cmd)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	default:
+		return tea.Batch(filtered...)
+	}
+}
+
+func (m *model) syncAfterComposerChange(immediatePath bool) tea.Cmd {
+	m.composerCache.dirty = true
+	cmd := m.refreshCompletionState(immediatePath)
+	m.syncLayout()
+	return cmd
+}
+
+func (m *model) resetComposerAndSync() tea.Cmd {
+	m.textarea.Reset()
+	m.reconcileSelectedRefs()
+	return m.syncAfterComposerChange(false)
+}
+
+func (m model) hasCompletionCandidates() bool {
+	return m.completion.ctx != nil && len(m.completion.ctx.candidates) > 0
+}
+
+func (m *model) applyCompletion() tea.Cmd {
+	_ = m.refreshCompletionState(true)
+	ctx := m.completion.ctx
 	if ctx == nil || len(ctx.candidates) == 0 {
-		return
+		return nil
 	}
 
 	replacement := ctx.token
@@ -62,7 +142,7 @@ func (m *model) applyCompletion() {
 	}
 
 	if replacement == ctx.token {
-		return
+		return nil
 	}
 
 	m.textarea.SetValue(replaceRuneRange(m.textarea.Value(), ctx.start, ctx.end, replacement))
@@ -70,43 +150,15 @@ func (m *model) applyCompletion() {
 		m.selectedRefs[replacement] = normalized
 	}
 	m.reconcileSelectedRefs()
-	m.syncLayout()
+	return m.syncAfterComposerChange(true)
 }
 
 func (m model) renderCompletionSuggestions() string {
-	ctx := m.activeCompletion()
-	if ctx == nil || len(ctx.candidates) == 0 {
-		return ""
-	}
-
-	hint := "候補: Tab で補完"
-	if ctx.kind == completionKindPath {
-		hint = "パス候補: Tab で補完"
-	}
-
-	lines := make([]string, 0, len(ctx.candidates)+1)
-	lines = append(lines, m.styles.commandHint.Render(hint))
-	for index, candidate := range ctx.candidates {
-		label := candidate.display
-		if candidate.description != "" {
-			label = fmt.Sprintf("%s  %s", label, candidate.description)
-		}
-		if index == 0 {
-			lines = append(lines, m.styles.commandSelected.Render(label))
-			continue
-		}
-		lines = append(lines, m.styles.commandCandidate.Render(label))
-	}
-
-	return strings.Join(lines, "\n")
+	return m.completion.rendered
 }
 
 func (m model) completionSuggestionsHeight() int {
-	suggestions := m.renderCompletionSuggestions()
-	if suggestions == "" {
-		return 0
-	}
-	return lipgloss.Height(suggestions)
+	return m.completion.height
 }
 
 func (m model) activeCompletion() *completionContext {
@@ -146,6 +198,252 @@ func (m model) activeSlashCompletion() *completionContext {
 }
 
 func (m model) activePathCompletion() *completionContext {
+	query := m.currentPathCompletionQuery()
+	if query == nil {
+		return nil
+	}
+
+	candidates := resolvePathCandidatesAt(query.rawDirPart, query.fragment, query.absSearchDir)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	return &completionContext{
+		kind:       completionKindPath,
+		start:      query.start,
+		end:        query.end,
+		token:      query.token,
+		candidates: candidates,
+	}
+}
+
+func (m *model) refreshCompletionState(immediatePath bool) tea.Cmd {
+	if ctx := m.activeSlashCompletion(); ctx != nil {
+		m.cancelPendingPathCompletion()
+		m.setCompletionContext(ctx)
+		return nil
+	}
+
+	if !strings.Contains(m.textarea.Value(), "@") {
+		m.cancelPendingPathCompletion()
+		m.setCompletionContext(nil)
+		return nil
+	}
+
+	query := m.currentPathCompletionQuery()
+	if query == nil {
+		m.cancelPendingPathCompletion()
+		m.setCompletionContext(nil)
+		return nil
+	}
+
+	if ctx, resolved := m.resolvePathCompletionQuery(query, immediatePath); resolved {
+		m.cancelPendingPathCompletion()
+		m.setCompletionContext(ctx)
+		return nil
+	}
+
+	m.setCompletionContext(nil)
+	if m.completion.pendingSeq != 0 && m.completion.pendingToken == query.token && m.completion.pendingDir == query.absSearchDir {
+		return nil
+	}
+
+	m.completion.nextSeq++
+	m.completion.pendingSeq = m.completion.nextSeq
+	m.completion.pendingToken = query.token
+	m.completion.pendingDir = query.absSearchDir
+	return pathCompletionDebounceCmd(m.completion.pendingSeq)
+}
+
+func (m *model) cancelPendingPathCompletion() {
+	m.completion.pendingSeq = 0
+	m.completion.pendingToken = ""
+	m.completion.pendingDir = ""
+}
+
+func (m *model) setCompletionContext(ctx *completionContext) {
+	m.completion.ctx = ctx
+	if ctx == nil || len(ctx.candidates) == 0 {
+		m.completion.rendered = ""
+		m.completion.height = 0
+		m.completionCache.dirty = false
+		return
+	}
+
+	m.completion.rendered = renderCompletionSuggestionsForContext(m.styles, ctx)
+	m.completion.height = lipgloss.Height(m.completion.rendered)
+	m.completionCache.dirty = false
+}
+
+func renderCompletionSuggestionsForContext(styles styles, ctx *completionContext) string {
+	if ctx == nil || len(ctx.candidates) == 0 {
+		return ""
+	}
+
+	hint := "候補: Tab で補完"
+	if ctx.kind == completionKindPath {
+		hint = "パス候補: Tab で補完"
+	}
+
+	lines := make([]string, 0, len(ctx.candidates)+1)
+	lines = append(lines, styles.commandHint.Render(hint))
+	for index, candidate := range ctx.candidates {
+		label := candidate.display
+		if candidate.description != "" {
+			label = fmt.Sprintf("%s  %s", label, candidate.description)
+		}
+		if index == 0 {
+			lines = append(lines, styles.commandSelected.Render(label))
+			continue
+		}
+		lines = append(lines, styles.commandCandidate.Render(label))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) resolvePathCompletionQuery(query *pathCompletionQuery, allowRead bool) (*completionContext, bool) {
+	snapshot, resolved := m.pathDirectorySnapshot(query.absSearchDir, allowRead)
+	if !resolved {
+		return nil, false
+	}
+
+	candidates := resolvePathCandidatesFromSnapshot(query.rawDirPart, query.fragment, snapshot.entries)
+	if len(candidates) == 0 {
+		return nil, true
+	}
+
+	return &completionContext{
+		kind:       completionKindPath,
+		start:      query.start,
+		end:        query.end,
+		token:      query.token,
+		candidates: candidates,
+	}, true
+}
+
+func (m *model) pathDirectorySnapshot(absSearchDir string, allowRead bool) (pathDirSnapshot, bool) {
+	if snapshot, ok := m.completion.pathDirs[absSearchDir]; ok && time.Since(snapshot.loadedAt) <= pathCompletionCacheTTL {
+		return snapshot, true
+	}
+	if !allowRead {
+		return pathDirSnapshot{}, false
+	}
+
+	entries, err := readDirEntries(absSearchDir)
+	if err != nil {
+		delete(m.completion.pathDirs, absSearchDir)
+		return pathDirSnapshot{}, true
+	}
+
+	snapshot := pathDirSnapshot{
+		loadedAt: time.Now(),
+		entries:  snapshotPathEntries(entries),
+	}
+	m.completion.pathDirs[absSearchDir] = snapshot
+	m.prunePathDirectorySnapshots()
+	return snapshot, true
+}
+
+func (m *model) prunePathDirectorySnapshots() {
+	if len(m.completion.pathDirs) <= maxPathCompletionCacheDirs {
+		return
+	}
+
+	type snapshotMeta struct {
+		dir      string
+		loadedAt time.Time
+	}
+	metas := make([]snapshotMeta, 0, len(m.completion.pathDirs))
+	for dir, snapshot := range m.completion.pathDirs {
+		metas = append(metas, snapshotMeta{dir: dir, loadedAt: snapshot.loadedAt})
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].loadedAt.Before(metas[j].loadedAt)
+	})
+	for len(metas) > maxPathCompletionCacheDirs {
+		delete(m.completion.pathDirs, metas[0].dir)
+		metas = metas[1:]
+	}
+}
+
+func snapshotPathEntries(entries []os.DirEntry) []pathDirEntry {
+	snapshots := make([]pathDirEntry, 0, len(entries))
+	for _, entry := range entries {
+		snapshots = append(snapshots, pathDirEntry{
+			name:  entry.Name(),
+			isDir: entry.IsDir(),
+		})
+	}
+	return snapshots
+}
+
+func resolvePathCandidates(workingDir, token string) []completionCandidate {
+	if workingDir == "" {
+		return nil
+	}
+
+	pathExpr := strings.TrimPrefix(token, "@")
+	if strings.Contains(pathExpr, "..") {
+		return nil
+	}
+
+	rawDirPart, fragment := splitPathExpression(pathExpr)
+	searchDir := "."
+	if rawDirPart != "" {
+		searchDir = strings.TrimSuffix(rawDirPart, "/")
+	}
+
+	absSearchDir := filepath.Clean(filepath.Join(workingDir, filepath.FromSlash(searchDir)))
+	if !isWithinRoot(workingDir, absSearchDir) {
+		return nil
+	}
+
+	return resolvePathCandidatesAt(rawDirPart, fragment, absSearchDir)
+}
+
+func resolvePathCandidatesAt(rawDirPart, fragment, absSearchDir string) []completionCandidate {
+	entries, err := readDirEntries(absSearchDir)
+	if err != nil {
+		return nil
+	}
+	return resolvePathCandidatesFromSnapshot(rawDirPart, fragment, snapshotPathEntries(entries))
+}
+
+func resolvePathCandidatesFromSnapshot(rawDirPart, fragment string, entries []pathDirEntry) []completionCandidate {
+	filtered := make([]completionCandidate, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.HasPrefix(strings.ToLower(entry.name), strings.ToLower(fragment)) {
+			continue
+		}
+
+		replacement := rawDirPart + entry.name
+		display := replacement
+		if entry.isDir {
+			replacement += "/"
+			display += "/"
+		}
+
+		filtered = append(filtered, completionCandidate{
+			value:      "@" + filepath.ToSlash(replacement),
+			normalized: filepath.ToSlash(replacement),
+			display:    filepath.ToSlash(display),
+			isDir:      entry.isDir,
+		})
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].isDir != filtered[j].isDir {
+			return filtered[i].isDir
+		}
+		return strings.ToLower(filtered[i].display) < strings.ToLower(filtered[j].display)
+	})
+	return filtered
+}
+
+func (m model) currentPathCompletionQuery() *pathCompletionQuery {
+	if m.workingDir == "" {
+		return nil
+	}
 	start, end, token, ok := m.currentTokenBounds()
 	if !ok || !strings.HasPrefix(token, "@") {
 		return nil
@@ -154,17 +452,29 @@ func (m model) activePathCompletion() *completionContext {
 		return nil
 	}
 
-	candidates := resolvePathCandidates(m.workingDir, token)
-	if len(candidates) == 0 {
+	pathExpr := strings.TrimPrefix(token, "@")
+	if strings.Contains(pathExpr, "..") {
 		return nil
 	}
 
-	return &completionContext{
-		kind:       completionKindPath,
-		start:      start,
-		end:        end,
-		token:      token,
-		candidates: candidates,
+	rawDirPart, fragment := splitPathExpression(pathExpr)
+	searchDir := "."
+	if rawDirPart != "" {
+		searchDir = strings.TrimSuffix(rawDirPart, "/")
+	}
+
+	absSearchDir := filepath.Clean(filepath.Join(m.workingDir, filepath.FromSlash(searchDir)))
+	if !isWithinRoot(m.workingDir, absSearchDir) {
+		return nil
+	}
+
+	return &pathCompletionQuery{
+		start:        start,
+		end:          end,
+		token:        token,
+		rawDirPart:   rawDirPart,
+		fragment:     fragment,
+		absSearchDir: absSearchDir,
 	}
 }
 
@@ -214,63 +524,6 @@ func (m model) cursorRuneIndex() int {
 		index += len([]rune(lines[i])) + 1
 	}
 	return index + m.textarea.LineInfo().CharOffset
-}
-
-func resolvePathCandidates(workingDir, token string) []completionCandidate {
-	if workingDir == "" {
-		return nil
-	}
-
-	pathExpr := strings.TrimPrefix(token, "@")
-	if strings.Contains(pathExpr, "..") {
-		return nil
-	}
-
-	rawDirPart, fragment := splitPathExpression(pathExpr)
-	searchDir := "."
-	if rawDirPart != "" {
-		searchDir = strings.TrimSuffix(rawDirPart, "/")
-	}
-
-	absSearchDir := filepath.Clean(filepath.Join(workingDir, filepath.FromSlash(searchDir)))
-	if !isWithinRoot(workingDir, absSearchDir) {
-		return nil
-	}
-
-	entries, err := os.ReadDir(absSearchDir)
-	if err != nil {
-		return nil
-	}
-
-	filtered := make([]completionCandidate, 0, len(entries))
-	for _, entry := range entries {
-		if !strings.HasPrefix(strings.ToLower(entry.Name()), strings.ToLower(fragment)) {
-			continue
-		}
-
-		replacement := rawDirPart + entry.Name()
-		display := replacement
-		if entry.IsDir() {
-			replacement += "/"
-			display += "/"
-		}
-
-		filtered = append(filtered, completionCandidate{
-			value:      "@" + filepath.ToSlash(replacement),
-			normalized: filepath.ToSlash(replacement),
-			display:    filepath.ToSlash(display),
-			isDir:      entry.IsDir(),
-		})
-	}
-
-	sort.Slice(filtered, func(i, j int) bool {
-		if filtered[i].isDir != filtered[j].isDir {
-			return filtered[i].isDir
-		}
-		return strings.ToLower(filtered[i].display) < strings.ToLower(filtered[j].display)
-	})
-
-	return filtered
 }
 
 func splitPathExpression(expr string) (string, string) {
