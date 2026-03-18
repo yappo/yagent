@@ -135,6 +135,58 @@ func TestListToolIncludesMCPBindingState(t *testing.T) {
 	if !strings.Contains(result.Output, "\"bind_required\": true") || !strings.Contains(result.Output, "\"bound\": true") {
 		t.Fatalf("expected bind metadata, got %s", result.Output)
 	}
+	if !strings.Contains(result.Output, "\"bind_hint\":") || !strings.Contains(result.Output, "\"usage_hint\":") || !strings.Contains(result.Output, "\"exposed_tool_prefix\": \"docs\"") {
+		t.Fatalf("expected MCP hints, got %s", result.Output)
+	}
+	if !strings.Contains(result.Output, "\"exposed_tools\": [") || !strings.Contains(result.Output, "\"mcp__docs\"") {
+		t.Fatalf("expected bind metadata, got %s", result.Output)
+	}
+}
+
+func TestBindToolReturnsExposedToolNamesAndNextActionHint(t *testing.T) {
+	var bindings *fakeBindings
+	bindings = &fakeBindings{
+		bind: func(_ context.Context, task domain.TaskDefinition) ([]domain.MCPToolDescriptor, error) {
+			bindings.tools = []domain.BoundMCPTool{{
+				TaskID:        task.ID,
+				QualifiedName: "mcp__docs__search_docs__docs",
+			}}
+			return []domain.MCPToolDescriptor{{
+				Name: "search_docs",
+			}}, nil
+		},
+	}
+	tool := NewBindTool(fakeCatalog{items: map[string]domain.TaskDefinition{
+		"docs": {
+			ID:          "docs",
+			Description: "Docs MCP",
+			Kind:        domain.TaskSpecKindMCPServer,
+			MCPServer: &domain.MCPServerSpec{
+				ToolPrefix: "docs",
+			},
+		},
+	}}, bindings, nil, nil)
+
+	result := tool.Execute(context.Background(), domain.ToolCall{
+		ID:        "1",
+		Name:      "task_bind",
+		Arguments: map[string]any{"task_id": "docs"},
+	})
+	if !result.Success {
+		t.Fatalf("expected success, got %s", result.Output)
+	}
+	for _, fragment := range []string{
+		"\"tool_names\": [",
+		"\"mcp__docs__search_docs__docs\"",
+		"\"server_tool_names\": [",
+		"\"search_docs\"",
+		"\"next_action_hint\":",
+		"\"Use one of tool_names directly in your next tool call.\"",
+	} {
+		if !strings.Contains(result.Output, fragment) {
+			t.Fatalf("expected bind output to contain %q, got %s", fragment, result.Output)
+		}
+	}
 }
 
 type nilPolicyEngine struct{}

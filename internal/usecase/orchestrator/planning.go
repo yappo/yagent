@@ -340,6 +340,12 @@ func buildInvocationInstructions(base string, context domain.RunContext) string 
 	}
 	sections = append(sections, strings.Join(lines, "\n"))
 
+	if context.ToolState.CurrentAgentID != "" {
+		sections = append(sections, "Tool state:\n"+prettyJSON(context.ToolState))
+	}
+	if hints := toolWorkflowHints(context.ToolState); len(hints) > 0 {
+		sections = append(sections, "Workflow hints:\n- "+strings.Join(hints, "\n- "))
+	}
 	if len(context.ExpectedOutput) > 0 {
 		sections = append(sections, "Expected output contract:\n"+prettyJSON(context.ExpectedOutput))
 	}
@@ -347,6 +353,23 @@ func buildInvocationInstructions(base string, context domain.RunContext) string 
 		sections = append(sections, "Agent inventory:\n"+prettyJSON(context.AgentInventory))
 	}
 	return strings.Join(sections, "\n\n")
+}
+
+func toolWorkflowHints(state domain.ToolState) []string {
+	hints := []string{}
+	if state.TaskDiscoveryAvailable && state.MCPToolsLazyBind {
+		hints = append(hints, `No visible mcp__* tools does not necessarily mean MCP is unavailable. If MCP seems relevant, call task_list, inspect kind="mcp_server", and bind a relevant unbound server before concluding MCP cannot be used.`)
+	}
+	if state.MCPBindingAvailable {
+		hints = append(hints, "After task_bind succeeds, use the returned tool_names directly on your next tool call.")
+	}
+	if len(state.VisibleWriteTools) > 0 {
+		hints = append(hints, "If file edits are needed and fs_write is visible, use fs_write instead of claiming no write tool exists.")
+	}
+	if state.ReadOnly {
+		hints = append(hints, "This agent is read-only. If file writes are required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist.")
+	}
+	return hints
 }
 
 func parseExecutionPlan(content string) (*domain.ExecutionPlan, error) {

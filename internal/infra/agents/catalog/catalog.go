@@ -188,7 +188,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			ID:              "manager",
 			Name:            "Manager",
 			Description:     "ユーザー窓口として委譲と最終応答を担当します。",
-			Instruction:     "You are the manager agent. Delegate research, testing, review, and implementation tasks when helpful. Keep the final response concise and grounded in available tool and agent results.",
+			Instruction:     builtInInstruction("You are the manager agent. Delegate research, testing, review, and implementation tasks when helpful. Keep the final response concise and grounded in available tool and agent results."),
 			Mode:            domain.AgentModeManager,
 			AllowedTools:    []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
 			RoutingProfile:  "strong",
@@ -210,7 +210,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			ID:              "planner",
 			Name:            "Planner",
 			Description:     "タスク分解を担当します。",
-			Instruction:     "Break the task into a practical plan with explicit constraints and deliverables. Do not delegate to coder for simple repository inspection tasks. Prefer direct read-only tools such as fs_list and fs_read.",
+			Instruction:     builtInInstruction("Break the task into a practical plan with explicit constraints and deliverables. Do not delegate to coder for simple repository inspection tasks. Prefer direct read-only tools such as fs_list and fs_read."),
 			Mode:            domain.AgentModeTool,
 			ReadOnly:        true,
 			RoutingProfile:  "fast",
@@ -227,7 +227,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			ID:              "researcher",
 			Name:            "Researcher",
 			Description:     "関連ファイルの探索と要点抽出を担当します。",
-			Instruction:     "Inspect available context and files, then return only the most relevant findings. Prefer fs_list and fs_read instead of asking another agent to write scripts.",
+			Instruction:     builtInInstruction("Inspect available context and files, then return only the most relevant findings. Prefer fs_list and fs_read instead of asking another agent to write scripts."),
 			Mode:            domain.AgentModeTool,
 			ReadOnly:        true,
 			RoutingProfile:  "fast",
@@ -244,7 +244,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			ID:                 "coder",
 			Name:               "Coder",
 			Description:        "実装ターンを主担当します。",
-			Instruction:        "Implement the requested change directly when enough context is available. Prefer precise file edits and mention verification status. Do not delegate planning back to planner when the task is already an implementation handoff.",
+			Instruction:        builtInInstruction("Implement the requested change directly when enough context is available. Prefer precise file edits and mention verification status. Do not delegate planning back to planner when the task is already an implementation handoff."),
 			Mode:               domain.AgentModeHandoff,
 			RoutingProfile:     "strong",
 			VerificationPolicy: domain.VerificationPolicy{Required: true, MaxAttempts: 2},
@@ -261,7 +261,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			ID:              "tester",
 			Name:            "Tester",
 			Description:     "検証と要約を担当します。",
-			Instruction:     "Verify behavior using available read-only context and report any validation gaps clearly.",
+			Instruction:     builtInInstruction("Verify behavior using available read-only context and report any validation gaps clearly."),
 			Mode:            domain.AgentModeTool,
 			ReadOnly:        true,
 			RoutingProfile:  "fast",
@@ -278,7 +278,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			ID:              "reviewer",
 			Name:            "Reviewer",
 			Description:     "リスクと回帰確認を担当します。",
-			Instruction:     "Review changes for bugs, regressions, and missing tests. Focus on findings first.",
+			Instruction:     builtInInstruction("Review changes for bugs, regressions, and missing tests. Focus on findings first."),
 			Mode:            domain.AgentModeTool,
 			ReadOnly:        true,
 			RoutingProfile:  "strong",
@@ -292,6 +292,15 @@ func builtInAgents() map[string]domain.AgentSpec {
 			BuiltIn:         true,
 		},
 	}
+}
+
+func builtInInstruction(base string) string {
+	guidance := strings.TrimSpace(`Visible tools are not the whole world. If MCP may help and no relevant mcp__* tool is visible, call task_list first, inspect kind="mcp_server", and bind a relevant unbound server with task_bind(task_id=...). After task_bind succeeds, use the returned tool_names directly. Do not say MCP is unavailable before checking task_list and trying a relevant bind. If file edits are needed and fs_write is visible, use fs_write. If this agent is read-only and write work is required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist.`)
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return guidance
+	}
+	return base + "\n\n" + guidance
 }
 
 func applyOverride(spec domain.AgentSpec, override config.AgentOverride) domain.AgentSpec {

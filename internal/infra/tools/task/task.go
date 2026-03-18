@@ -98,22 +98,26 @@ func (t *bindTool) Definition() domain.ToolDefinition {
 func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
 	items := t.catalog.List(ctx)
 	type taskInfo struct {
-		ID           string   `json:"id"`
-		Description  string   `json:"description"`
-		Kind         string   `json:"kind"`
-		Command      string   `json:"command,omitempty"`
-		Args         []string `json:"args,omitempty"`
-		Cwd          string   `json:"cwd,omitempty"`
-		Risk         string   `json:"risk,omitempty"`
-		AllowNetwork bool     `json:"allow_network"`
-		BindRequired bool     `json:"bind_required"`
-		Bound        bool     `json:"bound"`
-		Source       string   `json:"source,omitempty"`
+		ID                string   `json:"id"`
+		Description       string   `json:"description"`
+		Kind              string   `json:"kind"`
+		Command           string   `json:"command,omitempty"`
+		Args              []string `json:"args,omitempty"`
+		Cwd               string   `json:"cwd,omitempty"`
+		Risk              string   `json:"risk,omitempty"`
+		AllowNetwork      bool     `json:"allow_network"`
+		BindRequired      bool     `json:"bind_required"`
+		Bound             bool     `json:"bound"`
+		UsageHint         string   `json:"usage_hint,omitempty"`
+		BindHint          string   `json:"bind_hint,omitempty"`
+		ExposedToolPrefix string   `json:"exposed_tool_prefix,omitempty"`
+		ExposedTools      []string `json:"exposed_tools,omitempty"`
+		Source            string   `json:"source,omitempty"`
 	}
-	bound := map[string]struct{}{}
+	bound := map[string][]string{}
 	if t.bindings != nil {
 		for _, item := range t.bindings.BoundTools() {
-			bound[item.TaskID] = struct{}{}
+			bound[item.TaskID] = append(bound[item.TaskID], item.QualifiedName)
 		}
 	}
 	result := make([]taskInfo, 0, len(items))
@@ -124,7 +128,8 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 			Kind:        string(item.Kind),
 			Source:      item.Source,
 		}
-		_, info.Bound = bound[item.ID]
+		info.ExposedTools = append(info.ExposedTools, bound[item.ID]...)
+		info.Bound = len(info.ExposedTools) > 0
 		switch item.Kind {
 		case domain.TaskSpecKindCommand:
 			if item.Command != nil {
@@ -136,6 +141,9 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 			}
 		case domain.TaskSpecKindMCPServer:
 			info.BindRequired = true
+			info.ExposedToolPrefix = exposedToolPrefix(item)
+			info.UsageHint = "MCP tools are exposed lazily. Check task_list first, then bind a relevant server before concluding MCP is unavailable."
+			info.BindHint = fmt.Sprintf("If this MCP server is relevant and not bound yet, call task_bind with task_id=%q.", item.ID)
 			if item.MCPServer != nil {
 				info.Command = item.MCPServer.Command
 				info.Args = append([]string(nil), item.MCPServer.Args...)
@@ -222,15 +230,19 @@ func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 	if err != nil {
 		return failure(call, err.Error())
 	}
+	exposedToolNames := boundToolNamesForTask(t.bindings, taskDef.ID)
 	result := map[string]any{
-		"task_id":     taskDef.ID,
-		"kind":        taskDef.Kind,
-		"tool_count":  len(tools),
-		"tool_names":  toolNames(tools),
-		"description": taskDef.Description,
-		"bound_tools": len(t.bindings.BoundTools()),
-		"bind_status": "ready",
-		"source":      taskDef.Source,
+		"task_id":             taskDef.ID,
+		"kind":                taskDef.Kind,
+		"tool_count":          len(exposedToolNames),
+		"tool_names":          exposedToolNames,
+		"server_tool_names":   toolNames(tools),
+		"description":         taskDef.Description,
+		"bound_tools":         len(t.bindings.BoundTools()),
+		"bind_status":         "ready",
+		"next_action_hint":    "Use one of tool_names directly in your next tool call.",
+		"exposed_tool_prefix": exposedToolPrefix(taskDef),
+		"source":              taskDef.Source,
 	}
 	return marshalSuccess(call, result)
 }
@@ -308,4 +320,25 @@ func toolNames(items []domain.MCPToolDescriptor) []string {
 		result = append(result, item.Name)
 	}
 	return result
+}
+
+func boundToolNamesForTask(bindings domain.MCPConnectionManager, taskID string) []string {
+	if bindings == nil {
+		return nil
+	}
+	names := []string{}
+	for _, item := range bindings.BoundTools() {
+		if item.TaskID != taskID {
+			continue
+		}
+		names = append(names, item.QualifiedName)
+	}
+	return names
+}
+
+func exposedToolPrefix(task domain.TaskDefinition) string {
+	if task.MCPServer == nil || task.MCPServer.ToolPrefix == "" {
+		return task.ID
+	}
+	return task.MCPServer.ToolPrefix
 }
