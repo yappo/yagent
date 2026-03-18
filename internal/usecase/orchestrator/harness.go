@@ -295,7 +295,10 @@ func (s *Service) buildContext(run *domain.RunState, agent domain.AgentSpec, pha
 	if run != nil {
 		enabledCapabilities = append(enabledCapabilities, run.EnabledCapabilities...)
 	}
-	visible := s.visibleToolDefinitions(agent, enabledCapabilities)
+	allTools := s.toolDefinitionsForAgent(agent)
+	visible := visibleTools(agent, allTools, newAgentSession(domain.AgentInvocation{
+		Context: domain.RunContext{EnabledCapabilities: enabledCapabilities},
+	}))
 	if s.config.ContextEngine == nil {
 		userGoal := latestUserMessage(messages)
 		if run != nil && strings.TrimSpace(run.UserGoal) != "" {
@@ -310,11 +313,11 @@ func (s *Service) buildContext(run *domain.RunState, agent domain.AgentSpec, pha
 			RecentSummary:      userGoal,
 			AvailableToolNames: toolNames(visible),
 		}
-		contextPack.ToolState = buildToolState(agent, visible)
+		contextPack.ToolState = buildToolState(agent, allTools, visible)
 		return contextPack
 	}
 	contextPack := s.config.ContextEngine.Build(run, agent, phase, messages, visible)
-	contextPack.ToolState = buildToolState(agent, visible)
+	contextPack.ToolState = buildToolState(agent, allTools, visible)
 	return contextPack
 }
 
@@ -322,17 +325,17 @@ func (s *Service) buildContextForInvocation(parent domain.AgentInvocation, agent
 	contextPack := parent.Context
 	contextPack.CurrentPhase = phase
 	contextPack.TaskBrief = stringArg(call.Arguments, "task")
-	visible := s.visibleToolDefinitions(agent, contextPack.EnabledCapabilities)
+	allTools := s.toolDefinitionsForAgent(agent)
+	visible := visibleTools(agent, allTools, newAgentSession(domain.AgentInvocation{
+		Context: domain.RunContext{EnabledCapabilities: contextPack.EnabledCapabilities},
+	}))
 	contextPack.AvailableToolNames = toolNames(visible)
-	contextPack.ToolState = buildToolState(agent, visible)
+	contextPack.ToolState = buildToolState(agent, allTools, visible)
 	return contextPack
 }
 
-func (s *Service) visibleToolDefinitions(agent domain.AgentSpec, enabledCapabilities []string) []domain.ToolDefinition {
-	allTools := append(s.tools.Definitions(agent), s.agentToolDefinitions(agent)...)
-	return visibleTools(agent, allTools, newAgentSession(domain.AgentInvocation{
-		Context: domain.RunContext{EnabledCapabilities: enabledCapabilities},
-	}))
+func (s *Service) toolDefinitionsForAgent(agent domain.AgentSpec) []domain.ToolDefinition {
+	return append(s.tools.Definitions(agent), s.agentToolDefinitions(agent)...)
 }
 
 func phaseMessages(base []domain.Message, additions ...string) []domain.Message {

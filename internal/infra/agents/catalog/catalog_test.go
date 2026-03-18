@@ -35,6 +35,8 @@ func TestBuiltInAgentsIncludeToolDiscoveryGuidance(t *testing.T) {
 		"task_bind(task_id=...)",
 		"use the returned tool_names directly",
 		"fs_write is visible",
+		"use enable_capability",
+		"approval dialog automatically",
 		"delegate or handoff to a write-capable agent",
 	} {
 		if !strings.Contains(planner.Instruction, fragment) {

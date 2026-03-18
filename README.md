@@ -227,6 +227,8 @@ built-in agent には、tool discovery workflow に関する共通 instruction �
 - MCP が必要そうなら、まず `task_list` で `kind = "mcp_server"` の entry を確認する
 - relevant な server が未 bind なら `task_bind(task_id=...)` を呼ぶ
 - bind 成功後は返却された `tool_names` をそのまま使う
+- write-capable agent で write tool がまだ見えていないときは、通常の返答で許可を求めるのではなく `enable_capability` を使ってから write tool を呼ぶ
+- write tool 実行時の承認は会話ではなく approval dialog で行われる
 - 現在の agent が read-only で write が必要なときは、write-capable agent に delegate / handoff する
 
 user-defined agent は 1 ファイルにつき 1 agent を定義します。最小例は次です。
@@ -260,6 +262,7 @@ verification_max_attempts = 2
 - `allowed_tools`: その agent が使ってよい tool 一覧
 - `read_only`: 読み取り専用 agent として扱いたいときに指定
 - `read_only = true` の agent は write tool を新たに得るわけではありません。ファイル変更が必要なときは write-capable agent へ委譲する前提です
+- write-capable agent でも `fs_write` / `patch_apply` などは capability gating により最初は hidden のことがあります。その場合は `enable_capability` を経由して visible にしてから実行します
 - `model`: その agent だけ別 model を使いたいときに指定
 - `max_turns`: その agent の最大継続ターン数
 - `timeout`: その agent の LLM 呼び出し timeout
@@ -532,6 +535,8 @@ internal/
 
 Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。  
 MCP まわりでは、visible な `mcp__*` が空でも `task_list` / `task_bind` による lazy-bind が使える場合があります。  
+write-capable agent で write tool が hidden な場合は `enable_capability` を使って visible にしてから実行します。  
+その後の書き込み承認は通常の assistant 返答ではなく approval dialog で行われます。  
 一方で write tool が見えない理由が current agent の read-only 制約である場合は、「tool が存在しない」のではなく write-capable agent へ委譲すべきケースです。
 
 ## 開発

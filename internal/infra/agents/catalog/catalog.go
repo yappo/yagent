@@ -295,7 +295,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 }
 
 func builtInInstruction(base string) string {
-	guidance := strings.TrimSpace(`Visible tools are not the whole world. If MCP may help and no relevant mcp__* tool is visible, call task_list first, inspect kind="mcp_server", and bind a relevant unbound server with task_bind(task_id=...). After task_bind succeeds, use the returned tool_names directly. Do not say MCP is unavailable before checking task_list and trying a relevant bind. If file edits are needed and fs_write is visible, use fs_write. If this agent is read-only and write work is required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist.`)
+	guidance := strings.TrimSpace(`Visible tools are not the whole world. If MCP may help and no relevant mcp__* tool is visible, call task_list first, inspect kind="mcp_server", and bind a relevant unbound server with task_bind(task_id=...). After task_bind succeeds, use the returned tool_names directly. Do not say MCP is unavailable before checking task_list and trying a relevant bind. If file edits are needed and fs_write is visible, use fs_write. If this agent can write but write tools are currently hidden, use enable_capability and then call the write tool directly. Do not ask the user in a normal assistant reply to grant file_write_allowed or write permission; running the write tool should trigger the approval dialog automatically. If this agent is read-only and write work is required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist.`)
 	base = strings.TrimSpace(base)
 	if base == "" {
 		return guidance

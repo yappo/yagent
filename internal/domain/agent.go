@@ -89,14 +89,16 @@ type AgentSpec struct {
 }
 
 type ToolState struct {
-	CurrentAgentID         string   `json:"current_agent_id"`
-	ReadOnly               bool     `json:"read_only"`
-	FileWriteAllowed       bool     `json:"file_write_allowed"`
-	VisibleWriteTools      []string `json:"visible_write_tools,omitempty"`
-	VisibleMCPTools        []string `json:"visible_mcp_tools,omitempty"`
-	TaskDiscoveryAvailable bool     `json:"task_discovery_available"`
-	MCPBindingAvailable    bool     `json:"mcp_binding_available"`
-	MCPToolsLazyBind       bool     `json:"mcp_tools_lazy_bind"`
+	CurrentAgentID           string   `json:"current_agent_id"`
+	ReadOnly                 bool     `json:"read_only"`
+	FileWriteAllowed         bool     `json:"file_write_allowed"`
+	WriteCapabilityAvailable bool     `json:"write_capability_available"`
+	HiddenWriteCapabilities  []string `json:"hidden_write_capabilities,omitempty"`
+	VisibleWriteTools        []string `json:"visible_write_tools,omitempty"`
+	VisibleMCPTools          []string `json:"visible_mcp_tools,omitempty"`
+	TaskDiscoveryAvailable   bool     `json:"task_discovery_available"`
+	MCPBindingAvailable      bool     `json:"mcp_binding_available"`
+	MCPToolsLazyBind         bool     `json:"mcp_tools_lazy_bind"`
 }
 
 type RunContext struct {

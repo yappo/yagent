@@ -845,7 +845,7 @@ func visibleTools(agent domain.AgentSpec, defs []domain.ToolDefinition, session 
 	return visible
 }
 
-func buildToolState(agent domain.AgentSpec, visible []domain.ToolDefinition) domain.ToolState {
+func buildToolState(agent domain.AgentSpec, allDefs []domain.ToolDefinition, visible []domain.ToolDefinition) domain.ToolState {
 	state := domain.ToolState{
 		CurrentAgentID: agent.ID,
 		ReadOnly:       agent.ReadOnly,
@@ -866,7 +866,9 @@ func buildToolState(agent domain.AgentSpec, visible []domain.ToolDefinition) dom
 	}
 	state.VisibleWriteTools = uniqueStrings(state.VisibleWriteTools)
 	state.VisibleMCPTools = uniqueStrings(state.VisibleMCPTools)
-	state.FileWriteAllowed = len(state.VisibleWriteTools) > 0
+	state.HiddenWriteCapabilities = hiddenWriteCapabilities(agent, allDefs, visible)
+	state.WriteCapabilityAvailable = !agent.ReadOnly && (len(state.VisibleWriteTools) > 0 || len(state.HiddenWriteCapabilities) > 0)
+	state.FileWriteAllowed = state.WriteCapabilityAvailable
 	state.MCPToolsLazyBind = state.MCPBindingAvailable || len(state.VisibleMCPTools) > 0 || allowsLazyMCPTools(agent)
 	return state
 }
@@ -888,6 +890,30 @@ func allowsLazyMCPTools(agent domain.AgentSpec) bool {
 		}
 	}
 	return false
+}
+
+func hiddenWriteCapabilities(agent domain.AgentSpec, allDefs []domain.ToolDefinition, visible []domain.ToolDefinition) []string {
+	if agent.ReadOnly {
+		return nil
+	}
+	visibleByName := map[string]struct{}{}
+	for _, def := range visible {
+		visibleByName[def.Name] = struct{}{}
+	}
+	groups := []string{}
+	for _, def := range allDefs {
+		if !isVisibleWriteTool(def) {
+			continue
+		}
+		if _, ok := visibleByName[def.Name]; ok {
+			continue
+		}
+		if def.CapabilityGroup == "" || defaultVisibleCapabilityGroups(agent)[def.CapabilityGroup] {
+			continue
+		}
+		groups = append(groups, def.CapabilityGroup)
+	}
+	return uniqueStrings(groups)
 }
 
 func describeCapabilities(agent domain.AgentSpec, defs []domain.ToolDefinition, session *agentSessionState) string {

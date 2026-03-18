@@ -364,7 +364,10 @@ func toolWorkflowHints(state domain.ToolState) []string {
 		hints = append(hints, "After task_bind succeeds, use the returned tool_names directly on your next tool call.")
 	}
 	if len(state.VisibleWriteTools) > 0 {
-		hints = append(hints, "If file edits are needed and fs_write is visible, use fs_write instead of claiming no write tool exists.")
+		hints = append(hints, "If file edits are needed and fs_write is visible, call fs_write directly. The approval dialog will be shown automatically when the write tool runs.")
+	} else if state.WriteCapabilityAvailable && len(state.HiddenWriteCapabilities) > 0 {
+		hints = append(hints, "This agent can write files, but the write tools are currently hidden behind capability gating. If edits are needed, call enable_capability with one of hidden_write_capabilities, then call fs_write or patch_apply directly.")
+		hints = append(hints, "Do not ask the user in a normal assistant reply to grant file_write_allowed or write permission. Running the write tool should trigger the approval dialog automatically.")
 	}
 	if state.ReadOnly {
 		hints = append(hints, "This agent is read-only. If file writes are required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist.")

@@ -344,6 +344,7 @@ func TestRunTurnIncludesStructuredToolStateInInstructions(t *testing.T) {
 					{Name: "task_list", CapabilityGroup: "task_read", Parameters: map[string]any{"type": "object"}},
 					{Name: "task_bind", CapabilityGroup: "mcp", Parameters: map[string]any{"type": "object"}},
 					{Name: "mcp__docs__search_docs__docs", CapabilityGroup: "mcp", Parameters: map[string]any{"type": "object"}},
+					{Name: "fs_write", CapabilityGroup: "fs_write", MutatesWorkspace: true, Parameters: map[string]any{"type": "object"}},
 				},
 			},
 		},
@@ -362,12 +363,18 @@ func TestRunTurnIncludesStructuredToolStateInInstructions(t *testing.T) {
 	for _, fragment := range []string{
 		"Tool state:",
 		"\"current_agent_id\": \"manager\"",
+		"\"file_write_allowed\": true",
+		"\"write_capability_available\": true",
+		"\"hidden_write_capabilities\": [",
+		"\"fs_write\"",
 		"\"task_discovery_available\": true",
 		"\"mcp_binding_available\": true",
 		"\"mcp_tools_lazy_bind\": true",
 		"\"visible_mcp_tools\": [",
 		"Workflow hints:",
 		`kind="mcp_server"`,
+		"enable_capability",
+		"approval dialog automatically",
 	} {
 		if !strings.Contains(managerInstruction, fragment) {
 			t.Fatalf("expected instruction to contain %q, got %q", fragment, managerInstruction)
