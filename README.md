@@ -220,6 +220,17 @@ Agent DSL のファイルは `agent_catalog.paths` に指定したファイル�
 - `tester`: 検証を担当
 - `reviewer`: レビューを担当
 
+built-in agent には、tool discovery workflow に関する共通 instruction も入っています。  
+特に次の前提を明示しています。
+
+- visible な `mcp__*` が無くても、ただちに「MCP は使えない」とは限らない
+- MCP が必要そうなら、まず `task_list` で `kind = "mcp_server"` の entry を確認する
+- relevant な server が未 bind なら `task_bind(task_id=...)` を呼ぶ
+- bind 成功後は返却された `tool_names` をそのまま使う
+- write-capable agent では `fs_write` / `patch_apply` を直接呼び、承認は会話ではなく approval dialog で行う
+- write tool 実行時の承認は会話ではなく approval dialog で行われる
+- 現在の agent が read-only で write が必要なときは、write-capable agent に delegate / handoff する
+
 user-defined agent は 1 ファイルにつき 1 agent を定義します。最小例は次です。
 
 ```toml
@@ -250,6 +261,7 @@ verification_max_attempts = 2
 - `mode`: agent の使われ方。`tool` は補助役、`handoff` は実装の主担当、`manager` は窓口用です
 - `allowed_tools`: その agent が使ってよい tool 一覧
 - `read_only`: 読み取り専用 agent として扱いたいときに指定
+- `read_only = true` の agent は write tool を新たに得るわけではありません。ファイル変更が必要なときは write-capable agent へ委譲する前提です
 - `model`: その agent だけ別 model を使いたいときに指定
 - `max_turns`: その agent の最大継続ターン数
 - `timeout`: その agent の LLM 呼び出し timeout
@@ -374,6 +386,14 @@ include_tools = ["search_docs"]
 1. `task_list` で `kind = "mcp_server"` の entry を確認
 2. `task_bind` で対象 server を bind
 3. bind 後に追加された `mcp__...` tool を agent が利用
+
+補足:
+
+- `task_list` の `mcp_server` entry には `bind_required`, `usage_hint`, `bind_hint`, `exposed_tool_prefix`, `exposed_tools` などの補助情報が含まれます
+- `task_bind` の返却には `tool_names` に加えて `server_tool_names`, `next_action_hint`, `exposed_tool_prefix` が含まれます
+- `tool_names` は bind 後にそのまま呼べる qualified MCP tool 名です
+- `server_tool_names` は MCP server 側の元の tool 名です
+- `task_bind` と bind 後の `mcp__*` tool は既定で visible です。追加の capability 有効化を挟まずに `task_list` -> `task_bind` -> `mcp__*` の流れを取れます
 
 ## 実行ログ
 
@@ -512,7 +532,10 @@ internal/
 - `patch_apply`
 - `list_capabilities` / `enable_capability`
 
-Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。
+Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。  
+MCP まわりでは、visible な `mcp__*` が空でも `task_list` / `task_bind` による lazy-bind が使える場合があります。  
+write-capable agent では `fs_write` / `patch_apply` を直接実行でき、その後の書き込み承認は通常の assistant 返答ではなく approval dialog で行われます。  
+一方で write tool が見えない理由が current agent の read-only 制約である場合は、「tool が存在しない」のではなく write-capable agent へ委譲すべきケースです。
 
 ## 開発
 

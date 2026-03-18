@@ -254,18 +254,20 @@ func TestRunTurnCanDisablePhaseHarness(t *testing.T) {
 
 func TestRunTurnSeesBoundMCPToolsOnLaterTurn(t *testing.T) {
 	seenBoundTool := false
+	seenTaskBind := false
 	var executor *fakeToolExecutor
 	executor = &fakeToolExecutor{
 		defs: map[string][]domain.ToolDefinition{
 			"manager": {
-				{Name: "task_bind", Parameters: map[string]any{"type": "object"}},
+				{Name: "task_bind", CapabilityGroup: "mcp", Parameters: map[string]any{"type": "object"}},
 			},
 		},
 		exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
 			if call.Name == "task_bind" {
 				executor.defs["manager"] = append(executor.defs["manager"], domain.ToolDefinition{
-					Name:       "mcp__docs__search_docs__docs",
-					Parameters: map[string]any{"type": "object"},
+					Name:            "mcp__docs__search_docs__docs",
+					CapabilityGroup: "mcp",
+					Parameters:      map[string]any{"type": "object"},
 				})
 				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "bound"}
 			}
@@ -290,6 +292,9 @@ func TestRunTurnSeesBoundMCPToolsOnLaterTurn(t *testing.T) {
 			},
 			inspect: func(request domain.ModelRequest) {
 				for _, tool := range request.Tools {
+					if tool.Name == "task_bind" {
+						seenTaskBind = true
+					}
 					if tool.Name == "mcp__docs__search_docs__docs" {
 						seenBoundTool = true
 					}
@@ -312,8 +317,68 @@ func TestRunTurnSeesBoundMCPToolsOnLaterTurn(t *testing.T) {
 	if result.Message.Content != "done" {
 		t.Fatalf("unexpected result: %q", result.Message.Content)
 	}
+	if !seenTaskBind {
+		t.Fatal("expected task_bind to be visible before binding")
+	}
 	if !seenBoundTool {
 		t.Fatal("expected bound MCP tool to appear on a later LLM turn")
+	}
+}
+
+func TestRunTurnIncludesStructuredToolStateInInstructions(t *testing.T) {
+	var managerInstruction string
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				managerInstruction = request.Instructions
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {
+					{Name: "task_list", CapabilityGroup: "task_read", Parameters: map[string]any{"type": "object"}},
+					{Name: "task_bind", CapabilityGroup: "mcp", Parameters: map[string]any{"type": "object"}},
+					{Name: "mcp__docs__search_docs__docs", CapabilityGroup: "mcp", Parameters: map[string]any{"type": "object"}},
+					{Name: "fs_write", CapabilityGroup: "fs_write", MutatesWorkspace: true, Parameters: map[string]any{"type": "object"}},
+				},
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DisablePhaseHarness: true},
+	)
+
+	_, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "inspect tool state"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	for _, fragment := range []string{
+		"Tool state:",
+		"\"current_agent_id\": \"manager\"",
+		"\"file_write_allowed\": true",
+		"\"write_capability_available\": true",
+		"\"visible_write_tools\": [",
+		"\"fs_write\"",
+		"\"task_discovery_available\": true",
+		"\"mcp_binding_available\": true",
+		"\"mcp_tools_lazy_bind\": true",
+		"\"visible_mcp_tools\": [",
+		"Workflow hints:",
+		`kind="mcp_server"`,
+		"call fs_write directly",
+		"approval dialog will be shown automatically",
+	} {
+		if !strings.Contains(managerInstruction, fragment) {
+			t.Fatalf("expected instruction to contain %q, got %q", fragment, managerInstruction)
+		}
 	}
 }
 
@@ -912,7 +977,7 @@ func TestRunTurnUsesMatchingUserDefinedAgentBeforePrimaryExecution(t *testing.T)
 	}
 }
 
-func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
+func TestRunTurnAllowsDirectWorkspaceMutationForWritableAgent(t *testing.T) {
 	toolCalls := 0
 	service := New(
 		&fakeModelClient{
@@ -922,31 +987,6 @@ func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
 						Role: domain.RoleAssistant,
 						ToolCalls: []domain.ToolCall{{
 							ID:   "1",
-							Name: "fs_write",
-							Arguments: map[string]any{
-								"path":      "README.md",
-								"content":   "x",
-								"create":    true,
-								"overwrite": true,
-							},
-						}},
-					},
-				}, {
-					Message: domain.Message{
-						Role: domain.RoleAssistant,
-						ToolCalls: []domain.ToolCall{{
-							ID:   "2",
-							Name: "enable_capability",
-							Arguments: map[string]any{
-								"capability": "fs_write",
-							},
-						}},
-					},
-				}, {
-					Message: domain.Message{
-						Role: domain.RoleAssistant,
-						ToolCalls: []domain.ToolCall{{
-							ID:   "3",
 							Name: "fs_write",
 							Arguments: map[string]any{
 								"path":      "README.md",
@@ -990,7 +1030,7 @@ func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
 		t.Fatalf("unexpected result: %q", result.Message.Content)
 	}
 	if toolCalls != 1 {
-		t.Fatalf("expected only the enabled mutation tool call to execute, got %d", toolCalls)
+		t.Fatalf("expected direct mutation tool call to execute once, got %d", toolCalls)
 	}
 }
 

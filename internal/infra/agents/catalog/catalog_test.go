@@ -3,6 +3,7 @@ package catalog
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"yagent/internal/config"
@@ -19,6 +20,27 @@ func TestBuiltInCatalogAndOverrides(t *testing.T) {
 	}
 	if manager.Instruction != "custom manager" {
 		t.Fatalf("unexpected override: %q", manager.Instruction)
+	}
+}
+
+func TestBuiltInAgentsIncludeToolDiscoveryGuidance(t *testing.T) {
+	catalog := New(nil)
+	planner, ok := catalog.Resolve("planner")
+	if !ok {
+		t.Fatalf("planner agent not found")
+	}
+
+	for _, fragment := range []string{
+		`kind="mcp_server"`,
+		"task_bind(task_id=...)",
+		"use the returned tool_names directly",
+		"fs_write or patch_apply is visible",
+		"approval dialog automatically",
+		"delegate or handoff to a write-capable agent",
+	} {
+		if !strings.Contains(planner.Instruction, fragment) {
+			t.Fatalf("expected planner instruction to contain %q, got %q", fragment, planner.Instruction)
+		}
 	}
 }
 

@@ -845,6 +845,77 @@ func visibleTools(agent domain.AgentSpec, defs []domain.ToolDefinition, session 
 	return visible
 }
 
+func buildToolState(agent domain.AgentSpec, allDefs []domain.ToolDefinition, visible []domain.ToolDefinition) domain.ToolState {
+	state := domain.ToolState{
+		CurrentAgentID: agent.ID,
+		ReadOnly:       agent.ReadOnly,
+	}
+	for _, def := range visible {
+		switch {
+		case def.Name == "task_list":
+			state.TaskDiscoveryAvailable = true
+		case def.Name == "task_bind":
+			state.MCPBindingAvailable = true
+		}
+		if isVisibleWriteTool(def) {
+			state.VisibleWriteTools = append(state.VisibleWriteTools, def.Name)
+		}
+		if strings.HasPrefix(def.Name, "mcp__") {
+			state.VisibleMCPTools = append(state.VisibleMCPTools, def.Name)
+		}
+	}
+	state.VisibleWriteTools = uniqueStrings(state.VisibleWriteTools)
+	state.VisibleMCPTools = uniqueStrings(state.VisibleMCPTools)
+	state.HiddenWriteCapabilities = hiddenWriteCapabilities(agent, allDefs, visible)
+	state.WriteCapabilityAvailable = !agent.ReadOnly && (len(state.VisibleWriteTools) > 0 || len(state.HiddenWriteCapabilities) > 0)
+	state.FileWriteAllowed = state.WriteCapabilityAvailable
+	state.MCPToolsLazyBind = state.MCPBindingAvailable || len(state.VisibleMCPTools) > 0 || allowsLazyMCPTools(agent)
+	return state
+}
+
+func isVisibleWriteTool(def domain.ToolDefinition) bool {
+	if def.Name == "patch_apply" {
+		return true
+	}
+	if strings.HasPrefix(def.Name, "fs_") && def.MutatesWorkspace {
+		return true
+	}
+	return false
+}
+
+func allowsLazyMCPTools(agent domain.AgentSpec) bool {
+	for _, name := range agent.AllowedTools {
+		if name == "task_bind" || strings.HasPrefix(name, "mcp__") {
+			return true
+		}
+	}
+	return false
+}
+
+func hiddenWriteCapabilities(agent domain.AgentSpec, allDefs []domain.ToolDefinition, visible []domain.ToolDefinition) []string {
+	if agent.ReadOnly {
+		return nil
+	}
+	visibleByName := map[string]struct{}{}
+	for _, def := range visible {
+		visibleByName[def.Name] = struct{}{}
+	}
+	groups := []string{}
+	for _, def := range allDefs {
+		if !isVisibleWriteTool(def) {
+			continue
+		}
+		if _, ok := visibleByName[def.Name]; ok {
+			continue
+		}
+		if def.CapabilityGroup == "" || defaultVisibleCapabilityGroups(agent)[def.CapabilityGroup] {
+			continue
+		}
+		groups = append(groups, def.CapabilityGroup)
+	}
+	return uniqueStrings(groups)
+}
+
 func describeCapabilities(agent domain.AgentSpec, defs []domain.ToolDefinition, session *agentSessionState) string {
 	grouped := map[string][]string{}
 	enabled := map[string]bool{}
@@ -902,11 +973,14 @@ func defaultVisibleCapabilityGroups(agent domain.AgentSpec) map[string]bool {
 		"fs_read":   true,
 		"search":    true,
 		"git_read":  true,
+		"mcp":       true,
 		"task_read": true,
 	}
 	if agent.ReadOnly {
 		return visible
 	}
+	visible["fs_write"] = true
+	visible["patch"] = true
 	return visible
 }
 
