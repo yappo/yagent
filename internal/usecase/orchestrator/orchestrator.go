@@ -979,6 +979,8 @@ func defaultVisibleCapabilityGroups(agent domain.AgentSpec) map[string]bool {
 	if agent.ReadOnly {
 		return visible
 	}
+	visible["fs_write"] = true
+	visible["patch"] = true
 	return visible
 }
 

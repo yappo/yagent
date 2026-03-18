@@ -34,8 +34,7 @@ func TestBuiltInAgentsIncludeToolDiscoveryGuidance(t *testing.T) {
 		`kind="mcp_server"`,
 		"task_bind(task_id=...)",
 		"use the returned tool_names directly",
-		"fs_write is visible",
-		"use enable_capability",
+		"fs_write or patch_apply is visible",
 		"approval dialog automatically",
 		"delegate or handoff to a write-capable agent",
 	} {

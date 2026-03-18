@@ -365,7 +365,7 @@ func TestRunTurnIncludesStructuredToolStateInInstructions(t *testing.T) {
 		"\"current_agent_id\": \"manager\"",
 		"\"file_write_allowed\": true",
 		"\"write_capability_available\": true",
-		"\"hidden_write_capabilities\": [",
+		"\"visible_write_tools\": [",
 		"\"fs_write\"",
 		"\"task_discovery_available\": true",
 		"\"mcp_binding_available\": true",
@@ -373,8 +373,8 @@ func TestRunTurnIncludesStructuredToolStateInInstructions(t *testing.T) {
 		"\"visible_mcp_tools\": [",
 		"Workflow hints:",
 		`kind="mcp_server"`,
-		"enable_capability",
-		"approval dialog automatically",
+		"call fs_write directly",
+		"approval dialog will be shown automatically",
 	} {
 		if !strings.Contains(managerInstruction, fragment) {
 			t.Fatalf("expected instruction to contain %q, got %q", fragment, managerInstruction)
@@ -977,7 +977,7 @@ func TestRunTurnUsesMatchingUserDefinedAgentBeforePrimaryExecution(t *testing.T)
 	}
 }
 
-func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
+func TestRunTurnAllowsDirectWorkspaceMutationForWritableAgent(t *testing.T) {
 	toolCalls := 0
 	service := New(
 		&fakeModelClient{
@@ -987,31 +987,6 @@ func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
 						Role: domain.RoleAssistant,
 						ToolCalls: []domain.ToolCall{{
 							ID:   "1",
-							Name: "fs_write",
-							Arguments: map[string]any{
-								"path":      "README.md",
-								"content":   "x",
-								"create":    true,
-								"overwrite": true,
-							},
-						}},
-					},
-				}, {
-					Message: domain.Message{
-						Role: domain.RoleAssistant,
-						ToolCalls: []domain.ToolCall{{
-							ID:   "2",
-							Name: "enable_capability",
-							Arguments: map[string]any{
-								"capability": "fs_write",
-							},
-						}},
-					},
-				}, {
-					Message: domain.Message{
-						Role: domain.RoleAssistant,
-						ToolCalls: []domain.ToolCall{{
-							ID:   "3",
 							Name: "fs_write",
 							Arguments: map[string]any{
 								"path":      "README.md",
@@ -1055,7 +1030,7 @@ func TestRunTurnRequiresCapabilityEnableBeforeWorkspaceMutation(t *testing.T) {
 		t.Fatalf("unexpected result: %q", result.Message.Content)
 	}
 	if toolCalls != 1 {
-		t.Fatalf("expected only the enabled mutation tool call to execute, got %d", toolCalls)
+		t.Fatalf("expected direct mutation tool call to execute once, got %d", toolCalls)
 	}
 }
 
