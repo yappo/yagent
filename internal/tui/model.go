@@ -29,6 +29,15 @@ type statusEventMsg struct {
 	event domain.ExecutionEvent
 }
 
+type memoryLoadedMsg struct {
+	memory *domain.RepoMemory
+	err    error
+}
+
+type clockTickMsg struct {
+	now time.Time
+}
+
 type permissionState struct {
 	request       domain.PermissionRequest
 	response      chan domain.PermissionDecision
@@ -48,6 +57,30 @@ type toolCallState struct {
 type toolLogEntry struct {
 	title   string
 	content string
+}
+
+type chatBlock struct {
+	rawLines    []string
+	cachedWidth int
+	rendered    string
+}
+
+type panelRenderCache struct {
+	width   int
+	content string
+	dirty   bool
+}
+
+type stringRenderCache struct {
+	key     string
+	content string
+	dirty   bool
+}
+
+type memoryPanelState struct {
+	data    *domain.RepoMemory
+	err     error
+	loading bool
 }
 
 type permissionOption struct {
@@ -91,9 +124,10 @@ type model struct {
 	lastRun          *domain.RunState
 	selectedRefs     map[string]string
 	messages         []domain.Message
-	output           []string
+	chatBlocks       []chatBlock
 	loading          bool
 	loadingFrame     int
+	now              time.Time
 	width            int
 	height           int
 	viewport         viewport.Model
@@ -110,18 +144,28 @@ type model struct {
 	patternApprovals []patternApproval
 	activePanel      sidePanel
 	status           statusState
+	memory           memoryPanelState
 	statusEvents     <-chan domain.ExecutionEvent
 	cancelStatus     func()
 	styles           styles
 	logDirty         bool
-	statusDirty      bool
 	toolLogDirty     bool
+	panelCache       map[sidePanel]panelRenderCache
+	headerCache      stringRenderCache
+	mainPanelsCache  stringRenderCache
+	toolCardCache    stringRenderCache
+	toolLogCardCache stringRenderCache
+	permissionCache  stringRenderCache
+	completionCache  stringRenderCache
+	composerCache    stringRenderCache
 }
 
 type statusState struct {
 	nodes      map[string]*agentStatusNode
 	rootRunIDs []string
+	children   map[string][]string
 	recent     []domain.ExecutionEvent
+	counts     map[string]int
 }
 
 type agentStatusNode struct {
@@ -250,6 +294,7 @@ func newModelWithStores(runner domain.Orchestrator, workingDir string, defaultMo
 		workingDir:       workingDir,
 		defaultModel:     defaultModel,
 		selectedRefs:     map[string]string{},
+		now:              time.Now(),
 		viewport:         viewport.New(),
 		statusViewport:   viewport.New(),
 		toolLogViewport:  viewport.New(),
@@ -257,12 +302,29 @@ func newModelWithStores(runner domain.Orchestrator, workingDir string, defaultMo
 		history:          []string{},
 		sessionApprovals: map[string]bool{},
 		activePanel:      sidePanelRunGraph,
+		memory: memoryPanelState{
+			loading: memoryStore != nil,
+		},
 		status: statusState{
-			nodes: map[string]*agentStatusNode{},
+			nodes:    map[string]*agentStatusNode{},
+			children: map[string][]string{},
+			counts:   map[string]int{},
 		},
 		logDirty:     true,
-		statusDirty:  true,
 		toolLogDirty: true,
+		panelCache: map[sidePanel]panelRenderCache{
+			sidePanelRunGraph:     {dirty: true},
+			sidePanelPlan:         {dirty: true},
+			sidePanelVerification: {dirty: true},
+			sidePanelMemory:       {dirty: true},
+		},
+		headerCache:      stringRenderCache{dirty: true},
+		mainPanelsCache:  stringRenderCache{dirty: true},
+		toolCardCache:    stringRenderCache{dirty: true},
+		toolLogCardCache: stringRenderCache{dirty: true},
+		permissionCache:  stringRenderCache{dirty: true},
+		completionCache:  stringRenderCache{dirty: true},
+		composerCache:    stringRenderCache{dirty: true},
 	}
 	if stream, ok := runner.(domain.ExecutionEventStream); ok {
 		m.statusEvents, m.cancelStatus = stream.SubscribeEvents()
@@ -326,7 +388,7 @@ func defaultStyles() styles {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, listenStatusEvents(m.statusEvents))
+	return tea.Batch(textarea.Blink, listenStatusEvents(m.statusEvents), clockTick(), initialMemoryLoadCmd(m.memoryStore))
 }
 
 func (m *model) syncComposer() {
@@ -340,6 +402,76 @@ func (m *model) syncComposer() {
 	m.textarea.SetHeight(height)
 	if m.width > 0 {
 		m.textarea.SetWidth(m.width)
+	}
+	m.composerCache.dirty = true
+	m.completionCache.dirty = true
+}
+
+func (m *model) invalidateAllPanels() {
+	for panel, cache := range m.panelCache {
+		cache.dirty = true
+		m.panelCache[panel] = cache
+	}
+	m.mainPanelsCache.dirty = true
+}
+
+func (m *model) invalidatePanel(panel sidePanel) {
+	cache := m.panelCache[panel]
+	cache.dirty = true
+	m.panelCache[panel] = cache
+	if panel == m.activePanel {
+		m.mainPanelsCache.dirty = true
+	}
+}
+
+func (m *model) invalidatePanelSummary() {
+	m.invalidateAllPanels()
+}
+
+func (m *model) appendChatBlock(rawLines ...string) {
+	if len(rawLines) == 0 {
+		return
+	}
+	m.chatBlocks = append(m.chatBlocks, chatBlock{rawLines: append([]string(nil), rawLines...)})
+	m.logDirty = true
+	m.mainPanelsCache.dirty = true
+}
+
+func (m *model) appendOutputBlock(label, content string) {
+	lines := []string{label}
+	lines = append(lines, strings.Split(content, "\n")...)
+	lines = append(lines, "───────────────────────────────────────────────────────────────────────")
+	m.appendChatBlock(lines...)
+}
+
+func (m *model) resetChatBlocks(rawLines ...string) {
+	m.chatBlocks = nil
+	if len(rawLines) > 0 {
+		m.chatBlocks = append(m.chatBlocks, chatBlock{rawLines: append([]string(nil), rawLines...)})
+	}
+	m.logDirty = true
+	m.mainPanelsCache.dirty = true
+}
+
+func (m *model) loadMemoryCmd() tea.Cmd {
+	if m.memoryStore == nil || m.memory.loading {
+		return nil
+	}
+	m.memory.loading = true
+	m.invalidatePanel(sidePanelMemory)
+	return func() tea.Msg {
+		memory, err := m.memoryStore.LoadMemory(context.Background())
+		return memoryLoadedMsg{memory: memory, err: err}
+	}
+}
+
+func initialMemoryLoadCmd(store domain.RepoMemoryStore) tea.Cmd {
+	if store == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		memory, err := store.LoadMemory(context.Background())
+		return memoryLoadedMsg{memory: memory, err: err}
 	}
 }
 
@@ -385,9 +517,10 @@ func (m *model) syncLayout() {
 	}
 	if prevChatWidth != m.viewport.Width() || prevChatHeight != m.viewport.Height() {
 		m.logDirty = true
+		m.mainPanelsCache.dirty = true
 	}
 	if prevStatusWidth != m.statusViewport.Width() || prevStatusHeight != m.statusViewport.Height() {
-		m.statusDirty = true
+		m.invalidateAllPanels()
 	}
 	m.refreshViewport()
 }
@@ -398,10 +531,14 @@ func (m *model) refreshViewport() {
 		m.viewport.GotoBottom()
 		m.logDirty = false
 	}
-	if m.statusDirty {
-		m.statusViewport.SetContent(m.renderStatus())
-		m.statusViewport.GotoTop()
-		m.statusDirty = false
+	if m.width > 0 && m.statusViewport.Width() > 0 {
+		cache := m.panelCache[m.activePanel]
+		needsRefresh := cache.dirty || cache.width != m.statusViewport.Width()
+		content := m.renderStatus()
+		if needsRefresh {
+			m.statusViewport.SetContent(content)
+			m.statusViewport.GotoTop()
+		}
 	}
 	m.syncToolLogViewport()
 }
@@ -426,31 +563,27 @@ func (m *model) syncToolLogViewport() {
 	}
 }
 
-func (m model) renderLog() string {
+func (m *model) renderLog() string {
 	var sb strings.Builder
 	contentWidth := maxInt(1, m.viewport.Width())
 
-	for _, line := range m.output {
-		switch {
-		case line == userOutputLabel:
-			sb.WriteString(m.styles.user.Render("You"))
-		case line == assistantOutputLabel:
-			sb.WriteString(m.styles.assistant.Render("yagent"))
-		case strings.HasPrefix(line, "────────"):
-			sb.WriteString(m.styles.separator.Render(strings.Repeat("─", contentWidth)))
-		default:
-			sb.WriteString(wrapContent(line, contentWidth))
+	for idx := range m.chatBlocks {
+		block := m.chatBlocks[idx]
+		if block.cachedWidth != contentWidth || block.rendered == "" {
+			block.rendered = renderChatBlock(block.rawLines, contentWidth, m.styles)
+			block.cachedWidth = contentWidth
+			m.chatBlocks[idx] = block
 		}
-		sb.WriteString("\n")
+		if block.rendered == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(block.rendered)
 	}
 
-	if m.loading && m.permission == nil {
-		frame := loadingFrames[m.loadingFrame%len(loadingFrames)]
-		sb.WriteString(m.styles.tool.Render(wrapContent(frame+" 処理中...", contentWidth)))
-		sb.WriteString("\n")
-	}
-
-	return strings.TrimRight(sb.String(), "\n")
+	return sb.String()
 }
 
 func wrapContent(content string, width int) string {
@@ -461,11 +594,24 @@ func wrapContent(content string, width int) string {
 	return runewidth.Wrap(content, width)
 }
 
-func appendOutputBlock(output []string, label, content string) []string {
-	output = append(output, label)
-	output = append(output, strings.Split(content, "\n")...)
-	output = append(output, "───────────────────────────────────────────────────────────────────────")
-	return output
+func renderChatBlock(lines []string, width int, styles styles) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	rendered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		switch {
+		case line == userOutputLabel:
+			rendered = append(rendered, styles.user.Render("You"))
+		case line == assistantOutputLabel:
+			rendered = append(rendered, styles.assistant.Render("yagent"))
+		case strings.HasPrefix(line, "────────"):
+			rendered = append(rendered, styles.separator.Render(strings.Repeat("─", width)))
+		default:
+			rendered = append(rendered, wrapContent(line, width))
+		}
+	}
+	return strings.Join(rendered, "\n")
 }
 
 func approvalKey(request domain.PermissionRequest) string {
@@ -505,6 +651,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.permissionQueue = append(m.permissionQueue, state)
 		}
+		m.invalidatePanelSummary()
 		m.syncLayout()
 		return m, nil
 
@@ -515,18 +662,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "finish":
 			m.activeTool = finalizeToolCallState(msg.event.Call, msg.event.Result, m.activeTool)
 			m.appendToolLog(msg.event.Call, msg.event.Result)
-			m.output = append(m.output, formatToolSummary(m.activeTool))
-			m.output = append(m.output, "───────────────────────────────────────────────────────────────────────")
+			m.appendChatBlock(formatToolSummary(m.activeTool), "───────────────────────────────────────────────────────────────────────")
 			m.activeTool = nil
-			m.logDirty = true
 			m.toolLogDirty = true
 		}
+		m.toolCardCache.dirty = true
+		m.toolLogCardCache.dirty = true
 		m.syncLayout()
 		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.headerCache.dirty = true
 		m.syncLayout()
 		return m, nil
 
@@ -535,18 +683,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loadingFrame = (m.loadingFrame + 1) % len(loadingFrames)
-		m.logDirty = true
-		m.refreshViewport()
+		m.mainPanelsCache.dirty = true
 		return m, loadingTick()
+
+	case clockTickMsg:
+		m.now = msg.now
+		m.invalidatePanel(sidePanelRunGraph)
+		m.mainPanelsCache.dirty = true
+		return m, clockTick()
 
 	case chatMessage:
 		m.loading = false
+		m.mainPanelsCache.dirty = true
 		if msg.err != nil {
-			m.output = append(m.output, "実行エラー: "+msg.err.Error())
+			m.appendChatBlock("実行エラー: " + msg.err.Error())
 			if len(m.messages) > 0 {
 				m.messages = m.messages[:len(m.messages)-1]
 			}
-			m.logDirty = true
 			m.refreshViewport()
 			return m, nil
 		}
@@ -556,23 +709,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		})
 		if msg.run != nil {
 			m.lastRun = msg.run
-			m.statusDirty = true
+			m.invalidateAllPanels()
 		}
-		m.output = appendOutputBlock(m.output, assistantOutputLabel, msg.content)
-		m.logDirty = true
+		m.appendOutputBlock(assistantOutputLabel, msg.content)
 		m.refreshViewport()
 		return m, nil
 
 	case statusEventMsg:
 		m.applyStatusEvent(msg.event)
-		m.statusDirty = true
+		m.invalidatePanel(sidePanelRunGraph)
+		m.mainPanelsCache.dirty = true
 		m.refreshViewport()
 		return m, listenStatusEvents(m.statusEvents)
+
+	case memoryLoadedMsg:
+		m.memory.loading = false
+		m.memory.data = msg.memory
+		m.memory.err = msg.err
+		m.invalidatePanel(sidePanelMemory)
+		m.refreshViewport()
+		return m, nil
 
 	case tea.PasteMsg:
 		if m.permission != nil {
 			if m.permission.patternMode {
 				m.permission.patternInput += msg.Content
+				m.permissionCache.dirty = true
 				m.syncLayout()
 			}
 			return m, nil
@@ -607,10 +769,12 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "left", "shift+tab":
 		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex-1, len(options))
+		m.permissionCache.dirty = true
 		m.syncLayout()
 		return m, nil
 	case "right", "tab":
 		m.permission.selectedIndex = wrapIndex(m.permission.selectedIndex+1, len(options))
+		m.permissionCache.dirty = true
 		m.syncLayout()
 		return m, nil
 	case "enter":
@@ -618,6 +782,7 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if option.requiresPattern {
 			m.permission.patternMode = true
 			m.permission.patternInput = ""
+			m.permissionCache.dirty = true
 			m.syncLayout()
 			return m, nil
 		}
@@ -636,6 +801,7 @@ func handlePermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if options[idx].requiresPattern {
 				m.permission.patternMode = true
 				m.permission.patternInput = ""
+				m.permissionCache.dirty = true
 				m.syncLayout()
 				return m, nil
 			}
@@ -655,6 +821,7 @@ func handlePatternPermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.permission.patternMode = false
 		m.permission.patternInput = ""
+		m.permissionCache.dirty = true
 		m.syncLayout()
 		return m, nil
 	case "enter":
@@ -665,12 +832,14 @@ func handlePatternPermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.patternApprovals = append(m.patternApprovals, newPatternApproval(m.permission.request, patternValue))
 		m.permission.patternMode = false
 		m.permission.patternInput = ""
+		m.permissionCache.dirty = true
 		m.resolvePermissionWithLabel(domain.PermissionAllowSession, "パターン許可 ("+patternValue+")")
 		return m, nil
 	case "backspace", "ctrl+h":
 		if len(m.permission.patternInput) > 0 {
 			runes := []rune(m.permission.patternInput)
 			m.permission.patternInput = string(runes[:len(runes)-1])
+			m.permissionCache.dirty = true
 			m.syncLayout()
 		}
 		return m, nil
@@ -678,6 +847,7 @@ func handlePatternPermissionKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if typed := msg.String(); len([]rune(typed)) == 1 {
 		m.permission.patternInput += typed
+		m.permissionCache.dirty = true
 		m.syncLayout()
 	}
 	return m, nil
@@ -687,6 +857,9 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if delta, ok := panelNavigationDelta(msg); ok {
 		m.cyclePanel(delta)
 		m.syncLayout()
+		if m.activePanel == sidePanelMemory {
+			return m, m.loadMemoryCmd()
+		}
 		return m, nil
 	}
 
@@ -768,8 +941,7 @@ func handleComposerKeys(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 	command, ok := findSlashCommand(input)
 	if !ok {
-		m.output = append(m.output, "不明なコマンドです。/help でヘルプを表示します")
-		m.logDirty = true
+		m.appendChatBlock("不明なコマンドです。/help でヘルプを表示します")
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
@@ -779,95 +951,81 @@ func handleSlashCommand(m model, input string) (tea.Model, tea.Cmd) {
 	case "/exit":
 		return m, tea.Quit
 	case "/help":
-		m.output = append(m.output, "コマンド:")
+		m.appendChatBlock("コマンド:")
 		for _, slashCommand := range slashCommands {
-			m.output = append(m.output, fmt.Sprintf("  %s - %s", slashCommand.name, slashCommand.description))
+			m.appendChatBlock(fmt.Sprintf("  %s - %s", slashCommand.name, slashCommand.description))
 		}
-		m.logDirty = true
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/tools":
-		m.output = append(m.output, formatSlashList("利用可能な tool", m.listTools())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("利用可能な tool", m.listTools())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/tasks":
-		m.output = append(m.output, formatSlashList("登録済み task", m.listTasks())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("登録済み task", m.listTasks())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/mcp":
-		m.output = append(m.output, formatSlashList("bind 済み MCP tool", m.listMCPTools())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("bind 済み MCP tool", m.listMCPTools())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/agents":
-		m.output = append(m.output, formatSlashList("利用可能な agent", m.listAgents())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("利用可能な agent", m.listAgents())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/graph":
 		m.setActivePanel(sidePanelRunGraph)
-		m.output = append(m.output, "Run Graph panel を表示します")
-		m.logDirty = true
+		m.appendChatBlock("Run Graph panel を表示します")
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/plan":
 		m.setActivePanel(sidePanelPlan)
-		m.output = append(m.output, formatSlashList("Current plan", m.listPlan())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("Current plan", m.listPlan())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/verification":
 		m.setActivePanel(sidePanelVerification)
-		m.output = append(m.output, formatSlashList("Verification", m.listVerification())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("Verification", m.listVerification())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/artifacts":
-		m.output = append(m.output, formatSlashList("Run artifacts", m.listArtifacts())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("Run artifacts", m.listArtifacts())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/memory":
 		m.setActivePanel(sidePanelMemory)
-		m.output = append(m.output, formatSlashList("Repo memory", m.listMemory())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("Repo memory", m.listMemory())...)
 		m.textarea.Reset()
 		m.syncLayout()
-		return m, nil
+		return m, m.loadMemoryCmd()
 	case "/resume":
 		lines := m.resumeLatest()
-		m.output = append(m.output, lines...)
-		m.statusDirty = true
-		m.logDirty = true
+		m.appendChatBlock(lines...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/approvals":
-		m.output = append(m.output, formatSlashList("Approvals", m.listApprovals())...)
-		m.logDirty = true
+		m.appendChatBlock(formatSlashList("Approvals", m.listApprovals())...)
 		m.textarea.Reset()
 		m.syncLayout()
 		return m, nil
 	case "/clear":
 		m.messages = nil
 		m.lastRun = nil
-		m.output = []string{"チャット履歴をクリアしました"}
-		m.logDirty = true
-		m.statusDirty = true
+		m.resetChatBlocks("チャット履歴をクリアしました")
+		m.invalidateAllPanels()
 		m.textarea.Reset()
 		m.syncLayout()
-		return m, nil
+		return m, m.loadMemoryCmd()
 	}
 
 	return m, nil
@@ -881,12 +1039,12 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 		Role:    domain.RoleUser,
 		Content: normalized,
 	})
-	m.output = appendOutputBlock(m.output, userOutputLabel, input)
+	m.appendOutputBlock(userOutputLabel, input)
 	m.textarea.Reset()
 	m.selectedRefs = map[string]string{}
 	m.loading = true
 	m.loadingFrame = 0
-	m.logDirty = true
+	m.mainPanelsCache.dirty = true
 	m.syncLayout()
 
 	send := func() tea.Msg {
@@ -913,7 +1071,7 @@ func (m *model) resolvePermissionWithLabel(decision domain.PermissionDecision, l
 		m.sessionApprovals[approvalKey(m.permission.request)] = true
 	}
 
-	m.output = append(m.output, fmt.Sprintf("%s [%s] %s を%s",
+	m.appendChatBlock(fmt.Sprintf("%s [%s] %s を%s",
 		permissionRequesterLabel(m.permission.request),
 		permissionRequesterType(m.permission.request),
 		m.permission.request.Operation,
@@ -928,7 +1086,8 @@ func (m *model) resolvePermissionWithLabel(decision domain.PermissionDecision, l
 	} else {
 		m.permission = nil
 	}
-	m.logDirty = true
+	m.permissionCache.dirty = true
+	m.invalidatePanelSummary()
 	m.syncLayout()
 }
 
@@ -945,11 +1104,9 @@ func (m *model) applyStatusEvent(event domain.ExecutionEvent) {
 			m.status.rootRunIDs = appendUnique(m.status.rootRunIDs, event.RunID)
 		}
 	}
+	m.linkStatusChild(node, event.ParentRunID)
 	if node.AgentID == "" {
 		node.AgentID = event.AgentID
-	}
-	if node.ParentRunID == "" {
-		node.ParentRunID = event.ParentRunID
 	}
 	if node.StartedAt.IsZero() {
 		node.StartedAt = event.Timestamp
@@ -985,6 +1142,8 @@ func (m *model) applyStatusEvent(event domain.ExecutionEvent) {
 	if len(m.status.recent) > 8 {
 		m.status.recent = m.status.recent[:8]
 	}
+	m.rebuildStatusCounts()
+	m.reorderStatusNodes(node)
 }
 
 func permissionDecisionLabel(decision domain.PermissionDecision) string {
@@ -1408,6 +1567,12 @@ func loadingTick() tea.Cmd {
 	})
 }
 
+func clockTick() tea.Cmd {
+	return tea.Tick(time.Second, func(now time.Time) tea.Msg {
+		return clockTickMsg{now: now}
+	})
+}
+
 func findSlashCommand(name string) (slashCommand, bool) {
 	for _, command := range slashCommands {
 		if command.name == name {
@@ -1573,9 +1738,15 @@ func (m model) listMemory() []string {
 	if m.memoryStore == nil {
 		return []string{"(memory store unavailable)"}
 	}
-	memory, err := m.memoryStore.LoadMemory(context.Background())
-	if err != nil {
-		return []string{"failed to load memory: " + err.Error()}
+	if m.memory.loading {
+		return []string{"(memory loading...)"}
+	}
+	if m.memory.err != nil {
+		return []string{"failed to load memory: " + m.memory.err.Error()}
+	}
+	memory := m.memory.data
+	if memory == nil {
+		return []string{"(memory is empty)"}
 	}
 	items := []string{}
 	for _, constraint := range memory.Constraints {
@@ -1617,6 +1788,7 @@ func (m *model) resumeLatest() []string {
 	}
 	m.lastRun = run
 	m.messages = cloneDomainMessages(run.Messages)
+	m.invalidateAllPanels()
 	lines := []string{
 		fmt.Sprintf("Resumed run %s", run.ID),
 		fmt.Sprintf("phase=%s status=%s attempt=%d", run.CurrentPhase, run.Status, run.Attempt),
@@ -1698,45 +1870,42 @@ func (m model) latestBlockedReason() string {
 }
 
 func (m model) View() tea.View {
+	header := m.cachedHeaderView()
+	mainView := m.cachedMainPanels()
+	offsetY := lipgloss.Height(header) + 1 + lipgloss.Height(mainView) + 1
+
 	var sb strings.Builder
-	offsetY := 0
-	sb.WriteString(m.styles.hint.Render("入力： /help, /graph, /plan, /verification, /memory, /resume, /clear, /exit | Ctrl+←/→ または Ctrl+H/L / Alt+[/] で panel 切替 | Alt+↑/↓ と PgUp/PgDn でログ"))
+	sb.WriteString(header)
 	sb.WriteString("\n")
-	sb.WriteString(m.styles.separator.Render(strings.Repeat("─", maxInt(1, m.width))))
-	sb.WriteString("\n\n")
-	offsetY += 3
-	mainView := m.renderMainPanels()
 	sb.WriteString(mainView)
-	offsetY += lipgloss.Height(mainView)
 	sb.WriteString("\n")
-	offsetY++
 	if m.hasToolLogs() {
-		card := m.renderToolLogCard()
+		card := m.cachedToolLogCard()
 		sb.WriteString(card)
 		sb.WriteString("\n")
 		offsetY += lipgloss.Height(card) + 1
 	}
 	if m.activeTool != nil {
-		card := m.renderToolCard()
+		card := m.cachedToolCard()
 		sb.WriteString(card)
 		sb.WriteString("\n")
 		offsetY += lipgloss.Height(card) + 1
 	}
 	if m.permission != nil {
-		card := m.renderPermissionCard()
+		card := m.cachedPermissionCard()
 		sb.WriteString(card)
 		sb.WriteString("\n")
 		offsetY += lipgloss.Height(card) + 1
 	}
 	if m.hasCompletionCandidates() {
-		suggestions := m.renderCompletionSuggestions()
+		suggestions := m.cachedCompletionSuggestions()
 		sb.WriteString(suggestions)
 		sb.WriteString("\n")
 		offsetY += lipgloss.Height(suggestions) + 1
 	}
 	sb.WriteString("\n")
 	offsetY++
-	sb.WriteString(m.textarea.View())
+	sb.WriteString(m.cachedComposerView())
 
 	view := tea.NewView(sb.String())
 	view.AltScreen = true
@@ -1752,12 +1921,19 @@ func (m model) renderMainPanels() string {
 	if metrics := m.currentRunMetrics(); metrics != "" {
 		chatTitle += "  " + metrics
 	}
+	chatBody := m.viewport.View()
+	if loading := m.loadingStatusView(); loading != "" {
+		if chatBody != "" {
+			chatBody += "\n"
+		}
+		chatBody += loading
+	}
 	chatPane := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1).
 		Width(maxInt(1, m.viewport.Width()+paneHorizontalFrame)).
-		Render(chatTitle + "\n" + m.viewport.View())
+		Render(chatTitle + "\n" + chatBody)
 	sideTitle := m.renderPanelTabs()
 	statusPane := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1773,17 +1949,26 @@ func (m model) renderMainPanels() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, chatPane, statusPane)
 }
 
-func (m model) renderStatus() string {
+func (m *model) renderStatus() string {
+	cache := m.panelCache[m.activePanel]
+	width := m.statusViewport.Width()
+	if !cache.dirty && cache.width == width {
+		return cache.content
+	}
 	switch m.activePanel {
 	case sidePanelPlan:
-		return m.renderPlanPanel()
+		cache.content = m.renderPlanPanel()
 	case sidePanelVerification:
-		return m.renderVerificationPanel()
+		cache.content = m.renderVerificationPanel()
 	case sidePanelMemory:
-		return m.renderMemoryPanel()
+		cache.content = m.renderMemoryPanel()
 	default:
-		return m.renderRunGraphPanel()
+		cache.content = m.renderRunGraphPanel()
 	}
+	cache.width = width
+	cache.dirty = false
+	m.panelCache[m.activePanel] = cache
+	return cache.content
 }
 
 func (m model) renderRunGraphPanel() string {
@@ -1794,12 +1979,10 @@ func (m model) renderRunGraphPanel() string {
 	}
 
 	lines := m.renderPanelSummary()
-	lines = append(lines, "", fmt.Sprintf("running %d  done %d  failed %d", m.countStatus("running", "working", "thinking"), m.countStatus("done"), m.countStatus("failed")))
+	lines = append(lines, "", fmt.Sprintf("running %d  done %d  failed %d", m.countStatuses("running", "working", "thinking"), m.countStatuses("done"), m.countStatuses("failed")))
 	lines = append(lines, "")
 
-	rootIDs := append([]string(nil), m.status.rootRunIDs...)
-	sort.Strings(rootIDs)
-	for _, runID := range rootIDs {
+	for _, runID := range m.status.rootRunIDs {
 		lines = append(lines, m.renderStatusTree(runID, "", true)...)
 	}
 
@@ -1822,7 +2005,10 @@ func (m *model) setActivePanel(panel sidePanel) {
 		return
 	}
 	m.activePanel = panel
-	m.statusDirty = true
+	m.mainPanelsCache.dirty = true
+	if panel == sidePanelMemory {
+		m.invalidatePanel(sidePanelMemory)
+	}
 }
 
 func (m *model) cyclePanel(delta int) {
@@ -2001,11 +2187,15 @@ func (m model) renderMemoryPanel() string {
 		lines = append(lines, "", "(memory store unavailable)")
 		return strings.Join(lines, "\n")
 	}
-	memory, err := m.memoryStore.LoadMemory(context.Background())
-	if err != nil {
-		lines = append(lines, "", "failed to load memory: "+err.Error())
+	if m.memory.loading {
+		lines = append(lines, "", "(memory loading...)")
 		return strings.Join(lines, "\n")
 	}
+	if m.memory.err != nil {
+		lines = append(lines, "", "failed to load memory: "+m.memory.err.Error())
+		return strings.Join(lines, "\n")
+	}
+	memory := m.memory.data
 	if memory == nil {
 		lines = append(lines, "", "(memory is empty)")
 		return strings.Join(lines, "\n")
@@ -2067,7 +2257,7 @@ func (m model) renderStatusTree(runID, prefix string, last bool) []string {
 		nextPrefix = ""
 	}
 
-	line := fmt.Sprintf("%s%s  %s  %s", prefix+branch, titleCase(node.AgentID), statusLabel(node.Status), formatNodeMetrics(node))
+	line := fmt.Sprintf("%s%s  %s  %s", prefix+branch, titleCase(node.AgentID), statusLabel(node.Status), formatNodeMetricsAt(node, m.now))
 	if node.Phase != "" {
 		line += "  " + string(node.Phase)
 	}
@@ -2079,34 +2269,17 @@ func (m model) renderStatusTree(runID, prefix string, last bool) []string {
 	}
 	lines := []string{line}
 
-	children := m.childRunIDs(runID)
+	children := m.status.children[runID]
 	for idx, childID := range children {
 		lines = append(lines, m.renderStatusTree(childID, nextPrefix, idx == len(children)-1)...)
 	}
 	return lines
 }
 
-func (m model) childRunIDs(parentRunID string) []string {
-	var ids []string
-	for runID, node := range m.status.nodes {
-		if node.ParentRunID == parentRunID {
-			ids = append(ids, runID)
-		}
-	}
-	sort.Strings(ids)
-	return ids
-}
-
-func (m model) countStatus(statuses ...string) int {
-	allowed := map[string]bool{}
-	for _, status := range statuses {
-		allowed[status] = true
-	}
+func (m model) countStatuses(statuses ...string) int {
 	count := 0
-	for _, node := range m.status.nodes {
-		if allowed[node.Status] {
-			count++
-		}
+	for _, status := range statuses {
+		count += m.status.counts[status]
 	}
 	return count
 }
@@ -2230,7 +2403,7 @@ func (m model) currentRunMetrics() string {
 	if node == nil {
 		return ""
 	}
-	return formatMetrics(node.StartedAt, node.UpdatedAt, node.Status, node.ContextCount)
+	return formatMetricsAt(node.StartedAt, node.UpdatedAt, node.Status, node.ContextCount, m.now)
 }
 
 func (m model) currentRootNode() *agentStatusNode {
@@ -2241,16 +2414,16 @@ func (m model) currentRootNode() *agentStatusNode {
 	return m.status.nodes[runID]
 }
 
-func formatNodeMetrics(node *agentStatusNode) string {
-	return formatMetrics(node.StartedAt, node.UpdatedAt, node.Status, node.ContextCount)
+func formatNodeMetricsAt(node *agentStatusNode, now time.Time) string {
+	return formatMetricsAt(node.StartedAt, node.UpdatedAt, node.Status, node.ContextCount, now)
 }
 
-func formatMetrics(startedAt, updatedAt time.Time, status string, contextCount int) string {
+func formatMetricsAt(startedAt, updatedAt time.Time, status string, contextCount int, now time.Time) string {
 	parts := []string{}
 	if !startedAt.IsZero() {
 		end := updatedAt
 		if status != "done" && status != "failed" {
-			end = time.Now()
+			end = now
 		}
 		if end.Before(startedAt) {
 			end = startedAt
@@ -2280,4 +2453,170 @@ func formatDuration(duration time.Duration) string {
 	minutes := int(duration / time.Minute)
 	seconds := int((duration % time.Minute) / time.Second)
 	return fmt.Sprintf("%dm%02ds", minutes, seconds)
+}
+
+func (m *model) linkStatusChild(node *agentStatusNode, parentRunID string) {
+	if parentRunID == "" {
+		return
+	}
+	if node.ParentRunID != "" {
+		if node.ParentRunID != parentRunID {
+			children := m.status.children[node.ParentRunID]
+			filtered := children[:0]
+			for _, childID := range children {
+				if childID != node.RunID {
+					filtered = append(filtered, childID)
+				}
+			}
+			m.status.children[node.ParentRunID] = filtered
+		}
+	}
+	node.ParentRunID = parentRunID
+	children := appendUnique(m.status.children[parentRunID], node.RunID)
+	m.status.children[parentRunID] = children
+}
+
+func (m *model) rebuildStatusCounts() {
+	counts := map[string]int{}
+	for _, node := range m.status.nodes {
+		counts[node.Status]++
+	}
+	m.status.counts = counts
+}
+
+func (m *model) reorderStatusNodes(node *agentStatusNode) {
+	if node == nil {
+		return
+	}
+	if node.ParentRunID == "" {
+		m.reorderRunIDs(m.status.rootRunIDs)
+		return
+	}
+	m.reorderRunIDs(m.status.children[node.ParentRunID])
+}
+
+func (m *model) reorderRunIDs(ids []string) {
+	sort.SliceStable(ids, func(i, j int) bool {
+		left := m.status.nodes[ids[i]]
+		right := m.status.nodes[ids[j]]
+		if left == nil || right == nil {
+			return ids[i] < ids[j]
+		}
+		leftRank := statusOrderRank(left.Status)
+		rightRank := statusOrderRank(right.Status)
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		if !left.UpdatedAt.Equal(right.UpdatedAt) {
+			return left.UpdatedAt.After(right.UpdatedAt)
+		}
+		if !left.StartedAt.Equal(right.StartedAt) {
+			return left.StartedAt.After(right.StartedAt)
+		}
+		return ids[i] < ids[j]
+	})
+}
+
+func statusOrderRank(status string) int {
+	switch status {
+	case "running", "working", "thinking":
+		return 0
+	case "failed":
+		return 1
+	case "done":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func (m model) loadingStatusView() string {
+	if !m.loading || m.permission != nil {
+		return ""
+	}
+	frame := loadingFrames[m.loadingFrame%len(loadingFrames)]
+	return m.styles.tool.Render(frame + " 処理中...")
+}
+
+func (m *model) cachedHeaderView() string {
+	key := fmt.Sprintf("%d", m.width)
+	if !m.headerCache.dirty && m.headerCache.key == key {
+		return m.headerCache.content
+	}
+	m.headerCache.key = key
+	m.headerCache.content = m.styles.hint.Render("入力： /help, /graph, /plan, /verification, /memory, /resume, /clear, /exit | Ctrl+←/→ または Ctrl+H/L / Alt+[/] で panel 切替 | Alt+↑/↓ と PgUp/PgDn でログ") +
+		"\n" + m.styles.separator.Render(strings.Repeat("─", maxInt(1, m.width))) + "\n"
+	m.headerCache.dirty = false
+	return m.headerCache.content
+}
+
+func (m *model) cachedMainPanels() string {
+	key := fmt.Sprintf("%d:%d:%d:%s:%d:%t", m.viewport.Width(), m.viewport.Height(), m.statusViewport.Width(), m.activePanel, m.loadingFrame, m.loading)
+	if !m.mainPanelsCache.dirty && m.mainPanelsCache.key == key {
+		return m.mainPanelsCache.content
+	}
+	m.mainPanelsCache.key = key
+	m.mainPanelsCache.content = m.renderMainPanels()
+	m.mainPanelsCache.dirty = false
+	return m.mainPanelsCache.content
+}
+
+func (m *model) cachedToolCard() string {
+	key := fmt.Sprintf("%d:%v", m.width, m.activeTool != nil)
+	if !m.toolCardCache.dirty && m.toolCardCache.key == key {
+		return m.toolCardCache.content
+	}
+	m.toolCardCache.key = key
+	m.toolCardCache.content = m.renderToolCard()
+	m.toolCardCache.dirty = false
+	return m.toolCardCache.content
+}
+
+func (m *model) cachedToolLogCard() string {
+	key := fmt.Sprintf("%d:%d", m.width, len(m.toolLogs))
+	if !m.toolLogCardCache.dirty && m.toolLogCardCache.key == key {
+		return m.toolLogCardCache.content
+	}
+	m.toolLogCardCache.key = key
+	m.toolLogCardCache.content = m.renderToolLogCard()
+	m.toolLogCardCache.dirty = false
+	return m.toolLogCardCache.content
+}
+
+func (m *model) cachedPermissionCard() string {
+	key := fmt.Sprintf("%d:%t:%d:%s", m.width, m.permission != nil, m.pendingApprovalCount(), func() string {
+		if m.permission == nil {
+			return ""
+		}
+		return m.permission.patternInput
+	}())
+	if !m.permissionCache.dirty && m.permissionCache.key == key {
+		return m.permissionCache.content
+	}
+	m.permissionCache.key = key
+	m.permissionCache.content = m.renderPermissionCard()
+	m.permissionCache.dirty = false
+	return m.permissionCache.content
+}
+
+func (m *model) cachedCompletionSuggestions() string {
+	key := fmt.Sprintf("%d:%s", m.width, m.textarea.Value())
+	if !m.completionCache.dirty && m.completionCache.key == key {
+		return m.completionCache.content
+	}
+	m.completionCache.key = key
+	m.completionCache.content = m.renderCompletionSuggestions()
+	m.completionCache.dirty = false
+	return m.completionCache.content
+}
+
+func (m *model) cachedComposerView() string {
+	key := fmt.Sprintf("%d:%s", m.width, m.textarea.Value())
+	if !m.composerCache.dirty && m.composerCache.key == key {
+		return m.composerCache.content
+	}
+	m.composerCache.key = key
+	m.composerCache.content = m.textarea.View()
+	m.composerCache.dirty = false
+	return m.composerCache.content
 }

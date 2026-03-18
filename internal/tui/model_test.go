@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,9 +114,38 @@ func (s stubMemoryStore) RecordCommand(context.Context, domain.CommandMemoryEntr
 	return nil
 }
 
+type countingMemoryStore struct {
+	memory *domain.RepoMemory
+	loads  int
+}
+
+func (s *countingMemoryStore) LoadMemory(context.Context) (*domain.RepoMemory, error) {
+	s.loads++
+	if s.memory == nil {
+		return &domain.RepoMemory{}, nil
+	}
+	return s.memory, nil
+}
+
+func (s *countingMemoryStore) SaveMemory(context.Context, *domain.RepoMemory) error {
+	return nil
+}
+
+func (s *countingMemoryStore) RecordCommand(context.Context, domain.CommandMemoryEntry) error {
+	return nil
+}
+
 func newTestModel(t *testing.T) model {
 	t.Helper()
 	return newModel(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil)
+}
+
+func flattenChatBlocks(blocks []chatBlock) string {
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		parts = append(parts, strings.Join(block.rawLines, "\n"))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func TestPermissionRequestState(t *testing.T) {
@@ -251,8 +281,9 @@ func TestResolvePermissionAppendsRequesterToOutput(t *testing.T) {
 	}
 
 	m.resolvePermission(domain.PermissionAllowSession)
-	if len(m.output) == 0 || !strings.Contains(m.output[len(m.output)-1], "manager [main]") {
-		t.Fatalf("expected requester in output, got %+v", m.output)
+	output := flattenChatBlocks(m.chatBlocks)
+	if !strings.Contains(output, "manager [main]") {
+		t.Fatalf("expected requester in output, got %q", output)
 	}
 }
 
@@ -261,8 +292,9 @@ func TestChatMessageErrorUsesExecutionLabel(t *testing.T) {
 
 	modelValue, _ := m.Update(chatMessage{err: context.DeadlineExceeded})
 	next := modelValue.(model)
-	if len(next.output) == 0 || !strings.Contains(next.output[0], "実行エラー:") {
-		t.Fatalf("expected execution error label, got %+v", next.output)
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "実行エラー:") {
+		t.Fatalf("expected execution error label, got %q", output)
 	}
 }
 
@@ -331,8 +363,9 @@ func TestSlashPlanSwitchesPanel(t *testing.T) {
 	if next.activePanel != sidePanelPlan {
 		t.Fatalf("expected plan panel, got %s", next.activePanel)
 	}
-	if !strings.Contains(strings.Join(next.output, "\n"), "Current plan:") {
-		t.Fatalf("expected plan output, got %+v", next.output)
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "Current plan:") {
+		t.Fatalf("expected plan output, got %q", output)
 	}
 }
 
@@ -429,6 +462,13 @@ func TestRenderMemoryPanelUsesMemoryStore(t *testing.T) {
 		RecentArtifacts:    []string{"Final response"},
 		SuccessfulCommands: []domain.CommandMemoryEntry{{Summary: "go test ./..."}},
 	}})
+	m.memory.loading = false
+	m.memory.data = &domain.RepoMemory{
+		Constraints:        []string{"Keep README updated."},
+		FailurePatterns:    []string{"missing regression coverage"},
+		RecentArtifacts:    []string{"Final response"},
+		SuccessfulCommands: []domain.CommandMemoryEntry{{Summary: "go test ./..."}},
+	}
 	m.width = 120
 	m.height = 28
 	m.activePanel = sidePanelMemory
@@ -457,7 +497,7 @@ func TestViewportScrollKey(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 80
 	m.height = 24
-	m.output = appendOutputBlock(nil, assistantOutputLabel, strings.Repeat("a\n", 20))
+	m.appendOutputBlock(assistantOutputLabel, strings.Repeat("a\n", 20))
 	m.syncLayout()
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
@@ -470,7 +510,7 @@ func TestViewportScrollKey(t *testing.T) {
 func TestRenderLogWrapsLongLines(t *testing.T) {
 	m := newTestModel(t)
 	m.viewport.SetWidth(10)
-	m.output = appendOutputBlock(nil, assistantOutputLabel, "aaaaaaaaaaaa")
+	m.appendOutputBlock(assistantOutputLabel, "aaaaaaaaaaaa")
 
 	rendered := m.renderLog()
 	if !strings.Contains(rendered, "aaaaaaaaaa\naa") {
@@ -534,7 +574,7 @@ func TestTypingDoesNotDirtyLogOrStatusViewports(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 100
 	m.height = 30
-	m.output = appendOutputBlock(nil, assistantOutputLabel, "hello")
+	m.appendOutputBlock(assistantOutputLabel, "hello")
 	m.applyStatusEvent(domain.ExecutionEvent{
 		RunID:     "run-1",
 		AgentID:   "manager",
@@ -543,7 +583,6 @@ func TestTypingDoesNotDirtyLogOrStatusViewports(t *testing.T) {
 	})
 	m.syncLayout()
 	m.logDirty = false
-	m.statusDirty = false
 
 	modelValue, _ := m.Update(tea.KeyPressMsg{Text: "a"})
 	next := modelValue.(model)
@@ -551,8 +590,8 @@ func TestTypingDoesNotDirtyLogOrStatusViewports(t *testing.T) {
 	if next.logDirty {
 		t.Fatal("expected typing not to dirty log viewport")
 	}
-	if next.statusDirty {
-		t.Fatal("expected typing not to dirty status viewport")
+	if next.panelCache[next.activePanel].dirty {
+		t.Fatal("expected typing not to dirty active panel cache")
 	}
 }
 
@@ -691,7 +730,7 @@ func TestHandleSlashCommandListsTools(t *testing.T) {
 
 	modelValue, _ := handleSlashCommand(m, "/tools")
 	next := modelValue.(model)
-	output := strings.Join(next.output, "\n")
+	output := flattenChatBlocks(next.chatBlocks)
 
 	if !strings.Contains(output, "利用可能な tool:") {
 		t.Fatalf("expected tools header, got %q", output)
@@ -720,7 +759,7 @@ func TestHandleSlashCommandListsTasks(t *testing.T) {
 
 	modelValue, _ := handleSlashCommand(m, "/tasks")
 	next := modelValue.(model)
-	output := strings.Join(next.output, "\n")
+	output := flattenChatBlocks(next.chatBlocks)
 
 	if !strings.Contains(output, "登録済み task:") {
 		t.Fatalf("expected tasks header, got %q", output)
@@ -745,7 +784,7 @@ func TestHandleSlashCommandListsBoundMCPTools(t *testing.T) {
 
 	modelValue, _ := handleSlashCommand(m, "/mcp")
 	next := modelValue.(model)
-	output := strings.Join(next.output, "\n")
+	output := flattenChatBlocks(next.chatBlocks)
 
 	if !strings.Contains(output, "bind 済み MCP tool:") {
 		t.Fatalf("expected mcp header, got %q", output)
@@ -797,7 +836,7 @@ func TestMainPaneSeparatorDoesNotWrap(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 140
 	m.height = 24
-	m.output = appendOutputBlock(nil, assistantOutputLabel, "hello")
+	m.appendOutputBlock(assistantOutputLabel, "hello")
 	m.syncLayout()
 
 	view := m.renderMainPanels()
@@ -1082,8 +1121,9 @@ func TestSubmitPromptStoresNormalizedMessageOnlyForSelectedReference(t *testing.
 	if len(next.messages) != 1 || next.messages[0].Content != "main.go の概要を見せて" {
 		t.Fatalf("unexpected stored message: %+v", next.messages)
 	}
-	if !strings.Contains(strings.Join(next.output, "\n"), "@main.go の概要を見せて") {
-		t.Fatalf("original prompt was not kept in output: %+v", next.output)
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "@main.go の概要を見せて") {
+		t.Fatalf("original prompt was not kept in output: %q", output)
 	}
 }
 
@@ -1143,12 +1183,252 @@ func TestHandleSlashCommandListsAgents(t *testing.T) {
 
 	modelValue, _ := handleSlashCommand(m, "/agents")
 	next := modelValue.(model)
-	output := strings.Join(next.output, "\n")
+	output := flattenChatBlocks(next.chatBlocks)
 
 	if !strings.Contains(output, "利用可能な agent:") {
 		t.Fatalf("expected agents header, got %q", output)
 	}
 	if !strings.Contains(output, "docs-writer - README や設計メモの更新を担当") {
 		t.Fatalf("expected docs-writer entry, got %q", output)
+	}
+}
+
+func TestRenderMemoryPanelDoesNotHitStoreAfterLoad(t *testing.T) {
+	store := &countingMemoryStore{memory: &domain.RepoMemory{
+		Constraints: []string{"Keep README updated."},
+	}}
+	m := newModelWithStores(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil, nil, store)
+	m.width = 120
+	m.height = 28
+	m.activePanel = sidePanelMemory
+
+	msg := initialMemoryLoadCmd(store)()
+	modelValue, _ := m.Update(msg)
+	next := modelValue.(model)
+	if store.loads != 1 {
+		t.Fatalf("expected one initial load, got %d", store.loads)
+	}
+
+	next.syncLayout()
+	before := store.loads
+	rendered := next.renderStatus()
+	if store.loads != before {
+		t.Fatalf("expected renderStatus not to call memory store, got %d -> %d", before, store.loads)
+	}
+	if !strings.Contains(rendered, "Keep README updated.") {
+		t.Fatalf("unexpected memory panel: %q", rendered)
+	}
+}
+
+func TestMemoryPanelShowsLoadingPlaceholderBeforeLoadCompletes(t *testing.T) {
+	m := newModelWithStores(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil, nil, stubMemoryStore{})
+	m.width = 120
+	m.height = 28
+	m.activePanel = sidePanelMemory
+	m.memory.loading = true
+	m.syncLayout()
+
+	rendered := m.renderStatus()
+	if !strings.Contains(rendered, "(memory loading...)") {
+		t.Fatalf("expected loading placeholder, got %q", rendered)
+	}
+}
+
+func TestApplyStatusEventMaintainsChildrenIndex(t *testing.T) {
+	m := newTestModel(t)
+	now := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "root",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: now,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "child-b",
+		ParentRunID: "root",
+		AgentID:     "coder",
+		Type:        "agent_started",
+		Timestamp:   now,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "child-a",
+		ParentRunID: "root",
+		AgentID:     "reviewer",
+		Type:        "agent_started",
+		Timestamp:   now,
+	})
+
+	children := m.status.children["root"]
+	if len(children) != 2 || children[0] != "child-a" || children[1] != "child-b" {
+		t.Fatalf("unexpected child index: %+v", children)
+	}
+}
+
+func TestApplyStatusEventOrdersRootRunsByActiveAndLatest(t *testing.T) {
+	m := newTestModel(t)
+	base := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "done-run",
+		AgentID:   "manager",
+		Type:      "agent_completed",
+		Timestamp: base.Add(-3 * time.Minute),
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "running-older",
+		AgentID:   "coder",
+		Type:      "agent_started",
+		Timestamp: base.Add(-2 * time.Minute),
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "running-newer",
+		AgentID:   "reviewer",
+		Type:      "tool_called",
+		Timestamp: base.Add(-1 * time.Minute),
+	})
+
+	if got := m.status.rootRunIDs; len(got) != 3 || got[0] != "running-newer" || got[1] != "running-older" || got[2] != "done-run" {
+		t.Fatalf("unexpected root ordering: %+v", got)
+	}
+}
+
+func TestApplyStatusEventReordersChildrenWhenRunBecomesActive(t *testing.T) {
+	m := newTestModel(t)
+	base := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "root",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: base.Add(-5 * time.Minute),
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "done-child",
+		ParentRunID: "root",
+		AgentID:     "coder",
+		Type:        "agent_completed",
+		Timestamp:   base.Add(-4 * time.Minute),
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "active-child",
+		ParentRunID: "root",
+		AgentID:     "reviewer",
+		Type:        "agent_started",
+		Timestamp:   base.Add(-3 * time.Minute),
+	})
+
+	children := m.status.children["root"]
+	if len(children) != 2 || children[0] != "active-child" || children[1] != "done-child" {
+		t.Fatalf("unexpected initial child ordering: %+v", children)
+	}
+
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "done-child",
+		ParentRunID: "root",
+		AgentID:     "coder",
+		Type:        "tool_called",
+		Timestamp:   base.Add(-1 * time.Minute),
+	})
+
+	children = m.status.children["root"]
+	if len(children) != 2 || children[0] != "done-child" || children[1] != "active-child" {
+		t.Fatalf("unexpected reordered child ordering: %+v", children)
+	}
+}
+
+func TestRenderLogReusesCachedBlockWithoutWidthChange(t *testing.T) {
+	m := newTestModel(t)
+	m.viewport.SetWidth(20)
+	m.appendOutputBlock(assistantOutputLabel, "hello world")
+
+	first := m.renderLog()
+	if len(m.chatBlocks) != 1 || m.chatBlocks[0].rendered == "" {
+		t.Fatalf("expected rendered cache to be populated: %+v", m.chatBlocks)
+	}
+	cached := m.chatBlocks[0].rendered
+	second := m.renderLog()
+	if second != first {
+		t.Fatalf("expected stable render output, got %q vs %q", first, second)
+	}
+	if m.chatBlocks[0].rendered != cached {
+		t.Fatal("expected cached block render to be reused")
+	}
+}
+
+func TestRenderLogRebuildsCacheWhenWidthChanges(t *testing.T) {
+	m := newTestModel(t)
+	m.viewport.SetWidth(20)
+	m.appendOutputBlock(assistantOutputLabel, "aaaaaaaaaaaa")
+	_ = m.renderLog()
+	initial := m.chatBlocks[0].rendered
+
+	m.viewport.SetWidth(5)
+	rendered := m.renderLog()
+	if m.chatBlocks[0].rendered == initial {
+		t.Fatal("expected cached render to change after width update")
+	}
+	if !strings.Contains(rendered, "aaaaa\naaaaa\naa") {
+		t.Fatalf("expected wrapped output after width change, got %q", rendered)
+	}
+}
+
+func BenchmarkRenderLogLargeHistory(b *testing.B) {
+	m := newModel(stubOrchestrator{}, b.TempDir(), "", nil, nil, nil, nil)
+	m.viewport.SetWidth(80)
+	for i := 0; i < 1000; i++ {
+		m.appendOutputBlock(assistantOutputLabel, fmt.Sprintf("message %d %s", i, strings.Repeat("x", 80)))
+	}
+	_ = m.renderLog()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.logDirty = true
+		_ = m.renderLog()
+	}
+}
+
+func BenchmarkRenderStatusRunGraphManyNodes(b *testing.B) {
+	m := newModel(stubOrchestrator{}, b.TempDir(), "", nil, nil, nil, nil)
+	m.width = 140
+	m.height = 30
+	m.statusViewport.SetWidth(58)
+	now := time.Now()
+	for i := 0; i < 400; i++ {
+		runID := fmt.Sprintf("run-%03d", i)
+		parentID := ""
+		if i > 0 {
+			parentID = fmt.Sprintf("run-%03d", (i-1)/2)
+		}
+		m.applyStatusEvent(domain.ExecutionEvent{
+			RunID:       runID,
+			ParentRunID: parentID,
+			AgentID:     "agent",
+			Type:        "agent_started",
+			Timestamp:   now,
+		})
+	}
+	m.activePanel = sidePanelRunGraph
+	_ = m.renderStatus()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.invalidatePanel(sidePanelRunGraph)
+		_ = m.renderStatus()
+	}
+}
+
+func BenchmarkRenderStatusMemoryPanel(b *testing.B) {
+	m := newModelWithStores(stubOrchestrator{}, b.TempDir(), "", nil, nil, nil, nil, nil, stubMemoryStore{memory: &domain.RepoMemory{
+		Constraints: []string{"Keep README updated."},
+	}})
+	m.width = 140
+	m.height = 30
+	m.statusViewport.SetWidth(58)
+	m.activePanel = sidePanelMemory
+	m.memory.loading = false
+	m.memory.data = &domain.RepoMemory{
+		Constraints: []string{"Keep README updated."},
+	}
+	_ = m.renderStatus()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.invalidatePanel(sidePanelMemory)
+		_ = m.renderStatus()
 	}
 }
