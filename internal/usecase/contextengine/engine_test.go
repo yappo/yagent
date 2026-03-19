@@ -2,11 +2,13 @@ package contextengine
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"yagent/internal/config"
 	"yagent/internal/domain"
+	"yagent/internal/infra/state"
 )
 
 type stubMemoryStore struct {
@@ -35,11 +37,15 @@ func TestBuildIncludesPlanArtifactsAndMemory(t *testing.T) {
 		CompactAfterEstTokens:    1000,
 		CompactAfterVerifyCycles: 2,
 	}, stubMemoryStore{memory: &domain.RepoMemory{
-		Constraints: []string{"Keep README updated."},
-		SuccessfulCommands: []domain.CommandMemoryEntry{{
+		StableFacts: []domain.WorkspaceFact{{
+			ID:      "fact-1",
+			Summary: "Keep README updated.",
+		}, {
+			ID:      "fact-2",
 			Summary: "go test ./...",
 		}},
-	}}, 8)
+		KnownFailures: []string{"missing regression coverage"},
+	}}, nil, 8)
 
 	run := &domain.RunState{
 		UserGoal: "Improve the coding agent.",
@@ -84,7 +90,7 @@ func TestMaybeCompactCreatesArtifactWhenThresholdExceeded(t *testing.T) {
 		CompactAfterToolCalls:    10,
 		CompactAfterEstTokens:    1000,
 		CompactAfterVerifyCycles: 2,
-	}, nil, 8)
+	}, nil, nil, 8)
 	run := &domain.RunState{
 		CurrentPhase: domain.RunPhaseExecute,
 		Messages: []domain.Message{
@@ -98,10 +104,136 @@ func TestMaybeCompactCreatesArtifactWhenThresholdExceeded(t *testing.T) {
 	if !ok || artifact == nil {
 		t.Fatalf("expected compaction artifact")
 	}
-	if artifact.Kind != "context_summary" {
+	if artifact.Kind != "packet_digest" {
 		t.Fatalf("unexpected artifact: %+v", artifact)
 	}
-	if run.ConversationSummary == "" {
-		t.Fatalf("expected run summary to be updated")
+	if artifact.SchemaVersion != "packet_digest.v1" {
+		t.Fatalf("expected schema version, got %+v", artifact)
+	}
+	var payload domain.PacketDigestArtifactPayload
+	if err := json.Unmarshal(artifact.Payload, &payload); err != nil {
+		t.Fatalf("expected typed payload: %v", err)
+	}
+}
+
+func TestBuildScopesArtifactsAndObservationsByRole(t *testing.T) {
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        8,
+		MaxArtifacts:             8,
+		MaxRelevantFiles:         8,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, stubMemoryStore{memory: &domain.RepoMemory{
+		ReusableObservations: []domain.ObservationSummary{
+			{ObservationID: "obs-1", ToolName: "fs_read", Summary: "read file"},
+			{ObservationID: "obs-2", ToolName: "task_run", Summary: "ran tests"},
+		},
+	}}, nil, 8)
+
+	run := &domain.RunState{
+		UserGoal: "Refactor runtime.",
+		Artifacts: []domain.RunArtifact{
+			{ID: "a1", Name: "Execution plan", Kind: "execution_plan"},
+			{ID: "a2", Name: "Evidence bundle", Kind: "evidence_bundle"},
+			{ID: "a3", Name: "Final response", Kind: "final_response"},
+		},
+	}
+	messages := []domain.Message{
+		{Role: domain.RoleUser, Content: "please refactor"},
+		{Role: domain.RoleAssistant, Content: "thinking"},
+		{Role: domain.RoleUser, Content: "check internal/usecase/orchestrator"},
+	}
+
+	coder := engine.Build(run, domain.AgentSpec{ID: "coder"}, domain.RunPhaseExecute, messages, nil)
+	if len(coder.Artifacts) == 0 || coder.Artifacts[len(coder.Artifacts)-1].Kind == "final_response" {
+		t.Fatalf("coder packet should exclude final response artifacts: %+v", coder.Artifacts)
+	}
+	if len(coder.Observations) != 1 || coder.Observations[0].ToolName != "fs_read" {
+		t.Fatalf("coder packet should keep file observations, got %+v", coder.Observations)
+	}
+
+	finalizer := engine.Build(run, domain.AgentSpec{ID: "manager"}, domain.RunPhaseFinalize, messages, nil)
+	foundFinal := false
+	for _, item := range finalizer.Artifacts {
+		if item.Kind == "final_response" {
+			foundFinal = true
+			break
+		}
+	}
+	if !foundFinal {
+		t.Fatalf("finalizer packet should include final response artifacts: %+v", finalizer.Artifacts)
+	}
+}
+
+func TestMaybeCompactPayloadIncludesWorkUnits(t *testing.T) {
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        1,
+		MaxArtifacts:             4,
+		MaxRelevantFiles:         4,
+		CompactAfterTurns:        1,
+		CompactAfterToolCalls:    10,
+		CompactAfterEstTokens:    1000,
+		CompactAfterVerifyCycles: 2,
+	}, nil, nil, 8)
+	run := &domain.RunState{
+		CurrentPhase: domain.RunPhaseExecute,
+		Messages:     []domain.Message{{Role: domain.RoleUser, Content: "compact"}},
+		WorkUnits: []domain.WorkUnit{{
+			ID:     "execute:primary:coder",
+			Kind:   "primary",
+			Role:   "coder",
+			Phase:  domain.RunPhaseExecute,
+			Status: "done",
+			Task:   "Implement runtime changes",
+		}},
+	}
+
+	artifact, ok := engine.MaybeCompact(run)
+	if !ok || artifact == nil {
+		t.Fatalf("expected compaction artifact")
+	}
+	var payload domain.PacketDigestArtifactPayload
+	if err := json.Unmarshal(artifact.Payload, &payload); err != nil {
+		t.Fatalf("expected typed payload: %v", err)
+	}
+	if len(payload.WorkUnits) != 1 || payload.WorkUnits[0].ID != "execute:primary:coder" {
+		t.Fatalf("expected work unit digest, got %+v", payload.WorkUnits)
+	}
+}
+
+func TestBuildRecordsPacketScratch(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        4,
+		MaxArtifacts:             4,
+		MaxRelevantFiles:         4,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, nil, store, 8)
+
+	run := &domain.RunState{
+		ID:        "run-1",
+		RootRunID: "run-1",
+		UserGoal:  "Ship the refactor.",
+		Artifacts: []domain.RunArtifact{{ID: "a1", Name: "Execution plan", Kind: "execution_plan"}},
+	}
+	ctx := engine.Build(run, domain.AgentSpec{ID: "coder"}, domain.RunPhaseExecute, []domain.Message{{Role: domain.RoleUser, Content: "update README.md"}}, nil)
+	if ctx.PacketRole != "coder" {
+		t.Fatalf("unexpected packet role: %+v", ctx)
+	}
+
+	items, err := store.ListScratch(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListScratch returned error: %v", err)
+	}
+	if len(items) == 0 || items[0].Kind != "agent_packet" {
+		t.Fatalf("expected packet scratch record, got %+v", items)
 	}
 }

@@ -2,12 +2,15 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"yagent/internal/domain"
+	"yagent/internal/infra/state"
 )
 
 type fakeModelClient struct {
@@ -52,6 +55,32 @@ func (f *fakeToolExecutor) Execute(ctx context.Context, agent domain.AgentSpec, 
 	}
 	f.calls = append(f.calls, call)
 	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "tool output"}
+}
+
+type concurrentModelClient struct {
+	responses     map[string]domain.ModelResponse
+	delay         time.Duration
+	inFlight      atomic.Int32
+	maxConcurrent atomic.Int32
+}
+
+func (c *concurrentModelClient) Generate(_ context.Context, request domain.ModelRequest) (domain.ModelResponse, error) {
+	current := c.inFlight.Add(1)
+	for {
+		maxSeen := c.maxConcurrent.Load()
+		if current <= maxSeen {
+			break
+		}
+		if c.maxConcurrent.CompareAndSwap(maxSeen, current) {
+			break
+		}
+	}
+	time.Sleep(c.delay)
+	c.inFlight.Add(-1)
+	if response, ok := c.responses[request.Agent.ID]; ok {
+		return response, nil
+	}
+	return domain.ModelResponse{Message: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}, nil
 }
 
 type fakeCatalog struct {
@@ -249,6 +278,53 @@ func TestRunTurnCanDisablePhaseHarness(t *testing.T) {
 	}
 	if result.Run == nil || result.Run.ExecutionPlan == nil || result.Run.ExecutionPlan.Source != "disabled_harness" || len(result.Run.Verification) != 0 {
 		t.Fatalf("expected disabled harness execution plan, got %+v", result.Run)
+	}
+}
+
+func TestRunTurnPersistsTypedArtifacts(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done directly with README.md"},
+				}},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DisablePhaseHarness: true},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Run == nil || len(result.Run.Artifacts) < 3 {
+		t.Fatalf("expected artifacts, got %+v", result.Run)
+	}
+
+	var planPayload domain.ExecutionPlanArtifactPayload
+	if err := json.Unmarshal(result.Run.Artifacts[1].Payload, &planPayload); err != nil {
+		t.Fatalf("expected typed execution plan payload: %v", err)
+	}
+	if planPayload.Plan == nil || planPayload.Plan.Source == "" {
+		t.Fatalf("expected execution plan payload, got %+v", planPayload)
+	}
+
+	finalArtifact := result.Run.Artifacts[len(result.Run.Artifacts)-1]
+	if finalArtifact.Kind != "final_response" {
+		t.Fatalf("expected final response artifact, got %+v", finalArtifact)
+	}
+	var finalPayload domain.FinalResponseArtifactPayload
+	if err := json.Unmarshal(finalArtifact.Payload, &finalPayload); err != nil {
+		t.Fatalf("expected typed final response payload: %v", err)
+	}
+	if !strings.Contains(finalPayload.Response, "README.md") {
+		t.Fatalf("expected final response payload content, got %+v", finalPayload)
 	}
 }
 
@@ -1162,4 +1238,425 @@ func TestRunTurnRunsVerificationAndRecoveryLoop(t *testing.T) {
 	if !foundRecovery {
 		t.Fatalf("expected recovery artifact, got %+v", result.Run.Artifacts)
 	}
+	foundTestReport := false
+	foundSecondAttempt := false
+	for _, artifact := range result.Run.Artifacts {
+		if artifact.Kind == "test_report" {
+			foundTestReport = true
+		}
+	}
+	for _, unit := range result.Run.WorkUnits {
+		if unit.ID == "recover:2:coder" || unit.ID == "verify:2:tester" {
+			foundSecondAttempt = true
+		}
+	}
+	if !foundTestReport {
+		t.Fatalf("expected typed test_report artifact, got %+v", result.Run.Artifacts)
+	}
+	if !foundSecondAttempt {
+		t.Fatalf("expected dynamic second-attempt work units, got %+v", result.Run.WorkUnits)
+	}
+}
+
+func TestRunTurnBuildsTypedArtifactsAndTypedMemoryFacts(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "full",
+  "task_kind": "mutate",
+  "summary": "Update README, verify it, then summarize.",
+  "primary": {
+    "agent_id": "coder",
+    "reason": "Update README.md"
+  },
+  "verify": [
+    {
+      "agent_id": "tester",
+      "reason": "Verify the README update."
+    }
+  ],
+  "finalize": {
+    "agent_id": "manager",
+    "reason": "Summarize the README update."
+  }
+}`},
+				}},
+				"coder": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{
+							{ID: "call-read", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}},
+							{ID: "call-write", Name: "fs_write", Arguments: map[string]any{"path": "README.md", "content": "updated"}},
+						},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "README updated"},
+				}},
+				"tester": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: README looks good\nREPAIR_BRIEF: none"},
+				}},
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "all done"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"coder": {{
+					Name:         "fs_read",
+					ReadOnly:     true,
+					ParallelSafe: true,
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassObserve,
+						ReusePolicy:     domain.ToolReuseOnSuccess,
+						DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+						SideEffectClass: domain.SideEffectNone,
+						Source:          "fs",
+						ReadPathArgs:    []string{"path"},
+					},
+				}, {
+					Name:             "fs_write",
+					MutatesWorkspace: true,
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassMutate,
+						ReusePolicy:     domain.ToolReuseNever,
+						DuplicatePolicy: domain.ToolDuplicateAllow,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+						SideEffectClass: domain.SideEffectWorkspace,
+						Source:          "fs",
+						WritePathArgs:   []string{"path"},
+					},
+				}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				switch call.Name {
+				case "fs_read":
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "old README"}
+				case "fs_write":
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "wrote README"}
+				default:
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "ok"}
+				}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"planner": {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"coder":   {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+			"tester":  {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+		}},
+		Config{
+			MaxParallelAgents:       2,
+			MaxHandoffDepth:         2,
+			MaxVerificationAttempts: 1,
+			RunStore:                store,
+			MemoryStore:             store,
+			RuntimeStore:            store,
+		},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "update README.md"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+
+	foundKinds := map[string]domain.RunArtifact{}
+	for _, artifact := range result.Run.Artifacts {
+		foundKinds[artifact.Kind] = artifact
+	}
+	for _, kind := range []string{"repo_map", "change_set", "test_report", "final_response"} {
+		if _, ok := foundKinds[kind]; !ok {
+			t.Fatalf("expected %s artifact, got %+v", kind, result.Run.Artifacts)
+		}
+	}
+
+	var repoMap domain.RepoMapArtifactPayload
+	if err := json.Unmarshal(foundKinds["repo_map"].Payload, &repoMap); err != nil {
+		t.Fatalf("repo_map payload decode failed: %v", err)
+	}
+	foundREADMERef := false
+	for _, entry := range repoMap.Entries {
+		if strings.HasSuffix(entry.Path, "README.md") {
+			foundREADMERef = true
+			break
+		}
+	}
+	if !foundREADMERef {
+		t.Fatalf("expected README.md in repo_map, got %+v", repoMap.Entries)
+	}
+
+	var changeSet domain.ChangeSetArtifactPayload
+	if err := json.Unmarshal(foundKinds["change_set"].Payload, &changeSet); err != nil {
+		t.Fatalf("change_set payload decode failed: %v", err)
+	}
+	foundChangedREADME := false
+	for _, file := range changeSet.Files {
+		if strings.HasSuffix(file.Path, "README.md") {
+			foundChangedREADME = true
+			break
+		}
+	}
+	if !foundChangedREADME {
+		t.Fatalf("expected README.md in change_set, got %+v", changeSet.Files)
+	}
+
+	memory, err := store.LoadMemory(context.Background())
+	if err != nil {
+		t.Fatalf("LoadMemory returned error: %v", err)
+	}
+	foundTypedFact := false
+	for _, fact := range memory.StableFacts {
+		if strings.HasPrefix(fact.ID, workspaceFactRepoPathPrefix) || strings.HasPrefix(fact.ID, workspaceFactChangedPathPrefix) {
+			foundTypedFact = true
+			break
+		}
+	}
+	if !foundTypedFact {
+		t.Fatalf("expected typed workspace facts, got %+v", memory.StableFacts)
+	}
+
+	expectedPath := normalizePathForWorkspace("README.md")
+	foundPrimaryScope := false
+	foundVerifyScope := false
+	for _, unit := range result.Run.WorkUnits {
+		switch {
+		case unit.Kind == "primary" && len(unit.WriteSet) > 0:
+			if containsString(unit.WriteSet, expectedPath) {
+				foundPrimaryScope = true
+			}
+		case unit.Kind == "verification" && len(unit.ReadSet) > 0:
+			if containsString(unit.ReadSet, expectedPath) {
+				foundVerifyScope = true
+			}
+		}
+	}
+	if !foundPrimaryScope || !foundVerifyScope {
+		t.Fatalf("expected scoped work units, got %+v", result.Run.WorkUnits)
+	}
+}
+
+func TestRunTurnSuppressesDuplicateToolCalls(t *testing.T) {
+	var calls atomic.Int32
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{
+							{ID: "call-1", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}},
+							{ID: "call-2", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}},
+						},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{
+					Name:         "fs_read",
+					ReadOnly:     true,
+					ParallelSafe: true,
+					Metadata:     map[string]any{"category": "fs"},
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassObserve,
+						ReusePolicy:     domain.ToolReuseOnSuccess,
+						DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+						SideEffectClass: domain.SideEffectNone,
+						Source:          "fs",
+						ReadPathArgs:    []string{"path"},
+					},
+				}},
+			},
+			exec: func(context.Context, domain.AgentSpec, domain.ToolCall) domain.ToolResult {
+				calls.Add(1)
+				return domain.ToolResult{Success: true, Output: "hello"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 4, MaxHandoffDepth: 1, DisablePhaseHarness: true},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "read file"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected one tool execution, got %d", calls.Load())
+	}
+	if !hasEventType(result.Events, "duplicate_suppressed") {
+		t.Fatalf("expected duplicate_suppressed event, got %+v", result.Events)
+	}
+}
+
+func TestRunTurnReusesCachedObservationsAcrossTurns(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+
+	var calls atomic.Int32
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role:      domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{ID: "call-1", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "first"},
+				}, {
+					Message: domain.Message{
+						Role:      domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{ID: "call-2", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "second"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{
+					Name:         "fs_read",
+					ReadOnly:     true,
+					ParallelSafe: true,
+					Metadata:     map[string]any{"category": "fs"},
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassObserve,
+						ReusePolicy:     domain.ToolReuseOnSuccess,
+						DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+						SideEffectClass: domain.SideEffectNone,
+						Source:          "fs",
+						ReadPathArgs:    []string{"path"},
+					},
+				}},
+			},
+			exec: func(context.Context, domain.AgentSpec, domain.ToolCall) domain.ToolResult {
+				calls.Add(1)
+				return domain.ToolResult{Success: true, Output: "cached hello"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{
+			MaxParallelAgents:   2,
+			MaxHandoffDepth:     1,
+			DisablePhaseHarness: true,
+			RunStore:            store,
+			MemoryStore:         store,
+			RuntimeStore:        store,
+		},
+	)
+
+	_, err = service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "read file"}},
+	})
+	if err != nil {
+		t.Fatalf("first RunTurn returned error: %v", err)
+	}
+	second, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "read file again"}},
+	})
+	if err != nil {
+		t.Fatalf("second RunTurn returned error: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected cached second execution, got %d calls", calls.Load())
+	}
+	if !hasEventType(second.Events, "cache_hit") {
+		t.Fatalf("expected cache_hit event, got %+v", second.Events)
+	}
+}
+
+func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
+	model := &concurrentModelClient{
+		delay: 60 * time.Millisecond,
+		responses: map[string]domain.ModelResponse{
+			"coder": {
+				Message: domain.Message{Role: domain.RoleAssistant, Content: "implemented"},
+			},
+			"tester": {
+				Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: tests good\nREPAIR_BRIEF: none"},
+			},
+			"reviewer": {
+				Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: review good\nREPAIR_BRIEF: none"},
+			},
+		},
+	}
+	service := New(
+		model,
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"coder":    {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+			"tester":   {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"reviewer": {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 4, MaxHandoffDepth: 1},
+	)
+
+	plan := &domain.ExecutionPlan{
+		Primary: domain.PlannedAgentAssignment{AgentID: "coder"},
+		Verify: []domain.PlannedAgentAssignment{
+			{AgentID: "tester", Reason: "Run tests"},
+			{AgentID: "reviewer", Reason: "Review risks"},
+		},
+	}
+	run := &domain.RunState{
+		ID:        "run-1",
+		RootRunID: "run-1",
+		Messages:  []domain.Message{{Role: domain.RoleUser, Content: "fix it"}},
+	}
+	run.WorkUnits = workUnitsFromExecutionPlan(run, plan)
+
+	_, _, err := service.runWorkGraph(context.Background(), run, plan, domain.TurnRequest{})
+	if err != nil {
+		t.Fatalf("runWorkGraph returned error: %v", err)
+	}
+	if model.maxConcurrent.Load() < 2 {
+		t.Fatalf("expected parallel verification, max concurrency was %d", model.maxConcurrent.Load())
+	}
+	for _, unit := range run.WorkUnits {
+		if strings.HasPrefix(unit.ID, "verify:") && unit.Status != "done" {
+			t.Fatalf("expected verify work unit to be done, got %+v", unit)
+		}
+	}
+}
+
+func hasEventType(events []domain.ExecutionEvent, typ string) bool {
+	for _, event := range events {
+		if event.Type == typ {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

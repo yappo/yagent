@@ -1902,14 +1902,17 @@ func (m model) listMemory() []string {
 		return []string{"(memory is empty)"}
 	}
 	items := []string{}
-	for _, constraint := range memory.Constraints {
-		items = append(items, "constraint: "+constraint)
+	for _, fact := range memory.StableFacts {
+		items = append(items, "fact: "+fact.Summary)
 	}
-	for _, command := range memory.SuccessfulCommands {
-		items = append(items, "command: "+fallbackString(command.Summary, command.Command))
+	for _, failure := range memory.KnownFailures {
+		items = append(items, "failure: "+failure)
+	}
+	for _, observation := range memory.ReusableObservations {
+		items = append(items, "observation: "+fallbackString(observation.Summary, observation.ToolName))
 	}
 	for _, artifact := range memory.RecentArtifacts {
-		items = append(items, "artifact: "+artifact)
+		items = append(items, "artifact: "+fallbackString(artifact.Name, artifact.Kind))
 	}
 	if len(items) == 0 {
 		return []string{"(memory is empty)"}
@@ -1946,8 +1949,8 @@ func (m *model) resumeLatest() []string {
 		fmt.Sprintf("Resumed run %s", run.ID),
 		fmt.Sprintf("phase=%s status=%s attempt=%d", run.CurrentPhase, run.Status, run.Attempt),
 	}
-	if summary := strings.TrimSpace(run.ConversationSummary); summary != "" {
-		lines = append(lines, "summary: "+summary)
+	if len(run.WorkUnits) > 0 {
+		lines = append(lines, fmt.Sprintf("work_units=%d", len(run.WorkUnits)))
 	}
 	return lines
 }
@@ -2364,14 +2367,22 @@ func (m model) renderMemoryPanel() string {
 			lines = append(lines, wrapContent("- "+trimPathFromEnd(strings.TrimSpace(item), width), width))
 		}
 	}
-	appendSection("Constraints", memory.Constraints)
-	appendSection("Failure patterns", memory.FailurePatterns)
-	commands := make([]string, 0, len(memory.SuccessfulCommands))
-	for _, item := range memory.SuccessfulCommands {
-		commands = append(commands, fallbackString(item.Summary, item.Command))
+	facts := make([]string, 0, len(memory.StableFacts))
+	for _, item := range memory.StableFacts {
+		facts = append(facts, item.Summary)
 	}
-	appendSection("Successful commands", commands)
-	appendSection("Recent artifacts", memory.RecentArtifacts)
+	appendSection("Stable facts", facts)
+	appendSection("Known failures", memory.KnownFailures)
+	observations := make([]string, 0, len(memory.ReusableObservations))
+	for _, item := range memory.ReusableObservations {
+		observations = append(observations, fallbackString(item.Summary, item.ToolName))
+	}
+	appendSection("Reusable observations", observations)
+	artifacts := make([]string, 0, len(memory.RecentArtifacts))
+	for _, item := range memory.RecentArtifacts {
+		artifacts = append(artifacts, fallbackString(item.Name, item.Kind))
+	}
+	appendSection("Recent artifacts", artifacts)
 	if len(lines) == len(m.renderPanelSummary()) {
 		lines = append(lines, "", "(memory is empty)")
 	}

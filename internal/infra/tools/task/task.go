@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,6 +57,16 @@ func (t *listTool) Definition() domain.ToolDefinition {
 			"properties": map[string]any{},
 		},
 		Metadata: map[string]any{"category": "task"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessSnapshot},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "task",
+			IdentityArgs:    []string{},
+			SourceLimit:     2,
+		},
 	}
 }
 
@@ -74,6 +86,17 @@ func (t *runTool) Definition() domain.ToolDefinition {
 			"required": []string{"task_id"},
 		},
 		Metadata: map[string]any{"category": "task"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassMutate,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectProcess,
+			Source:          "task",
+			WritePathArgs:   []string{"task_id"},
+			IdentityArgs:    []string{"task_id"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -92,7 +115,67 @@ func (t *bindTool) Definition() domain.ToolDefinition {
 			"required": []string{"task_id"},
 		},
 		Metadata: map[string]any{"category": "task"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectExternal,
+			Source:          "task",
+			ReadPathArgs:    []string{"task_id"},
+			IdentityArgs:    []string{"task_id"},
+			SourceLimit:     1,
+			Stateful:        true,
+		},
 	}
+}
+
+func (t *runTool) InferRuntime(ctx context.Context, _ domain.AgentSpec, call domain.ToolCall, _ domain.ToolDefinition) (domain.ToolRuntimeHint, bool) {
+	taskID, _ := call.Arguments["task_id"].(string)
+	if strings.TrimSpace(taskID) == "" {
+		return domain.ToolRuntimeHint{}, false
+	}
+	taskDef, ok := t.catalog.Get(ctx, taskID)
+	if !ok || taskDef.Kind != domain.TaskSpecKindCommand || taskDef.Command == nil {
+		return domain.ToolRuntimeHint{}, false
+	}
+	readSet, writeSet := inferCommandAccess(taskDef)
+	sideEffect := domain.SideEffectProcess
+	if taskDef.Command.AllowNetwork {
+		sideEffect = domain.SideEffectNetwork
+	}
+	return domain.ToolRuntimeHint{
+		ReadSet:         readSet,
+		WriteSet:        writeSet,
+		ReplaceAccess:   true,
+		SideEffectClass: sideEffect,
+		Source:          "task:" + taskID,
+		SourceLimit:     1,
+	}, true
+}
+
+func (t *bindTool) InferRuntime(ctx context.Context, _ domain.AgentSpec, call domain.ToolCall, _ domain.ToolDefinition) (domain.ToolRuntimeHint, bool) {
+	taskID, _ := call.Arguments["task_id"].(string)
+	if strings.TrimSpace(taskID) == "" {
+		return domain.ToolRuntimeHint{}, false
+	}
+	taskDef, ok := t.catalog.Get(ctx, taskID)
+	if !ok || taskDef.Kind != domain.TaskSpecKindMCPServer || taskDef.MCPServer == nil {
+		return domain.ToolRuntimeHint{}, false
+	}
+	scope := mcpTaskScope(taskDef.ID)
+	readSet := []string{}
+	if taskDef.MCPServer.Cwd != "" {
+		readSet = append(readSet, taskDef.MCPServer.Cwd)
+	}
+	return domain.ToolRuntimeHint{
+		ReadSet:         compactRuntimePaths(readSet),
+		WriteSet:        []string{scope},
+		ReplaceAccess:   true,
+		SideEffectClass: domain.SideEffectExternal,
+		Source:          "mcp:" + taskDef.ID,
+		SourceLimit:     1,
+	}, true
 }
 
 func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
@@ -296,6 +379,43 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 		return fmt.Errorf("ユーザーによってキャンセルされました")
 	}
 	return nil
+}
+
+func inferCommandAccess(taskDef domain.TaskDefinition) ([]string, []string) {
+	if taskDef.Command == nil {
+		return nil, nil
+	}
+	readSet := append([]string(nil), taskDef.Command.ReadPaths...)
+	writeSet := append([]string(nil), taskDef.Command.WritePaths...)
+	if len(readSet) == 0 && len(writeSet) == 0 && taskDef.Command.Cwd != "" {
+		writeSet = append(writeSet, taskDef.Command.Cwd)
+	}
+	return compactRuntimePaths(readSet), compactRuntimePaths(writeSet)
+}
+
+func compactRuntimePaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func mcpTaskScope(taskID string) string {
+	return "mcp/" + strings.TrimSpace(taskID) + "/state"
 }
 
 func marshalSuccess(call domain.ToolCall, value any) domain.ToolResult {

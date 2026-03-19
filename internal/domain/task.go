@@ -19,6 +19,8 @@ type CommandTaskSpec struct {
 	Command      string
 	Args         []string
 	Cwd          string
+	ReadPaths    []string
+	WritePaths   []string
 	Risk         string
 	AllowNetwork bool
 	Timeout      int

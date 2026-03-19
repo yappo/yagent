@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 
@@ -32,6 +33,8 @@ type taskEntry struct {
 	Command      string   `toml:"command"`
 	Args         []string `toml:"args"`
 	Cwd          string   `toml:"cwd"`
+	ReadPaths    []string `toml:"read_paths"`
+	WritePaths   []string `toml:"write_paths"`
 	Risk         string   `toml:"risk"`
 	AllowNetwork bool     `toml:"allow_network"`
 	Timeout      int      `toml:"timeout"`
@@ -70,7 +73,6 @@ func New(workDir string) (*Catalog, error) {
 		}
 	}
 
-	addAll(detectTemplates(workDir))
 	if userPath, ok := defaultUserTasksPath(); ok {
 		items, err := loadFile(userPath, workDir)
 		if err != nil {
@@ -131,6 +133,8 @@ func loadFile(path string, baseDir string) ([]domain.TaskDefinition, error) {
 				Command:      entry.Command,
 				Args:         append([]string(nil), entry.Args...),
 				Cwd:          cwd,
+				ReadPaths:    resolveTaskPaths(baseDir, cwd, entry.ReadPaths),
+				WritePaths:   resolveTaskPaths(baseDir, cwd, entry.WritePaths),
 				Risk:         normalizeRisk(entry.Risk),
 				AllowNetwork: entry.AllowNetwork,
 				Timeout:      entry.Timeout,
@@ -188,54 +192,6 @@ func defaultUserTasksPath() (string, bool) {
 	return filepath.Join(home, ".config", "yagent", "tasks.toml"), true
 }
 
-func detectTemplates(workDir string) []domain.TaskDefinition {
-	var result []domain.TaskDefinition
-	if exists(filepath.Join(workDir, "go.mod")) {
-		result = append(result,
-			task("go:test", "Go test を実行します", "go", []string{"test", "./..."}, workDir, "medium", false, 300),
-			task("go:build", "Go build を実行します", "go", []string{"build", "./..."}, workDir, "medium", false, 300),
-			task("go:mod-download", "Go 依存関係を取得します", "go", []string{"mod", "download"}, workDir, "high", true, 300),
-		)
-	}
-	if exists(filepath.Join(workDir, "package.json")) {
-		result = append(result,
-			task("npm:install", "npm install を実行します", "npm", []string{"install"}, workDir, "high", true, 600),
-			task("npm:test", "npm test を実行します", "npm", []string{"test"}, workDir, "medium", false, 600),
-			task("npm:build", "npm run build を実行します", "npm", []string{"run", "build"}, workDir, "medium", false, 600),
-		)
-	}
-	if exists(filepath.Join(workDir, "pyproject.toml")) || exists(filepath.Join(workDir, "requirements.txt")) {
-		result = append(result,
-			task("python:install", "Python 依存関係を取得します", "python3", []string{"-m", "pip", "install", "-r", "requirements.txt"}, workDir, "high", true, 600),
-			task("python:test", "pytest を実行します", "pytest", nil, workDir, "medium", false, 600),
-		)
-	}
-	if exists(filepath.Join(workDir, "Cargo.toml")) {
-		result = append(result,
-			task("cargo:test", "cargo test を実行します", "cargo", []string{"test"}, workDir, "medium", false, 600),
-			task("cargo:build", "cargo build を実行します", "cargo", []string{"build"}, workDir, "medium", false, 600),
-		)
-	}
-	return result
-}
-
-func task(id, desc, command string, args []string, cwd, risk string, allowNetwork bool, timeout int) domain.TaskDefinition {
-	return domain.TaskDefinition{
-		ID:          id,
-		Description: desc,
-		Kind:        domain.TaskSpecKindCommand,
-		Command: &domain.CommandTaskSpec{
-			Command:      command,
-			Args:         append([]string(nil), args...),
-			Cwd:          cwd,
-			Risk:         normalizeRisk(risk),
-			AllowNetwork: allowNetwork,
-			Timeout:      timeout,
-		},
-		Source: "template",
-	}
-}
-
 func normalizeRisk(risk string) string {
 	switch risk {
 	case "low", "medium", "high":
@@ -243,11 +199,6 @@ func normalizeRisk(risk string) string {
 	default:
 		return "medium"
 	}
-}
-
-func exists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 func cloneEnv(env map[string]string) map[string]string {
@@ -259,4 +210,25 @@ func cloneEnv(env map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func resolveTaskPaths(baseDir string, cwd string, paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	resolved := make([]string, 0, len(paths))
+	for _, item := range paths {
+		item = filepath.Clean(item)
+		switch {
+		case item == ".":
+			item = cwd
+		case filepath.IsAbs(item):
+		case strings.HasPrefix(item, "./") || strings.HasPrefix(item, "../"):
+			item = filepath.Join(cwd, item)
+		default:
+			item = filepath.Join(baseDir, item)
+		}
+		resolved = append(resolved, filepath.Clean(item))
+	}
+	return resolved
 }

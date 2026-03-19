@@ -27,6 +27,7 @@ type Config struct {
 	ContextEngine           domain.ContextEngine
 	RunStore                domain.RunStateStore
 	MemoryStore             domain.RepoMemoryStore
+	RuntimeStore            domain.RuntimeStateStore
 }
 
 type Service struct {
@@ -107,25 +108,23 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		return domain.TurnResult{}, err
 	}
 
-	manager, ok := s.catalog.Resolve("manager")
-	if !ok {
-		return domain.TurnResult{}, fmt.Errorf("manager agent が見つかりません")
-	}
 	prompt := strings.TrimSpace(run.UserGoal)
 	if prompt == "" {
 		prompt = strings.TrimSpace(latestUserMessage(request.Messages))
 	}
 	inventory := s.buildAgentInventory()
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "planner", "Agent inventory", "agent_inventory", inventoryArtifactSummary(inventory)))
+	run.Artifacts = append(run.Artifacts, newInventoryArtifact(run, domain.RunPhaseIntake, "planner", inventory))
 	_ = s.saveRun(ctx, run)
 
 	var allEvents []domain.ExecutionEvent
 	if s.config.DisablePhaseHarness {
 		run.ExecutionPlan = disabledHarnessExecutionPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "manager", "Execution plan", "execution_plan", stablePlanJSON(run.ExecutionPlan)))
+		run.WorkUnits = workUnitsFromExecutionPlan(run, run.ExecutionPlan)
+		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhaseIntake, "manager", run.ExecutionPlan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
-		result, events, err := s.runDirectPhase(ctx, run, manager, request)
+		s.ensureRepoMapArtifact(ctx, run, domain.RunPhaseIntake, "manager")
+		result, events, err := s.runWorkGraph(ctx, run, run.ExecutionPlan, request)
 		allEvents = append(allEvents, events...)
 		if err != nil {
 			run.Status = domain.RunStatusFailed
@@ -133,31 +132,21 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 			return domain.TurnResult{}, err
 		}
 		run.Status = domain.RunStatusCompleted
-		run.CurrentPhase = domain.RunPhaseExecute
-		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-		artifact := domain.RunArtifact{
-			ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-			Name:      "Final response",
-			Kind:      "final_response",
-			Phase:     domain.RunPhaseExecute,
-			AgentID:   result.Message.AgentID,
-			Summary:   truncateSummary(result.Message.Content),
-			Content:   result.Message.Content,
-			CreatedAt: time.Now(),
-		}
+		artifact := newFinalResponseArtifact(run, run.CurrentPhase, result.Message.AgentID, result.Message.Content)
 		run.Artifacts = append(run.Artifacts, artifact)
-		if s.config.MemoryStore != nil {
-			_ = s.rememberRun(ctx, run)
-		}
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, result.Message.Content))
+		_ = s.rememberRun(ctx, run)
 		_ = s.saveRun(ctx, run)
 		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
 	}
 	if shouldBypassPlanner(prompt) {
 		run.ExecutionPlan = directConversationPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "manager", "Execution plan", "execution_plan", stablePlanJSON(run.ExecutionPlan)))
+		run.WorkUnits = workUnitsFromExecutionPlan(run, run.ExecutionPlan)
+		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhaseIntake, "manager", run.ExecutionPlan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
-		result, events, err := s.runDirectPhase(ctx, run, manager, request)
+		s.ensureRepoMapArtifact(ctx, run, domain.RunPhaseIntake, "manager")
+		final, events, err := s.runWorkGraph(ctx, run, run.ExecutionPlan, request)
 		allEvents = append(allEvents, events...)
 		if err != nil {
 			run.Status = domain.RunStatusFailed
@@ -165,24 +154,12 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 			return domain.TurnResult{}, err
 		}
 		run.Status = domain.RunStatusCompleted
-		run.CurrentPhase = domain.RunPhaseExecute
-		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-		artifact := domain.RunArtifact{
-			ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-			Name:      "Final response",
-			Kind:      "final_response",
-			Phase:     domain.RunPhaseExecute,
-			AgentID:   result.Message.AgentID,
-			Summary:   truncateSummary(result.Message.Content),
-			Content:   result.Message.Content,
-			CreatedAt: time.Now(),
-		}
+		artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
 		run.Artifacts = append(run.Artifacts, artifact)
-		if s.config.MemoryStore != nil {
-			_ = s.rememberRun(ctx, run)
-		}
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
+		_ = s.rememberRun(ctx, run)
 		_ = s.saveRun(ctx, run)
-		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
+		return domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}, nil
 	}
 
 	executionPlan, planEvents, err := s.runPlanPhase(ctx, run, request, inventory)
@@ -193,43 +170,9 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		return domain.TurnResult{}, err
 	}
 
-	executionResult, executeEvents, err := s.runExecutePhase(ctx, run, executionPlan, request)
-	allEvents = append(allEvents, executeEvents...)
-	if err != nil {
-		run.Status = domain.RunStatusFailed
-		_ = s.saveRun(ctx, run)
-		return domain.TurnResult{}, err
-	}
-
-	finalExecution := executionResult
-	if len(executionPlan.Verify) > 0 {
-		for attempt := 1; attempt <= s.config.MaxVerificationAttempts; attempt++ {
-			verification, verifyEvents, err := s.runVerifyPhase(ctx, run, executionPlan, request, finalExecution, attempt)
-			allEvents = append(allEvents, verifyEvents...)
-			if err != nil {
-				run.Status = domain.RunStatusFailed
-				_ = s.saveRun(ctx, run)
-				return domain.TurnResult{}, err
-			}
-			if verification.Status == "pass" {
-				break
-			}
-			if attempt >= s.config.MaxVerificationAttempts {
-				break
-			}
-			repaired, recoverEvents, err := s.runRecoverPhase(ctx, run, executionPlan, request, verification, attempt+1)
-			allEvents = append(allEvents, recoverEvents...)
-			if err != nil {
-				run.Status = domain.RunStatusFailed
-				_ = s.saveRun(ctx, run)
-				return domain.TurnResult{}, err
-			}
-			finalExecution = repaired
-		}
-	}
-
-	final, finalizeEvents, err := s.runFinalizePhase(ctx, run, executionPlan, request, finalExecution)
-	allEvents = append(allEvents, finalizeEvents...)
+	s.ensureRepoMapArtifact(ctx, run, domain.RunPhasePlan, fallbackString(planAgentID(executionPlan), "planner"))
+	final, graphEvents, err := s.runWorkGraph(ctx, run, executionPlan, request)
+	allEvents = append(allEvents, graphEvents...)
 	if err != nil {
 		run.Status = domain.RunStatusFailed
 		_ = s.saveRun(ctx, run)
@@ -237,17 +180,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	}
 
 	run.Status = domain.RunStatusCompleted
-	run.CurrentPhase = lastExecutionPlanPhase(executionPlan)
-	artifact := domain.RunArtifact{
-		ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-		Name:      "Final response",
-		Kind:      "final_response",
-		Phase:     run.CurrentPhase,
-		AgentID:   final.Message.AgentID,
-		Summary:   truncateSummary(final.Message.Content),
-		Content:   final.Message.Content,
-		CreatedAt: time.Now(),
-	}
+	artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
 	run.Artifacts = append(run.Artifacts, artifact)
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
 	_ = s.rememberRun(ctx, run)
@@ -383,10 +316,81 @@ func (s *Service) executeCalls(ctx context.Context, invocation domain.AgentInvoc
 	}
 
 	executable := s.prepareExecutableCalls(invocation.Agent, calls, session)
-	if s.shouldRunSequentially(executable) {
-		return s.executeSequential(ctx, invocation, executable, depth, session)
+	scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
+	specs := make([]scheduleSpec, len(executable))
+	for idx, item := range executable {
+		specs[idx] = s.scheduleSpecForExecutable(ctx, invocation.Agent, item)
 	}
-	return s.executeParallel(ctx, invocation, executable, depth, session)
+
+	results := make([]domain.Message, len(executable))
+	events := make([][]domain.ExecutionEvent, len(executable))
+	completed := map[string]bool{}
+	duplicateResults := map[string]domain.Message{}
+	var duplicateMu sync.Mutex
+	var directMu sync.Mutex
+	var direct *domain.AgentResult
+
+	for len(completed) < len(specs) {
+		batch := scheduler.nextBatch(specs, completed)
+		if len(batch) == 0 {
+			for idx := range specs {
+				if !completed[specs[idx].ID] {
+					batch = append(batch, idx)
+					break
+				}
+			}
+		}
+
+		group, groupCtx := errgroup.WithContext(ctx)
+		group.SetLimit(s.config.MaxParallelAgents)
+		for _, idx := range batch {
+			idx := idx
+			group.Go(func() error {
+				if specs[idx].DuplicateKey != "" {
+					duplicateMu.Lock()
+					if cached, ok := duplicateResults[specs[idx].DuplicateKey]; ok {
+						duplicateMu.Unlock()
+						results[idx] = cached
+						events[idx] = []domain.ExecutionEvent{
+							s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, "duplicate_suppressed", invocation.Phase, invocation.Attempt, "done", executable[idx].call.Name, "", map[string]any{"duplicate_key": specs[idx].DuplicateKey}, countContextItems(invocation.Messages, invocation.Context)),
+						}
+						return nil
+					}
+					duplicateMu.Unlock()
+				}
+				msg, directResult, callEvents, err := s.executeOne(groupCtx, invocation, executable[idx], depth, session)
+				events[idx] = callEvents
+				if err != nil {
+					return err
+				}
+				if directResult != nil {
+					directMu.Lock()
+					if direct == nil {
+						direct = directResult
+					}
+					directMu.Unlock()
+					return nil
+				}
+				results[idx] = msg
+				if specs[idx].DuplicateKey != "" {
+					duplicateMu.Lock()
+					duplicateResults[specs[idx].DuplicateKey] = msg
+					duplicateMu.Unlock()
+				}
+				return nil
+			})
+		}
+		if err := group.Wait(); err != nil {
+			return nil, nil, flattenEvents(events), err
+		}
+		for _, idx := range batch {
+			completed[specs[idx].ID] = true
+		}
+		if direct != nil {
+			return nil, direct, flattenEvents(events), nil
+		}
+	}
+	return results, nil, flattenEvents(events), nil
 }
 
 type executableCall struct {
@@ -557,21 +561,32 @@ func (s *Service) executeOne(ctx context.Context, invocation domain.AgentInvocat
 		}
 		return toolMessage(item.call, result.Message.Content), nil, result.Events, nil
 	default:
-		s.notifyToolEvent(ctx, domain.ToolEvent{Phase: "start", Call: item.call})
-		result := s.tools.Execute(ctx, invocation.Agent, item.call)
-		s.notifyToolEvent(ctx, domain.ToolEvent{Phase: "finish", Call: item.call, Result: result})
-		eventType := "tool_called"
-		detail := item.call.Name
-		if !result.Success {
-			eventType = "tool_failed"
-			detail = item.call.Name + ": " + result.Output
-		}
-		status := "done"
-		if !result.Success {
-			status = "failed"
-		}
-		events := []domain.ExecutionEvent{s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, eventType, invocation.Phase, invocation.Attempt, status, detail, "", nil, countContextItems(invocation.Messages, invocation.Context))}
-		return toolMessage(item.call, result.Output), nil, events, nil
+		message, events := s.executeToolCall(ctx, invocation, item)
+		return message, nil, events, nil
+	}
+}
+
+func (s *Service) scheduleSpecForExecutable(ctx context.Context, agent domain.AgentSpec, item executableCall) scheduleSpec {
+	descriptor := s.describeToolRuntime(ctx, agent, item)
+	duplicateKey := ""
+	if descriptor.semantics.DuplicatePolicy == domain.ToolDuplicateSuppressInflight || descriptor.semantics.DuplicatePolicy == domain.ToolDuplicateSuppressSemantic {
+		duplicateKey = descriptor.semanticKey
+	}
+	if item.targetAgent != nil || item.ephemeral != nil || item.handoff {
+		descriptor.semantics.SideEffectClass = domain.SideEffectExternal
+		descriptor.semantics.Source = "agent"
+		descriptor.semantics.SourceLimit = 1
+		descriptor.readSet = nil
+		descriptor.writeSet = nil
+	}
+	return scheduleSpec{
+		ID:              fallbackString(item.call.ID, descriptor.semanticKey),
+		ReadSet:         descriptor.readSet,
+		WriteSet:        descriptor.writeSet,
+		SideEffectClass: descriptor.semantics.SideEffectClass,
+		DuplicateKey:    duplicateKey,
+		Source:          descriptor.semantics.Source,
+		SourceLimit:     descriptor.semantics.SourceLimit,
 	}
 }
 
@@ -662,6 +677,16 @@ func agentToolDefinition(spec domain.AgentSpec, handoff bool) domain.ToolDefinit
 			},
 			"required": []string{"task"},
 		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectExternal,
+			Source:          "agent",
+			IdentityArgs:    []string{"task"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -687,6 +712,16 @@ func ephemeralToolDefinition() domain.ToolDefinition {
 			},
 			"required": []string{"task", "instruction"},
 		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectExternal,
+			Source:          "agent",
+			IdentityArgs:    []string{"task", "instruction", "allowed_tools", "read_only", "mode"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -703,6 +738,15 @@ func capabilityListDefinition() domain.ToolDefinition {
 			"type":       "object",
 			"properties": map[string]any{},
 		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassCompute,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessSnapshot},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "agent",
+			SourceLimit:     4,
+		},
 	}
 }
 
@@ -718,6 +762,16 @@ func capabilityEnableDefinition() domain.ToolDefinition {
 				"capability": map[string]any{"type": "string", "description": "有効化する capability 名"},
 			},
 			"required": []string{"capability"},
+		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateSuppressSemantic,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectProcess,
+			Source:          "agent",
+			IdentityArgs:    []string{"capability"},
+			SourceLimit:     1,
 		},
 	}
 }

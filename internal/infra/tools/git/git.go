@@ -100,6 +100,17 @@ func (t *tool) Definition() domain.ToolDefinition {
 			"required":   required,
 		},
 		Metadata: map[string]any{"category": "git"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "git",
+			ReadPathArgs:    []string{"repo_path"},
+			IdentityArgs:    []string{"repo_path", "path", "limit", "target"},
+			SourceLimit:     4,
+		},
 	}
 }
 

@@ -485,17 +485,17 @@ func TestRenderVerificationPanelUsesRunState(t *testing.T) {
 
 func TestRenderMemoryPanelUsesMemoryStore(t *testing.T) {
 	m := newModelWithStores(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil, nil, stubMemoryStore{memory: &domain.RepoMemory{
-		Constraints:        []string{"Keep README updated."},
-		FailurePatterns:    []string{"missing regression coverage"},
-		RecentArtifacts:    []string{"Final response"},
-		SuccessfulCommands: []domain.CommandMemoryEntry{{Summary: "go test ./..."}},
+		StableFacts:          []domain.WorkspaceFact{{ID: "fact-1", Summary: "Keep README updated."}},
+		KnownFailures:        []string{"missing regression coverage"},
+		ReusableObservations: []domain.ObservationSummary{{ObservationID: "obs-1", ToolName: "task_run", Summary: "go test ./..."}},
+		RecentArtifacts:      []domain.ArtifactReference{{ID: "artifact-1", Name: "Final response", Kind: "final_response"}},
 	}})
 	m.memory.loading = false
 	m.memory.data = &domain.RepoMemory{
-		Constraints:        []string{"Keep README updated."},
-		FailurePatterns:    []string{"missing regression coverage"},
-		RecentArtifacts:    []string{"Final response"},
-		SuccessfulCommands: []domain.CommandMemoryEntry{{Summary: "go test ./..."}},
+		StableFacts:          []domain.WorkspaceFact{{ID: "fact-1", Summary: "Keep README updated."}},
+		KnownFailures:        []string{"missing regression coverage"},
+		ReusableObservations: []domain.ObservationSummary{{ObservationID: "obs-1", ToolName: "task_run", Summary: "go test ./..."}},
+		RecentArtifacts:      []domain.ArtifactReference{{ID: "artifact-1", Name: "Final response", Kind: "final_response"}},
 	}
 	m.width = 120
 	m.height = 28
@@ -1356,7 +1356,7 @@ func TestHandleSlashCommandListsAgents(t *testing.T) {
 
 func TestRenderMemoryPanelDoesNotHitStoreAfterLoad(t *testing.T) {
 	store := &countingMemoryStore{memory: &domain.RepoMemory{
-		Constraints: []string{"Keep README updated."},
+		StableFacts: []domain.WorkspaceFact{{ID: "fact-1", Summary: "Keep README updated."}},
 	}}
 	m := newModelWithStores(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil, nil, store)
 	m.width = 120
@@ -1661,7 +1661,7 @@ func BenchmarkRenderStatusRunGraphManyNodes(b *testing.B) {
 
 func BenchmarkRenderStatusMemoryPanel(b *testing.B) {
 	m := newModelWithStores(stubOrchestrator{}, b.TempDir(), "", nil, nil, nil, nil, nil, stubMemoryStore{memory: &domain.RepoMemory{
-		Constraints: []string{"Keep README updated."},
+		StableFacts: []domain.WorkspaceFact{{ID: "fact-1", Summary: "Keep README updated."}},
 	}})
 	m.width = 140
 	m.height = 30
@@ -1669,7 +1669,7 @@ func BenchmarkRenderStatusMemoryPanel(b *testing.B) {
 	m.activePanel = sidePanelMemory
 	m.memory.loading = false
 	m.memory.data = &domain.RepoMemory{
-		Constraints: []string{"Keep README updated."},
+		StableFacts: []domain.WorkspaceFact{{ID: "fact-1", Summary: "Keep README updated."}},
 	}
 	_ = m.renderStatus()
 	b.ResetTimer()

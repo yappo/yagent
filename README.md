@@ -13,7 +13,7 @@ yagent は、「LLM に bash を渡しておけば勝手に賢くやる」とい
 
 MCP Server についても、そのまま無造作に露出させるのではなく、task catalog と bind フローの中で独自にラップしています。これは安全性のためだけではありません。MCP は便利な一方で、server や tool の情報を常時抱え込むとコンテキストを食いやすく、必要のない情報まで LLM に渡し続ける構造になりがちです。yagent では必要なときにだけ `task_bind` で server を bind し、必要な tool だけを公開できるので、コンテキスト消費を抑えながら拡張性も確保しやすくなっています。
 
-さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、`intake -> plan -> execute -> verify -> recover -> finalize` の harness で仕事を分け、必要なら ephemeral agent もその場で生成できます。repo memory や context compaction も持つので、長めの run でも必要な事実だけを残しやすくなっています。
+さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、`intake -> plan -> execute -> verify -> recover -> finalize` の harness で仕事を分け、必要なら ephemeral agent もその場で生成できます。最近の runtime では会話 summary ではなく typed artifact / reusable observation / workspace snapshot を主記憶に寄せているので、長めの run でも次の agent に必要な事実だけを scoped packet として渡しやすくなっています。
 
 要するに yagent は、単なる「TUI から LLM を叩くツール」でも、単なる「自律実行が派手な agent」でもありません。Bash を安易に渡さず、task catalog・file permission・MCP wrapping・subagent orchestration を最初から設計に入れたうえで、それでも task や agent は簡単に拡張できるようにした、**“LLM を信用しない” 前提の実運用志向 coding agent** です。
 
@@ -26,7 +26,7 @@ MCP Server についても、そのまま無造作に露出させるのではな
 - Orchestrator-first のサブエージェント実行
 - planner-driven execution plan で必要な agent だけを選択
 - `intake -> plan -> execute -> verify -> recover -> finalize` の run harness
-- adaptive context compaction と lightweight repo memory
+- adaptive packet compaction と state-first workspace memory
 - role / phase ベースの model routing
 - lazy capability discovery (`list_capabilities` / `enable_capability`)
 - built-in agent catalog と user-defined agent DSL
@@ -154,14 +154,14 @@ instruction = "Review for regressions first."
 - `execution.max_handoff_depth`: handoff の最大深度
 - `execution.default_timeout`: agent ごとの LLM 呼び出し timeout
 - `features.phase_harness`: phased multi-agent harness を使うか
-- `features.adaptive_compaction`: adaptive context compaction を使うか
+- `features.adaptive_compaction`: packet を軽くする compaction を使うか
 - `features.role_routing`: role / phase ベースの router を使うか
-- `features.repo_memory`: repo memory の読込と更新を使うか
+- `features.repo_memory`: workspace memory / observation cache の読込と更新を使うか
 - `routing.profiles.*`: role / phase ごとの model routing 先
 - `harness.max_verification_attempts`: verify -> recover の最大試行回数
 - `harness.force_planner`: 実装前に planner を強制するか
 - `context.*`: recent messages / artifacts / compaction 閾値
-- `memory.*`: `./.yagent/state/` 配下の run state / repo memory 設定
+- `memory.*`: `./.yagent/state/` 配下の session state / workspace memory / observation cache 設定
 - `benchmark.default_runs`: `yagent benchmark` の既定試行回数
 - `agent_catalog.paths`: user-defined agent DSL のファイルまたはディレクトリ一覧
 - `agents.<id>.instruction`: built-in agent の instruction 上書き
@@ -178,9 +178,20 @@ model の優先順は次です。
 
 起動時のカレントディレクトリは自動で許可パスに追加されます。
 
+`memory.state_dir` 配下の主なレイアウトは次です。
+
+- `sessions/`: 各 session の state
+- `workspace/facts.json`: stable workspace facts / known failures / reusable observations の要約
+- `workspace/snapshot.json`: 観測 freshness 判定に使う workspace snapshot
+- `artifacts/`: typed artifact
+- `observations/`: reusable observation record
+- `executions/`: tool execution record
+- `mutations/`: mutation record
+- `latest_session`: `/resume` が参照する最新 session id
+
 ## TUI Panels
 
-右側 pane は `Run Graph / Plan / Verification / Memory` を切り替えられます。`/graph` `/plan` `/verification` `/memory` で直接開けて、`Ctrl+←/→` でも順送りできます。`/resume` を使うと直近 run を読み込み、Plan / Verification / Memory panel もその内容で更新されます。
+右側 pane は `Run Graph / Plan / Verification / Memory` を切り替えられます。`/graph` `/plan` `/verification` `/memory` で直接開けて、`Ctrl+←/→` でも順送りできます。`/resume` を使うと `latest_session` を読み込み、Plan / Verification / Memory panel もその内容で更新されます。`/memory` panel には stable facts / known failures / reusable observations / recent artifacts を表示します。
 
 ## Benchmark
 
@@ -424,7 +435,7 @@ include_tools = ["search_docs"]
 - `/help`: ヘルプ表示
 - `/plan`: 直近 run の plan を表示
 - `/artifacts`: 直近 run の artifacts を表示
-- `/memory`: repo memory を表示
+- `/memory`: workspace memory を表示
 - `/resume`: 最新 run を会話に復元
 - `/approvals`: approval の状態を表示
 - `/clear`: 会話ログをクリア
@@ -532,7 +543,7 @@ internal/
 - `patch_apply`
 - `list_capabilities` / `enable_capability`
 
-Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。  
+Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` とユーザー共通の `~/.config/yagent/tasks.toml` から構築されます。  
 MCP まわりでは、visible な `mcp__*` が空でも `task_list` / `task_bind` による lazy-bind が使える場合があります。  
 write-capable agent では `fs_write` / `patch_apply` を直接実行でき、その後の書き込み承認は通常の assistant 返答ではなく approval dialog で行われます。  
 一方で write tool が見えない理由が current agent の read-only 制約である場合は、「tool が存在しない」のではなく write-capable agent へ委譲すべきケースです。
