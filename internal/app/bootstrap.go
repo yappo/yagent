@@ -151,6 +151,7 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 			ContextEngine:           contextEngine,
 			RunStore:                runStore,
 			MemoryStore:             memoryStore,
+			RuntimeStore:            runStore,
 		}),
 		Tools:        tools,
 		TaskCatalog:  taskCatalog,

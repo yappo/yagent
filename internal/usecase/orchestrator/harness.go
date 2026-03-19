@@ -2,9 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"yagent/internal/domain"
 )
@@ -56,6 +59,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		plan := buildFallbackExecutionPlan(inventory, "planner agent was not available")
 		run.ExecutionPlan = plan
 		run.Plan = planNodesFromExecutionPlan(plan)
+		run.WorkUnits = workUnitsFromExecutionPlan(plan)
 		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, fallbackString(plan.Primary.AgentID, "manager"), "Execution plan", "execution_plan", stablePlanJSON(plan)))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 		_ = s.saveRun(ctx, run)
@@ -72,6 +76,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		plan := buildFallbackExecutionPlan(inventory, "planner call failed: "+err.Error())
 		run.ExecutionPlan = plan
 		run.Plan = planNodesFromExecutionPlan(plan)
+		run.WorkUnits = workUnitsFromExecutionPlan(plan)
 		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, planner.ID, "Execution plan", "execution_plan", stablePlanJSON(plan)))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 		_ = s.saveRun(ctx, run)
@@ -103,6 +108,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 
 	run.ExecutionPlan = plan
 	run.Plan = planNodesFromExecutionPlan(plan)
+	run.WorkUnits = workUnitsFromExecutionPlan(plan)
 	markPlanNodeStatus(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "done")
 	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "Execution plan", "execution_plan", stablePlanJSON(plan)))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
@@ -139,28 +145,87 @@ func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, pla
 	}
 	messages = phaseMessages(messages, "Execution plan:\n"+stablePlanJSON(plan))
 
-	for _, item := range plan.Preparation {
-		agent, ok := s.catalog.Resolve(item.AgentID)
-		if !ok {
-			continue
+	prepEvents := []domain.ExecutionEvent{}
+	prepArtifacts := []domain.RunArtifact{}
+	if len(plan.Preparation) > 0 {
+		scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
+		specs := make([]scheduleSpec, 0, len(plan.Preparation))
+		assignments := make([]domain.PlannedAgentAssignment, 0, len(plan.Preparation))
+		for _, item := range plan.Preparation {
+			specs = append(specs, scheduleSpec{
+				ID:              "prep:" + item.AgentID,
+				Source:          item.AgentID,
+				SourceLimit:     1,
+				SideEffectClass: domain.SideEffectNone,
+			})
+			assignments = append(assignments, item)
+			markWorkUnitStatus(run, "execute:prep:"+item.AgentID, "running")
 		}
-		prepTask := fallbackString(strings.TrimSpace(item.Reason), fmt.Sprintf("Prepare focused context for the primary agent %s. Return only findings that materially help the task.", fallbackString(plan.Primary.AgentID, "manager")))
-		invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseExecute, 1, messages, prepTask)
-		invocation.Context.ExpectedOutput = map[string]any{
-			"goal": "Return only the findings that materially help the primary agent.",
+		completed := map[string]bool{}
+		for len(completed) < len(specs) {
+			batch := scheduler.nextBatch(specs, completed)
+			if len(batch) == 0 {
+				break
+			}
+			group, groupCtx := errgroup.WithContext(ctx)
+			type prepResult struct {
+				index    int
+				artifact domain.RunArtifact
+				events   []domain.ExecutionEvent
+			}
+			results := make([]prepResult, len(batch))
+			for batchIdx, specIdx := range batch {
+				batchIdx := batchIdx
+				specIdx := specIdx
+				group.Go(func() error {
+					item := assignments[specIdx]
+					agent, ok := s.catalog.Resolve(item.AgentID)
+					if !ok {
+						return nil
+					}
+					prepTask := fallbackString(strings.TrimSpace(item.Reason), fmt.Sprintf("Prepare focused context for the primary agent %s. Return only findings that materially help the task.", fallbackString(plan.Primary.AgentID, "manager")))
+					invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseExecute, 1, messages, prepTask)
+					invocation.Context.ExpectedOutput = map[string]any{
+						"goal": "Return only the findings that materially help the primary agent.",
+					}
+					research, err := s.runAgent(groupCtx, invocation, 0)
+					if err != nil {
+						return nil
+					}
+					results[batchIdx] = prepResult{
+						index:    specIdx,
+						artifact: newArtifact(run, domain.RunPhaseExecute, agent.ID, agent.Name+" evidence", "evidence_bundle", research.Message.Content),
+						events:   research.Events,
+					}
+					return nil
+				})
+			}
+			if err := group.Wait(); err != nil {
+				return domain.AgentResult{}, prepEvents, err
+			}
+			for _, item := range results {
+				if item.artifact.ID == "" {
+					continue
+				}
+				prepArtifacts = append(prepArtifacts, item.artifact)
+				prepEvents = append(prepEvents, item.events...)
+				run.Artifacts = append(run.Artifacts, item.artifact)
+				markPlanNodeStatus(run, domain.RunPhaseExecute, item.artifact.AgentID, "done")
+				markWorkUnitStatus(run, "execute:prep:"+item.artifact.AgentID, "done")
+				completed[specs[item.index].ID] = true
+			}
 		}
-		research, err := s.runAgent(ctx, invocation, 0)
-		if err == nil {
-			messages = phaseMessages(messages, agent.Name+" summary:\n"+research.Message.Content)
-			run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, agent.ID, agent.Name+" summary", "research", research.Message.Content))
-			markPlanNodeStatus(run, domain.RunPhaseExecute, agent.ID, "done")
-		}
+	}
+
+	if bundle := buildEvidenceBundleArtifact(run, prepArtifacts); bundle.ID != "" {
+		run.Artifacts = append(run.Artifacts, bundle)
+		messages = phaseMessages(messages, "Evidence bundle:\n"+bundle.Summary)
 	}
 
 	primaryID := fallbackString(plan.Primary.AgentID, "manager")
 	primary, ok := s.catalog.Resolve(primaryID)
 	if !ok {
-		return domain.AgentResult{}, nil, fmt.Errorf("primary agent %q が見つかりません", primaryID)
+		return domain.AgentResult{}, prepEvents, fmt.Errorf("primary agent %q が見つかりません", primaryID)
 	}
 	taskBrief := fallbackString(strings.TrimSpace(plan.Primary.Reason), "Handle the request directly using the prepared context and available tools.")
 	if primary.ID == "manager" {
@@ -168,15 +233,16 @@ func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, pla
 	}
 	result, err := s.runAgent(ctx, s.phaseInvocation(run, primary, request, domain.RunPhaseExecute, 1, messages, taskBrief), 0)
 	if err != nil {
-		return domain.AgentResult{}, nil, err
+		return domain.AgentResult{}, prepEvents, err
 	}
 	markPlanNodeStatus(run, domain.RunPhaseExecute, primary.ID, "done")
+	markWorkUnitStatus(run, "execute:primary:"+primary.ID, "done")
 	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
 	s.maybeCompactRun(run)
 	_ = s.saveRun(ctx, run)
-	return result, result.Events, nil
+	return result, append(prepEvents, result.Events...), nil
 }
 
 func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, execution domain.AgentResult, attempt int) (domain.VerificationResult, []domain.ExecutionEvent, error) {
@@ -187,25 +253,74 @@ func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, plan
 	input := phaseMessages(run.Messages, "Execution summary:\n"+execution.Message.Content, "Execution plan:\n"+stablePlanJSON(plan))
 	results := []domain.VerificationResult{}
 	allEvents := []domain.ExecutionEvent{}
-	for _, item := range plan.Verify {
-		agent, ok := s.catalog.Resolve(item.AgentID)
-		if !ok {
-			continue
+	if len(plan.Verify) > 0 {
+		scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
+		specs := make([]scheduleSpec, 0, len(plan.Verify))
+		for _, item := range plan.Verify {
+			specs = append(specs, scheduleSpec{
+				ID:              "verify:" + item.AgentID,
+				Source:          item.AgentID,
+				SourceLimit:     1,
+				SideEffectClass: domain.SideEffectNone,
+			})
+			markWorkUnitStatus(run, "verify:"+item.AgentID, "running")
 		}
-		agent = withVerificationInstruction(agent)
-		taskBrief := fallbackString(strings.TrimSpace(item.Reason), "Verify the latest implementation. Return VERIFICATION_STATUS, SUMMARY, and REPAIR_BRIEF.")
-		invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseVerify, attempt, input, taskBrief)
-		invocation.Context.ExpectedOutput = verificationOutputContract()
-		result, err := s.runAgent(ctx, invocation, 0)
-		if err != nil {
-			return domain.VerificationResult{}, allEvents, err
+		completed := map[string]bool{}
+		for len(completed) < len(specs) {
+			batch := scheduler.nextBatch(specs, completed)
+			if len(batch) == 0 {
+				break
+			}
+			group, groupCtx := errgroup.WithContext(ctx)
+			type verifyResult struct {
+				index    int
+				parsed   domain.VerificationResult
+				artifact domain.RunArtifact
+				events   []domain.ExecutionEvent
+			}
+			batchResults := make([]verifyResult, len(batch))
+			for batchIdx, specIdx := range batch {
+				batchIdx := batchIdx
+				specIdx := specIdx
+				group.Go(func() error {
+					item := plan.Verify[specIdx]
+					agent, ok := s.catalog.Resolve(item.AgentID)
+					if !ok {
+						return nil
+					}
+					agent = withVerificationInstruction(agent)
+					taskBrief := fallbackString(strings.TrimSpace(item.Reason), "Verify the latest implementation. Return VERIFICATION_STATUS, SUMMARY, and REPAIR_BRIEF.")
+					invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseVerify, attempt, input, taskBrief)
+					invocation.Context.ExpectedOutput = verificationOutputContract()
+					result, err := s.runAgent(groupCtx, invocation, 0)
+					if err != nil {
+						return err
+					}
+					batchResults[batchIdx] = verifyResult{
+						index:    specIdx,
+						parsed:   parseVerification(result.Message.Content, agent.ID, attempt),
+						artifact: newArtifact(run, domain.RunPhaseVerify, agent.ID, agent.Name+" verification", "review_findings", result.Message.Content),
+						events:   result.Events,
+					}
+					return nil
+				})
+			}
+			if err := group.Wait(); err != nil {
+				return domain.VerificationResult{}, allEvents, err
+			}
+			for _, item := range batchResults {
+				if item.parsed.SourceAgent == "" {
+					continue
+				}
+				results = append(results, item.parsed)
+				allEvents = append(allEvents, item.events...)
+				run.Verification = append(run.Verification, item.parsed)
+				run.Artifacts = append(run.Artifacts, item.artifact)
+				markPlanNodeStatus(run, domain.RunPhaseVerify, item.parsed.SourceAgent, "done")
+				markWorkUnitStatus(run, "verify:"+item.parsed.SourceAgent, "done")
+				completed[specs[item.index].ID] = true
+			}
 		}
-		parsed := parseVerification(result.Message.Content, agent.ID, attempt)
-		results = append(results, parsed)
-		allEvents = append(allEvents, result.Events...)
-		run.Verification = append(run.Verification, parsed)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseVerify, agent.ID, agent.Name+" verification", "verification", result.Message.Content))
-		markPlanNodeStatus(run, domain.RunPhaseVerify, agent.ID, "done")
 	}
 	merged := mergeVerification(results, attempt)
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseVerify, merged.Summary))
@@ -310,7 +425,8 @@ func (s *Service) buildContext(run *domain.RunState, agent domain.AgentSpec, pha
 			TaskBrief:          userGoal,
 			RecentMessages:     cloneMessages(messages),
 			RelevantFiles:      extractRelevantFiles(messages),
-			RecentSummary:      userGoal,
+			PacketRole:         agent.ID,
+			PacketKind:         agent.ID,
 			AvailableToolNames: toolNames(visible),
 		}
 		contextPack.ToolState = buildToolState(agent, allTools, visible)
@@ -351,15 +467,21 @@ func phaseMessages(base []domain.Message, additions ...string) []domain.Message 
 }
 
 func newArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, name string, kind string, content string) domain.RunArtifact {
+	payload, _ := json.Marshal(map[string]any{
+		"text": content,
+	})
 	return domain.RunArtifact{
-		ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-		Name:      name,
-		Kind:      kind,
-		Phase:     phase,
-		AgentID:   agentID,
-		Summary:   truncateSummary(content),
-		Content:   content,
-		CreatedAt: time.Now(),
+		ID:            fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
+		Name:          name,
+		Kind:          kind,
+		SchemaVersion: kind + ".v1",
+		Phase:         phase,
+		AgentID:       agentID,
+		Summary:       truncateSummary(content),
+		Text:          content,
+		Content:       content,
+		Payload:       payload,
+		CreatedAt:     time.Now(),
 	}
 }
 
@@ -500,15 +622,28 @@ func (s *Service) rememberRun(ctx context.Context, run *domain.RunState) error {
 		memory = &domain.RepoMemory{}
 	}
 	for _, artifact := range lastArtifacts(run.Artifacts, 8) {
-		memory.RecentArtifacts = appendUnique(memory.RecentArtifacts, artifact.Name+": "+artifact.Summary)
+		memory.RecentArtifacts = appendArtifactRef(memory.RecentArtifacts, domain.ArtifactReference{
+			ID:   artifact.ID,
+			Kind: artifact.Kind,
+			Name: artifact.Name,
+		})
 	}
 	for _, verification := range run.Verification {
 		if strings.EqualFold(verification.Status, "fail") && verification.Summary != "" {
-			memory.FailurePatterns = appendUnique(memory.FailurePatterns, verification.Summary)
+			memory.KnownFailures = appendUnique(memory.KnownFailures, verification.Summary)
 		}
 	}
-	if summary := strings.TrimSpace(run.ConversationSummary); summary != "" {
-		memory.Constraints = appendUnique(memory.Constraints, summary)
+	for _, artifact := range lastArtifacts(run.Artifacts, 4) {
+		if artifact.Summary == "" {
+			continue
+		}
+		memory.StableFacts = appendOrReplaceWorkspaceFact(memory.StableFacts, domain.WorkspaceFact{
+			ID:         artifact.ID,
+			Kind:       artifact.Kind,
+			Summary:    artifact.Summary,
+			ArtifactID: artifact.ID,
+			UpdatedAt:  time.Now(),
+		})
 	}
 	return s.config.MemoryStore.SaveMemory(ctx, memory)
 }
@@ -530,6 +665,152 @@ func appendUnique(items []string, value string) []string {
 		}
 	}
 	return append(items, value)
+}
+
+func appendArtifactRef(items []domain.ArtifactReference, ref domain.ArtifactReference) []domain.ArtifactReference {
+	for _, item := range items {
+		if item.ID == ref.ID {
+			return items
+		}
+	}
+	return append(items, ref)
+}
+
+func appendOrReplaceWorkspaceFact(items []domain.WorkspaceFact, fact domain.WorkspaceFact) []domain.WorkspaceFact {
+	for idx := range items {
+		if items[idx].ID != fact.ID {
+			continue
+		}
+		items[idx] = fact
+		return items
+	}
+	return append(items, fact)
+}
+
+func workUnitsFromExecutionPlan(plan *domain.ExecutionPlan) []domain.WorkUnit {
+	if plan == nil {
+		return nil
+	}
+	units := make([]domain.WorkUnit, 0, len(plan.Preparation)+len(plan.Verify)+4)
+	prepIDs := make([]string, 0, len(plan.Preparation))
+	for _, item := range plan.Preparation {
+		id := "execute:prep:" + item.AgentID
+		prepIDs = append(prepIDs, id)
+		units = append(units, domain.WorkUnit{
+			ID:     id,
+			Kind:   "preparation",
+			Role:   item.AgentID,
+			Phase:  domain.RunPhaseExecute,
+			Task:   item.Reason,
+			Status: "pending",
+			Source: item.AgentID,
+		})
+	}
+	primaryID := "execute:primary:" + plan.Primary.AgentID
+	units = append(units, domain.WorkUnit{
+		ID:        primaryID,
+		Kind:      "primary",
+		Role:      plan.Primary.AgentID,
+		Phase:     domain.RunPhaseExecute,
+		Task:      plan.Primary.Reason,
+		Status:    "pending",
+		DependsOn: append([]string(nil), prepIDs...),
+		Source:    plan.Primary.AgentID,
+	})
+	verifyIDs := make([]string, 0, len(plan.Verify))
+	for _, item := range plan.Verify {
+		id := "verify:" + item.AgentID
+		verifyIDs = append(verifyIDs, id)
+		units = append(units, domain.WorkUnit{
+			ID:        id,
+			Kind:      "verification",
+			Role:      item.AgentID,
+			Phase:     domain.RunPhaseVerify,
+			Task:      item.Reason,
+			Status:    "pending",
+			DependsOn: []string{primaryID},
+			Source:    item.AgentID,
+		})
+	}
+	if plan.Recovery != nil && plan.Recovery.AgentID != "" {
+		units = append(units, domain.WorkUnit{
+			ID:              "recover:" + plan.Recovery.AgentID,
+			Kind:            "recovery",
+			Role:            plan.Recovery.AgentID,
+			Phase:           domain.RunPhaseRecover,
+			Task:            plan.Recovery.Reason,
+			Status:          "pending",
+			DependsOn:       append([]string(nil), verifyIDs...),
+			Source:          plan.Recovery.AgentID,
+			SideEffectClass: domain.SideEffectExternal,
+		})
+	}
+	if plan.Finalize != nil && plan.Finalize.AgentID != "" {
+		dependsOn := []string{primaryID}
+		if plan.Recovery != nil && plan.Recovery.AgentID != "" {
+			dependsOn = []string{"recover:" + plan.Recovery.AgentID}
+		} else if len(verifyIDs) > 0 {
+			dependsOn = append([]string(nil), verifyIDs...)
+		}
+		units = append(units, domain.WorkUnit{
+			ID:        "finalize:" + plan.Finalize.AgentID,
+			Kind:      "finalize",
+			Role:      plan.Finalize.AgentID,
+			Phase:     domain.RunPhaseFinalize,
+			Task:      plan.Finalize.Reason,
+			Status:    "pending",
+			DependsOn: dependsOn,
+			Source:    plan.Finalize.AgentID,
+		})
+	}
+	return units
+}
+
+func markWorkUnitStatus(run *domain.RunState, id string, status string) {
+	if run == nil || id == "" {
+		return
+	}
+	for idx := range run.WorkUnits {
+		if run.WorkUnits[idx].ID != id {
+			continue
+		}
+		run.WorkUnits[idx].Status = status
+		if status == "running" {
+			run.WorkUnits[idx].StartedAt = time.Now()
+		}
+		if status == "done" || status == "failed" {
+			run.WorkUnits[idx].CompletedAt = time.Now()
+		}
+		return
+	}
+}
+
+func buildEvidenceBundleArtifact(run *domain.RunState, artifacts []domain.RunArtifact) domain.RunArtifact {
+	if len(artifacts) == 0 {
+		return domain.RunArtifact{}
+	}
+	summaries := make([]string, 0, len(artifacts))
+	refs := make([]domain.ArtifactReference, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		summaries = append(summaries, artifact.Name+": "+artifact.Summary)
+		refs = append(refs, domain.ArtifactReference{ID: artifact.ID, Kind: artifact.Kind, Name: artifact.Name})
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"artifacts": refs,
+	})
+	return domain.RunArtifact{
+		ID:            fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
+		Name:          "Evidence bundle",
+		Kind:          "evidence_bundle",
+		SchemaVersion: "evidence_bundle.v1",
+		Phase:         domain.RunPhaseExecute,
+		Summary:       truncateSummary(strings.Join(summaries, " | ")),
+		Text:          strings.Join(summaries, "\n"),
+		Content:       strings.Join(summaries, "\n"),
+		Payload:       payload,
+		References:    refs,
+		CreatedAt:     time.Now(),
+	}
 }
 
 func lastArtifacts(items []domain.RunArtifact, limit int) []domain.RunArtifact {

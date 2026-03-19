@@ -40,6 +40,42 @@ func (p *Provider) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 			Metadata:         map[string]any{"category": "mcp", "task_id": item.TaskID, "server_tool_name": item.ServerToolName, "source": "mcp"},
 			ReadOnly:         item.ReadOnly,
 			ParallelSafe:     item.ParallelSafe,
+			Semantics: domain.ToolSemantics{
+				Class: func() domain.ToolClass {
+					if item.ReadOnly {
+						return domain.ToolClassObserve
+					}
+					return domain.ToolClassExecute
+				}(),
+				ReusePolicy: func() domain.ToolReusePolicy {
+					if item.ReadOnly {
+						return domain.ToolReuseOnSuccess
+					}
+					return domain.ToolReuseNever
+				}(),
+				DuplicatePolicy: func() domain.ToolDuplicatePolicy {
+					if item.ReadOnly {
+						return domain.ToolDuplicateSuppressInflight
+					}
+					return domain.ToolDuplicateAllow
+				}(),
+				Freshness: domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+				SideEffectClass: func() domain.SideEffectClass {
+					if item.ReadOnly {
+						return domain.SideEffectNone
+					}
+					return domain.SideEffectExternal
+				}(),
+				Source:       "mcp",
+				IdentityArgs: []string{},
+				SourceLimit: func() int {
+					if item.ParallelSafe {
+						return 2
+					}
+					return 1
+				}(),
+				Stateful: !item.ReadOnly,
+			},
 		})
 	}
 	return definitions

@@ -55,6 +55,16 @@ func (t *Tool) Definition() domain.ToolDefinition {
 			"required": []string{"operations"},
 		},
 		Metadata: map[string]any{"category": "patch"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassMutate,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectWorkspace,
+			Source:          "patch",
+			IdentityArgs:    []string{"operations"},
+			SourceLimit:     1,
+		},
 	}
 }
 

@@ -311,17 +311,26 @@ func buildInvocationInstructions(base string, context domain.RunContext) string 
 		fmt.Sprintf("- user_goal: %s", fallbackString(strings.TrimSpace(context.UserGoal), "-")),
 		fmt.Sprintf("- task_brief: %s", fallbackString(strings.TrimSpace(context.TaskBrief), "-")),
 	}
-	if summary := strings.TrimSpace(context.RecentSummary); summary != "" {
-		lines = append(lines, "- recent_summary: "+summary)
+	if packetRole := strings.TrimSpace(context.PacketRole); packetRole != "" {
+		lines = append(lines, "- packet_role: "+packetRole)
 	}
-	if len(context.Constraints) > 0 {
-		lines = append(lines, "- constraints: "+strings.Join(context.Constraints, "; "))
+	if packetKind := strings.TrimSpace(context.PacketKind); packetKind != "" {
+		lines = append(lines, "- packet_kind: "+packetKind)
+	}
+	if len(context.ScopedConstraints) > 0 {
+		lines = append(lines, "- scoped_constraints: "+strings.Join(context.ScopedConstraints, "; "))
+	}
+	if len(context.KnownFailures) > 0 {
+		lines = append(lines, "- known_failures: "+strings.Join(context.KnownFailures, " | "))
 	}
 	if len(context.RelevantFiles) > 0 {
 		lines = append(lines, "- relevant_files: "+strings.Join(context.RelevantFiles, ", "))
 	}
 	if len(context.ArtifactRefs) > 0 {
 		lines = append(lines, "- artifacts: "+strings.Join(context.ArtifactRefs, ", "))
+	}
+	if len(context.Artifacts) > 0 {
+		lines = append(lines, "- artifact_refs: "+strings.Join(artifactReferenceNames(context.Artifacts), ", "))
 	}
 	if len(context.UnresolvedTODOs) > 0 {
 		lines = append(lines, "- unresolved_todos: "+strings.Join(context.UnresolvedTODOs, "; "))
@@ -334,6 +343,9 @@ func buildInvocationInstructions(base string, context domain.RunContext) string 
 	}
 	if len(context.StableFacts) > 0 {
 		lines = append(lines, "- stable_facts: "+strings.Join(context.StableFacts, " | "))
+	}
+	if len(context.Observations) > 0 {
+		lines = append(lines, "- reusable_observations: "+strings.Join(observationSummaries(context.Observations), " | "))
 	}
 	if len(context.AvailableToolNames) > 0 {
 		lines = append(lines, "- available_tools: "+strings.Join(context.AvailableToolNames, ", "))
@@ -890,12 +902,40 @@ func plannerMessages(base []domain.Message, inventory []domain.AgentInventoryEnt
 	)
 }
 
+func artifactReferenceNames(items []domain.ArtifactReference) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		switch {
+		case item.Name != "":
+			out = append(out, item.Name)
+		case item.Kind != "":
+			out = append(out, item.Kind)
+		default:
+			out = append(out, item.ID)
+		}
+	}
+	return out
+}
+
+func observationSummaries(items []domain.ObservationRecord) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Summary == "" {
+			out = append(out, item.ToolName)
+			continue
+		}
+		out = append(out, item.ToolName+": "+item.Summary)
+	}
+	return out
+}
+
 func countContextItems(messages []domain.Message, context domain.ContextPack) int {
 	messageCount := len(messages)
 	fileCount := len(uniqueStrings(append([]string(nil), context.RelevantFiles...)))
-	artifactCount := len(uniqueStrings(append([]string(nil), context.ArtifactRefs...)))
+	artifactCount := len(uniqueStrings(append([]string(nil), context.ArtifactRefs...))) + len(context.Artifacts)
 	inventoryCount := len(context.AgentInventory)
-	return messageCount + fileCount + artifactCount + inventoryCount
+	observationCount := len(context.Observations)
+	return messageCount + fileCount + artifactCount + inventoryCount + observationCount
 }
 
 func stablePlanJSON(plan *domain.ExecutionPlan) string {

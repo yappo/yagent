@@ -53,6 +53,17 @@ func (t *textTool) Definition() domain.ToolDefinition {
 			"required": []string{"root", "query"},
 		},
 		Metadata: map[string]any{"category": "search"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "search",
+			ReadPathArgs:    []string{"root"},
+			IdentityArgs:    []string{"root", "query", "max_results"},
+			SourceLimit:     6,
+		},
 	}
 }
 
@@ -73,6 +84,17 @@ func (t *filesTool) Definition() domain.ToolDefinition {
 			"required": []string{"root", "name_pattern"},
 		},
 		Metadata: map[string]any{"category": "search"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "search",
+			ReadPathArgs:    []string{"root"},
+			IdentityArgs:    []string{"root", "name_pattern", "max_results"},
+			SourceLimit:     6,
+		},
 	}
 }
 

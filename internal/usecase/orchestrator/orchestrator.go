@@ -27,6 +27,7 @@ type Config struct {
 	ContextEngine           domain.ContextEngine
 	RunStore                domain.RunStateStore
 	MemoryStore             domain.RepoMemoryStore
+	RuntimeStore            domain.RuntimeStateStore
 }
 
 type Service struct {
@@ -383,10 +384,81 @@ func (s *Service) executeCalls(ctx context.Context, invocation domain.AgentInvoc
 	}
 
 	executable := s.prepareExecutableCalls(invocation.Agent, calls, session)
-	if s.shouldRunSequentially(executable) {
-		return s.executeSequential(ctx, invocation, executable, depth, session)
+	scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
+	specs := make([]scheduleSpec, len(executable))
+	for idx, item := range executable {
+		specs[idx] = scheduleSpecForExecutable(item)
 	}
-	return s.executeParallel(ctx, invocation, executable, depth, session)
+
+	results := make([]domain.Message, len(executable))
+	events := make([][]domain.ExecutionEvent, len(executable))
+	completed := map[string]bool{}
+	duplicateResults := map[string]domain.Message{}
+	var duplicateMu sync.Mutex
+	var directMu sync.Mutex
+	var direct *domain.AgentResult
+
+	for len(completed) < len(specs) {
+		batch := scheduler.nextBatch(specs, completed)
+		if len(batch) == 0 {
+			for idx := range specs {
+				if !completed[specs[idx].ID] {
+					batch = append(batch, idx)
+					break
+				}
+			}
+		}
+
+		group, groupCtx := errgroup.WithContext(ctx)
+		group.SetLimit(s.config.MaxParallelAgents)
+		for _, idx := range batch {
+			idx := idx
+			group.Go(func() error {
+				if specs[idx].DuplicateKey != "" {
+					duplicateMu.Lock()
+					if cached, ok := duplicateResults[specs[idx].DuplicateKey]; ok {
+						duplicateMu.Unlock()
+						results[idx] = cached
+						events[idx] = []domain.ExecutionEvent{
+							s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, "duplicate_suppressed", invocation.Phase, invocation.Attempt, "done", executable[idx].call.Name, "", map[string]any{"duplicate_key": specs[idx].DuplicateKey}, countContextItems(invocation.Messages, invocation.Context)),
+						}
+						return nil
+					}
+					duplicateMu.Unlock()
+				}
+				msg, directResult, callEvents, err := s.executeOne(groupCtx, invocation, executable[idx], depth, session)
+				events[idx] = callEvents
+				if err != nil {
+					return err
+				}
+				if directResult != nil {
+					directMu.Lock()
+					if direct == nil {
+						direct = directResult
+					}
+					directMu.Unlock()
+					return nil
+				}
+				results[idx] = msg
+				if specs[idx].DuplicateKey != "" {
+					duplicateMu.Lock()
+					duplicateResults[specs[idx].DuplicateKey] = msg
+					duplicateMu.Unlock()
+				}
+				return nil
+			})
+		}
+		if err := group.Wait(); err != nil {
+			return nil, nil, flattenEvents(events), err
+		}
+		for _, idx := range batch {
+			completed[specs[idx].ID] = true
+		}
+		if direct != nil {
+			return nil, direct, flattenEvents(events), nil
+		}
+	}
+	return results, nil, flattenEvents(events), nil
 }
 
 type executableCall struct {
@@ -557,21 +629,31 @@ func (s *Service) executeOne(ctx context.Context, invocation domain.AgentInvocat
 		}
 		return toolMessage(item.call, result.Message.Content), nil, result.Events, nil
 	default:
-		s.notifyToolEvent(ctx, domain.ToolEvent{Phase: "start", Call: item.call})
-		result := s.tools.Execute(ctx, invocation.Agent, item.call)
-		s.notifyToolEvent(ctx, domain.ToolEvent{Phase: "finish", Call: item.call, Result: result})
-		eventType := "tool_called"
-		detail := item.call.Name
-		if !result.Success {
-			eventType = "tool_failed"
-			detail = item.call.Name + ": " + result.Output
-		}
-		status := "done"
-		if !result.Success {
-			status = "failed"
-		}
-		events := []domain.ExecutionEvent{s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, eventType, invocation.Phase, invocation.Attempt, status, detail, "", nil, countContextItems(invocation.Messages, invocation.Context))}
-		return toolMessage(item.call, result.Output), nil, events, nil
+		message, events := s.executeToolCall(ctx, invocation, item)
+		return message, nil, events, nil
+	}
+}
+
+func scheduleSpecForExecutable(item executableCall) scheduleSpec {
+	semantics := effectiveSemantics(item.definition)
+	duplicateKey := ""
+	if semantics.DuplicatePolicy == domain.ToolDuplicateSuppressInflight || semantics.DuplicatePolicy == domain.ToolDuplicateSuppressSemantic {
+		duplicateKey = semanticFingerprint(item.call.Name, normalizeArguments(item.call.Arguments))
+	}
+	readSet, writeSet := resolveAccessSets(item.call, item.definition, semantics)
+	if item.targetAgent != nil || item.ephemeral != nil || item.handoff {
+		semantics.SideEffectClass = domain.SideEffectExternal
+		semantics.Source = "agent"
+		semantics.SourceLimit = 1
+	}
+	return scheduleSpec{
+		ID:              fallbackString(item.call.ID, semanticFingerprint(item.call.Name, normalizeArguments(item.call.Arguments))),
+		ReadSet:         readSet,
+		WriteSet:        writeSet,
+		SideEffectClass: semantics.SideEffectClass,
+		DuplicateKey:    duplicateKey,
+		Source:          semantics.Source,
+		SourceLimit:     semantics.SourceLimit,
 	}
 }
 
@@ -662,6 +744,16 @@ func agentToolDefinition(spec domain.AgentSpec, handoff bool) domain.ToolDefinit
 			},
 			"required": []string{"task"},
 		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectExternal,
+			Source:          "agent",
+			IdentityArgs:    []string{"task"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -687,6 +779,16 @@ func ephemeralToolDefinition() domain.ToolDefinition {
 			},
 			"required": []string{"task", "instruction"},
 		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectExternal,
+			Source:          "agent",
+			IdentityArgs:    []string{"task", "instruction", "allowed_tools", "read_only", "mode"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -703,6 +805,15 @@ func capabilityListDefinition() domain.ToolDefinition {
 			"type":       "object",
 			"properties": map[string]any{},
 		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassCompute,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessSnapshot},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "agent",
+			SourceLimit:     4,
+		},
 	}
 }
 
@@ -718,6 +829,16 @@ func capabilityEnableDefinition() domain.ToolDefinition {
 				"capability": map[string]any{"type": "string", "description": "有効化する capability 名"},
 			},
 			"required": []string{"capability"},
+		},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateSuppressSemantic,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectProcess,
+			Source:          "agent",
+			IdentityArgs:    []string{"capability"},
+			SourceLimit:     1,
 		},
 	}
 }

@@ -15,6 +15,8 @@
 - tool call card を複数同時表示・履歴表示できるようにする
 - search / git / patch tool のユニットテストを追加する
 - fake approver / fake tool を使った統合テストの拡充
+- typed artifact payload の schema validation を追加する
+- observation relevance ranking を強化して packet をさらに小さくする
 
 ## Tech Debt
 
@@ -23,6 +25,7 @@
 - tool observer と approver bridge の責務整理
 - orchestrator の event payload は UI 表示用 detail とログ用 detail が混ざっている
 - `fs_list` の結果をより強く再利用し、同じ探索を繰り返さないようにしたい
+- scheduler の source semaphore と read/write set 推定はまだ coarse なので、task / MCP の実 path 連携を強くしたい
 - path policy は将来的に glob / rule ベースへ拡張したい
 - task catalog の schema validation と分かりやすいエラーメッセージ整備
 - `exec` コマンドも TUI と同じイベント基盤へさらに寄せたい

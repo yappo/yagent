@@ -55,6 +55,16 @@ func (t *listTool) Definition() domain.ToolDefinition {
 			"properties": map[string]any{},
 		},
 		Metadata: map[string]any{"category": "task"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessSnapshot},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "task",
+			IdentityArgs:    []string{},
+			SourceLimit:     2,
+		},
 	}
 }
 
@@ -74,6 +84,17 @@ func (t *runTool) Definition() domain.ToolDefinition {
 			"required": []string{"task_id"},
 		},
 		Metadata: map[string]any{"category": "task"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassMutate,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectProcess,
+			Source:          "task",
+			WritePathArgs:   []string{"task_id"},
+			IdentityArgs:    []string{"task_id"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -92,6 +113,18 @@ func (t *bindTool) Definition() domain.ToolDefinition {
 			"required": []string{"task_id"},
 		},
 		Metadata: map[string]any{"category": "task"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassExecute,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectExternal,
+			Source:          "task",
+			ReadPathArgs:    []string{"task_id"},
+			IdentityArgs:    []string{"task_id"},
+			SourceLimit:     1,
+			Stateful:        true,
+		},
 	}
 }
 

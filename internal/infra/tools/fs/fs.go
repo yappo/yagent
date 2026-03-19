@@ -93,6 +93,17 @@ func (t *readTool) Definition() domain.ToolDefinition {
 			"required": []string{"path"},
 		},
 		Metadata: map[string]any{"category": "fs"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "fs",
+			ReadPathArgs:    []string{"path"},
+			IdentityArgs:    []string{"path", "offset", "limit_bytes"},
+			SourceLimit:     8,
+		},
 	}
 }
 
@@ -115,6 +126,17 @@ func (t *writeTool) Definition() domain.ToolDefinition {
 			"required": []string{"path", "content"},
 		},
 		Metadata: map[string]any{"category": "fs"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassMutate,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectWorkspace,
+			Source:          "fs",
+			WritePathArgs:   []string{"path"},
+			IdentityArgs:    []string{"path", "create", "overwrite"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -136,6 +158,17 @@ func (t *listTool) Definition() domain.ToolDefinition {
 			"required": []string{"path"},
 		},
 		Metadata: map[string]any{"category": "fs"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "fs",
+			ReadPathArgs:    []string{"path"},
+			IdentityArgs:    []string{"path", "depth", "include_hidden", "limit_entries"},
+			SourceLimit:     8,
+		},
 	}
 }
 
@@ -154,6 +187,17 @@ func (t *statTool) Definition() domain.ToolDefinition {
 			"required": []string{"path"},
 		},
 		Metadata: map[string]any{"category": "fs"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "fs",
+			ReadPathArgs:    []string{"path"},
+			IdentityArgs:    []string{"path"},
+			SourceLimit:     8,
+		},
 	}
 }
 
@@ -175,6 +219,17 @@ func (t *removeTool) Definition() domain.ToolDefinition {
 			"required": []string{"path"},
 		},
 		Metadata: map[string]any{"category": "fs"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassMutate,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectWorkspace,
+			Source:          "fs",
+			WritePathArgs:   []string{"path"},
+			IdentityArgs:    []string{"path", "recursive", "force"},
+			SourceLimit:     1,
+		},
 	}
 }
 
@@ -195,6 +250,18 @@ func (t *moveTool) Definition() domain.ToolDefinition {
 			"required": []string{"source_path", "destination_path"},
 		},
 		Metadata: map[string]any{"category": "fs"},
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassMutate,
+			ReusePolicy:     domain.ToolReuseNever,
+			DuplicatePolicy: domain.ToolDuplicateAllow,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+			SideEffectClass: domain.SideEffectWorkspace,
+			Source:          "fs",
+			ReadPathArgs:    []string{"source_path"},
+			WritePathArgs:   []string{"source_path", "destination_path"},
+			IdentityArgs:    []string{"source_path", "destination_path"},
+			SourceLimit:     1,
+		},
 	}
 }
 

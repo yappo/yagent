@@ -2,6 +2,7 @@ package contextengine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -24,10 +25,13 @@ func New(cfg config.ContextConfig, memory domain.RepoMemoryStore, maxFacts int) 
 }
 
 func (e *Engine) Build(run *domain.RunState, agent domain.AgentSpec, phase domain.RunPhase, messages []domain.Message, tools []domain.ToolDefinition) domain.RunContext {
+	role := packetRole(agent, phase)
 	ctx := domain.RunContext{
 		CurrentPhase:       phase,
 		AvailableToolNames: toolNames(tools),
 		ExpectedOutput:     map[string]any{},
+		PacketRole:         role,
+		PacketKind:         role,
 	}
 	if run == nil {
 		ctx.UserGoal = latestUserMessage(messages)
@@ -39,20 +43,24 @@ func (e *Engine) Build(run *domain.RunState, agent domain.AgentSpec, phase domai
 
 	ctx.UserGoal = run.UserGoal
 	ctx.TaskBrief = phaseTaskBrief(run, phase)
-	ctx.RecentMessages = tailMessages(messages, e.config.MaxRecentMessages)
+	ctx.RecentMessages = roleScopedMessages(messages, role, e.config.MaxRecentMessages)
 	ctx.RelevantFiles = extractRelevantFiles(messages, e.config.MaxRelevantFiles)
-	ctx.ArtifactRefs = artifactRefs(run.Artifacts, e.config.MaxArtifacts)
+	relevantArtifacts := selectArtifactsForRole(run.Artifacts, role, e.config.MaxArtifacts)
+	ctx.ArtifactRefs = artifactRefs(relevantArtifacts, e.config.MaxArtifacts)
+	ctx.Artifacts = artifactReferences(relevantArtifacts, e.config.MaxArtifacts)
 	ctx.UnresolvedTODOs = unresolvedTODOs(run.Plan)
 	ctx.RecentFailures = recentFailures(run.Verification)
 	ctx.VerificationNotes = verificationNotes(run.Verification)
-	ctx.RecentSummary = strings.TrimSpace(run.ConversationSummary)
+	ctx.KnownFailures = append([]string(nil), run.KnownFailures...)
+	ctx.KnownFailures = append(ctx.KnownFailures, ctx.RecentFailures...)
 	ctx.EnabledCapabilities = append([]string(nil), run.EnabledCapabilities...)
 	ctx.ExpectedOutput["agent"] = agent.ID
 	ctx.ExpectedOutput["phase"] = phase
 	if e.memory != nil {
 		if memory, err := e.memory.LoadMemory(context.Background()); err == nil && memory != nil {
 			ctx.StableFacts = stableFacts(memory, e.maxFacts)
-			ctx.Constraints = append(ctx.Constraints, memory.Constraints...)
+			ctx.Observations = selectObservationsForRole(memory.ReusableObservations, role)
+			ctx.KnownFailures = append(ctx.KnownFailures, memory.KnownFailures...)
 		}
 	}
 	if phase == domain.RunPhaseRecover {
@@ -69,15 +77,22 @@ func (e *Engine) MaybeCompact(run *domain.RunState) (*domain.RunArtifact, bool) 
 		return nil, false
 	}
 	summary := compactSummary(run)
-	run.ConversationSummary = summary
+	payload, _ := json.Marshal(map[string]any{
+		"latest_artifacts": artifactReferences(lastArtifacts(run.Artifacts, 4), 4),
+		"known_failures":   run.KnownFailures,
+		"work_units":       len(run.WorkUnits),
+	})
 	artifact := &domain.RunArtifact{
-		ID:        fmt.Sprintf("compact-%d", len(run.Artifacts)+1),
-		Name:      "Adaptive Context Summary",
-		Kind:      "context_summary",
-		Phase:     run.CurrentPhase,
-		Summary:   summary,
-		Content:   summary,
-		CreatedAt: run.UpdatedAt,
+		ID:            fmt.Sprintf("compact-%d", len(run.Artifacts)+1),
+		Name:          "Packet Digest",
+		Kind:          "packet_digest",
+		SchemaVersion: "packet_digest.v1",
+		Phase:         run.CurrentPhase,
+		Summary:       summary,
+		Text:          summary,
+		Content:       summary,
+		Payload:       payload,
+		CreatedAt:     run.UpdatedAt,
 	}
 	run.Artifacts = append(run.Artifacts, *artifact)
 	return artifact, true
@@ -145,7 +160,7 @@ func phaseTaskBrief(run *domain.RunState, phase domain.RunPhase) string {
 	case domain.RunPhaseRecover:
 		return "Repair the implementation using the latest verification findings."
 	case domain.RunPhaseFinalize:
-		return "Summarize completed work, verification results, and any remaining risks."
+		return "Summarize completed work, verification results, and remaining risks."
 	default:
 		return run.UserGoal
 	}
@@ -191,6 +206,17 @@ func artifactNames(artifacts []domain.RunArtifact) []string {
 	return out
 }
 
+func artifactReferences(artifacts []domain.RunArtifact, limit int) []domain.ArtifactReference {
+	if limit > 0 && len(artifacts) > limit {
+		artifacts = artifacts[len(artifacts)-limit:]
+	}
+	out := make([]domain.ArtifactReference, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		out = append(out, domain.ArtifactReference{ID: artifact.ID, Kind: artifact.Kind, Name: artifact.Name})
+	}
+	return out
+}
+
 func unresolvedTODOs(plan []domain.PlanNode) []string {
 	out := []string{}
 	for _, node := range plan {
@@ -219,21 +245,35 @@ func verificationNotes(results []domain.VerificationResult) []string {
 	return out
 }
 
-func stableFacts(memory *domain.RepoMemory, maxFacts int) []string {
+func stableFacts(memory *domain.WorkspaceMemory, maxFacts int) []string {
 	if memory == nil {
 		return nil
 	}
-	facts := append([]string(nil), memory.Constraints...)
-	for _, item := range memory.SuccessfulCommands {
+	facts := make([]string, 0, len(memory.StableFacts))
+	for _, item := range memory.StableFacts {
 		if item.Summary == "" {
 			continue
 		}
-		facts = append(facts, "Command: "+item.Summary)
+		facts = append(facts, item.Summary)
 	}
 	if maxFacts > 0 && len(facts) > maxFacts {
 		return facts[len(facts)-maxFacts:]
 	}
 	return facts
+}
+
+func observationRecords(items []domain.ObservationSummary) []domain.ObservationRecord {
+	out := make([]domain.ObservationRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, domain.ObservationRecord{
+			ID:        item.ObservationID,
+			ToolName:  item.ToolName,
+			Summary:   item.Summary,
+			Reusable:  true,
+			UpdatedAt: item.UpdatedAt,
+		})
+	}
+	return out
 }
 
 func compactSummary(run *domain.RunState) string {
@@ -283,4 +323,115 @@ func toolNames(tools []domain.ToolDefinition) []string {
 		names = append(names, tool.Name)
 	}
 	return names
+}
+
+func packetRole(agent domain.AgentSpec, phase domain.RunPhase) string {
+	switch {
+	case agent.ID != "":
+		return agent.ID
+	case phase != "":
+		return string(phase)
+	default:
+		return "runtime"
+	}
+}
+
+func roleScopedMessages(messages []domain.Message, role string, limit int) []domain.Message {
+	if role == "coder" || role == "tester" || role == "reviewer" {
+		limit = minInt(limit, 4)
+	}
+	return tailMessages(messages, limit)
+}
+
+func selectArtifactsForRole(artifacts []domain.RunArtifact, role string, limit int) []domain.RunArtifact {
+	if len(artifacts) == 0 {
+		return nil
+	}
+	allowed := map[string]bool{}
+	switch role {
+	case "planner":
+		allowed["agent_inventory"] = true
+		allowed["repo_map"] = true
+		allowed["evidence_bundle"] = true
+	case "researcher":
+		allowed["execution_plan"] = true
+		allowed["repo_map"] = true
+		allowed["evidence_bundle"] = true
+	case "coder":
+		allowed["execution_plan"] = true
+		allowed["repo_map"] = true
+		allowed["evidence_bundle"] = true
+		allowed["review_findings"] = true
+		allowed["test_report"] = true
+		allowed["change_set"] = true
+	case "tester":
+		allowed["execution"] = true
+		allowed["change_set"] = true
+		allowed["evidence_bundle"] = true
+		allowed["test_report"] = true
+	case "reviewer":
+		allowed["execution"] = true
+		allowed["change_set"] = true
+		allowed["evidence_bundle"] = true
+		allowed["review_findings"] = true
+	case "manager", "finalizer":
+		allowed["execution_plan"] = true
+		allowed["execution"] = true
+		allowed["evidence_bundle"] = true
+		allowed["test_report"] = true
+		allowed["review_findings"] = true
+		allowed["final_response"] = true
+	default:
+		return lastArtifacts(artifacts, limit)
+	}
+
+	filtered := make([]domain.RunArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if allowed[artifact.Kind] {
+			filtered = append(filtered, artifact)
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = lastArtifacts(artifacts, limit)
+	}
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+	return filtered
+}
+
+func selectObservationsForRole(items []domain.ObservationSummary, role string) []domain.ObservationRecord {
+	if len(items) == 0 {
+		return nil
+	}
+	records := observationRecords(items)
+	filtered := make([]domain.ObservationRecord, 0, len(records))
+	for _, item := range records {
+		switch role {
+		case "coder":
+			if strings.HasPrefix(item.ToolName, "fs_") || strings.HasPrefix(item.ToolName, "search_") || strings.HasPrefix(item.ToolName, "git_") {
+				filtered = append(filtered, item)
+			}
+		case "tester", "reviewer":
+			if strings.HasPrefix(item.ToolName, "task_") || strings.HasPrefix(item.ToolName, "git_") || strings.HasPrefix(item.ToolName, "fs_") {
+				filtered = append(filtered, item)
+			}
+		default:
+			filtered = append(filtered, item)
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = records
+	}
+	if len(filtered) > 6 {
+		filtered = filtered[len(filtered)-6:]
+	}
+	return filtered
+}
+
+func minInt(left int, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }

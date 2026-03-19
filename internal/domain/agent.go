@@ -39,6 +39,66 @@ type ToolCall struct {
 	Purpose            string
 }
 
+type ToolClass string
+
+const (
+	ToolClassObserve ToolClass = "observe"
+	ToolClassCompute ToolClass = "compute"
+	ToolClassExecute ToolClass = "execute"
+	ToolClassMutate  ToolClass = "mutate"
+)
+
+type ToolReusePolicy string
+
+const (
+	ToolReuseNever     ToolReusePolicy = "never"
+	ToolReuseOnSuccess ToolReusePolicy = "on_success"
+)
+
+type ToolDuplicatePolicy string
+
+const (
+	ToolDuplicateAllow            ToolDuplicatePolicy = "allow"
+	ToolDuplicateSuppressInflight ToolDuplicatePolicy = "suppress_inflight"
+	ToolDuplicateSuppressSemantic ToolDuplicatePolicy = "suppress_semantic"
+)
+
+type ToolFreshnessStrategy string
+
+const (
+	ToolFreshnessNone     ToolFreshnessStrategy = "none"
+	ToolFreshnessSnapshot ToolFreshnessStrategy = "snapshot"
+	ToolFreshnessReadSet  ToolFreshnessStrategy = "read_set"
+)
+
+type SideEffectClass string
+
+const (
+	SideEffectNone      SideEffectClass = "none"
+	SideEffectWorkspace SideEffectClass = "workspace"
+	SideEffectProcess   SideEffectClass = "process"
+	SideEffectNetwork   SideEffectClass = "network"
+	SideEffectExternal  SideEffectClass = "external"
+)
+
+type ToolFreshnessPolicy struct {
+	Strategy ToolFreshnessStrategy `json:"strategy"`
+}
+
+type ToolSemantics struct {
+	Class           ToolClass           `json:"class"`
+	ReusePolicy     ToolReusePolicy     `json:"reuse_policy"`
+	DuplicatePolicy ToolDuplicatePolicy `json:"duplicate_policy"`
+	Freshness       ToolFreshnessPolicy `json:"freshness"`
+	SideEffectClass SideEffectClass     `json:"side_effect_class"`
+	Source          string              `json:"source,omitempty"`
+	ReadPathArgs    []string            `json:"read_path_args,omitempty"`
+	WritePathArgs   []string            `json:"write_path_args,omitempty"`
+	IdentityArgs    []string            `json:"identity_args,omitempty"`
+	SourceLimit     int                 `json:"source_limit,omitempty"`
+	Stateful        bool                `json:"stateful,omitempty"`
+}
+
 type ToolDefinition struct {
 	Name             string
 	Description      string
@@ -52,6 +112,7 @@ type ToolDefinition struct {
 	CostHint         string
 	RequiresApproval bool
 	DiscoveryOnly    bool
+	Semantics        ToolSemantics
 }
 
 type ToolResult struct {
@@ -106,6 +167,12 @@ type RunContext struct {
 	CurrentPhase        RunPhase
 	TaskBrief           string
 	RecentMessages      []Message
+	PacketRole          string
+	PacketKind          string
+	Observations        []ObservationRecord
+	Artifacts           []ArtifactReference
+	KnownFailures       []string
+	ScopedConstraints   []string
 	StableFacts         []string
 	RelevantFiles       []string
 	ArtifactRefs        []string

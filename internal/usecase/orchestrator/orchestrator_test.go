@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"yagent/internal/domain"
+	"yagent/internal/infra/state"
 )
 
 type fakeModelClient struct {
@@ -52,6 +54,32 @@ func (f *fakeToolExecutor) Execute(ctx context.Context, agent domain.AgentSpec, 
 	}
 	f.calls = append(f.calls, call)
 	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "tool output"}
+}
+
+type concurrentModelClient struct {
+	responses     map[string]domain.ModelResponse
+	delay         time.Duration
+	inFlight      atomic.Int32
+	maxConcurrent atomic.Int32
+}
+
+func (c *concurrentModelClient) Generate(_ context.Context, request domain.ModelRequest) (domain.ModelResponse, error) {
+	current := c.inFlight.Add(1)
+	for {
+		maxSeen := c.maxConcurrent.Load()
+		if current <= maxSeen {
+			break
+		}
+		if c.maxConcurrent.CompareAndSwap(maxSeen, current) {
+			break
+		}
+	}
+	time.Sleep(c.delay)
+	c.inFlight.Add(-1)
+	if response, ok := c.responses[request.Agent.ID]; ok {
+		return response, nil
+	}
+	return domain.ModelResponse{Message: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}, nil
 }
 
 type fakeCatalog struct {
@@ -1162,4 +1190,209 @@ func TestRunTurnRunsVerificationAndRecoveryLoop(t *testing.T) {
 	if !foundRecovery {
 		t.Fatalf("expected recovery artifact, got %+v", result.Run.Artifacts)
 	}
+}
+
+func TestRunTurnSuppressesDuplicateToolCalls(t *testing.T) {
+	var calls atomic.Int32
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{
+							{ID: "call-1", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}},
+							{ID: "call-2", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}},
+						},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{
+					Name:         "fs_read",
+					ReadOnly:     true,
+					ParallelSafe: true,
+					Metadata:     map[string]any{"category": "fs"},
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassObserve,
+						ReusePolicy:     domain.ToolReuseOnSuccess,
+						DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+						SideEffectClass: domain.SideEffectNone,
+						Source:          "fs",
+						ReadPathArgs:    []string{"path"},
+					},
+				}},
+			},
+			exec: func(context.Context, domain.AgentSpec, domain.ToolCall) domain.ToolResult {
+				calls.Add(1)
+				return domain.ToolResult{Success: true, Output: "hello"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 4, MaxHandoffDepth: 1, DisablePhaseHarness: true},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "read file"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected one tool execution, got %d", calls.Load())
+	}
+	if !hasEventType(result.Events, "duplicate_suppressed") {
+		t.Fatalf("expected duplicate_suppressed event, got %+v", result.Events)
+	}
+}
+
+func TestRunTurnReusesCachedObservationsAcrossTurns(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+
+	var calls atomic.Int32
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{
+						Role:      domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{ID: "call-1", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "first"},
+				}, {
+					Message: domain.Message{
+						Role:      domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{{ID: "call-2", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}}},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "second"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"manager": {{
+					Name:         "fs_read",
+					ReadOnly:     true,
+					ParallelSafe: true,
+					Metadata:     map[string]any{"category": "fs"},
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassObserve,
+						ReusePolicy:     domain.ToolReuseOnSuccess,
+						DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+						SideEffectClass: domain.SideEffectNone,
+						Source:          "fs",
+						ReadPathArgs:    []string{"path"},
+					},
+				}},
+			},
+			exec: func(context.Context, domain.AgentSpec, domain.ToolCall) domain.ToolResult {
+				calls.Add(1)
+				return domain.ToolResult{Success: true, Output: "cached hello"}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{
+			MaxParallelAgents:   2,
+			MaxHandoffDepth:     1,
+			DisablePhaseHarness: true,
+			RunStore:            store,
+			MemoryStore:         store,
+			RuntimeStore:        store,
+		},
+	)
+
+	_, err = service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "read file"}},
+	})
+	if err != nil {
+		t.Fatalf("first RunTurn returned error: %v", err)
+	}
+	second, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "read file again"}},
+	})
+	if err != nil {
+		t.Fatalf("second RunTurn returned error: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected cached second execution, got %d calls", calls.Load())
+	}
+	if !hasEventType(second.Events, "cache_hit") {
+		t.Fatalf("expected cache_hit event, got %+v", second.Events)
+	}
+}
+
+func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
+	model := &concurrentModelClient{
+		delay: 60 * time.Millisecond,
+		responses: map[string]domain.ModelResponse{
+			"tester": {
+				Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: tests good\nREPAIR_BRIEF: none"},
+			},
+			"reviewer": {
+				Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: review good\nREPAIR_BRIEF: none"},
+			},
+		},
+	}
+	service := New(
+		model,
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"tester":   {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"reviewer": {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 4, MaxHandoffDepth: 1},
+	)
+
+	plan := &domain.ExecutionPlan{
+		Primary: domain.PlannedAgentAssignment{AgentID: "coder"},
+		Verify: []domain.PlannedAgentAssignment{
+			{AgentID: "tester", Reason: "Run tests"},
+			{AgentID: "reviewer", Reason: "Review risks"},
+		},
+	}
+	run := &domain.RunState{
+		ID:        "run-1",
+		RootRunID: "run-1",
+		WorkUnits: workUnitsFromExecutionPlan(plan),
+		Messages:  []domain.Message{{Role: domain.RoleUser, Content: "fix it"}},
+	}
+
+	_, _, err := service.runVerifyPhase(context.Background(), run, plan, domain.TurnRequest{}, domain.AgentResult{
+		Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
+	}, 1)
+	if err != nil {
+		t.Fatalf("runVerifyPhase returned error: %v", err)
+	}
+	if model.maxConcurrent.Load() < 2 {
+		t.Fatalf("expected parallel verification, max concurrency was %d", model.maxConcurrent.Load())
+	}
+	for _, unit := range run.WorkUnits {
+		if strings.HasPrefix(unit.ID, "verify:") && unit.Status != "done" {
+			t.Fatalf("expected verify work unit to be done, got %+v", unit)
+		}
+	}
+}
+
+func hasEventType(events []domain.ExecutionEvent, typ string) bool {
+	for _, event := range events {
+		if event.Type == typ {
+			return true
+		}
+	}
+	return false
 }
