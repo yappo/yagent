@@ -148,3 +148,42 @@ func TestFileStoreFindsReusableExecutionAndInvalidatesOnMutation(t *testing.T) {
 		t.Fatalf("expected stale observation to be removed from memory, got %+v", memory.ReusableObservations)
 	}
 }
+
+func TestFileStoreSavesAndListsScratchRecords(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewFileStore(root)
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+
+	now := time.Now()
+	if err := store.SaveScratch(context.Background(), domain.ScratchRecord{
+		ID:        "scratch-1",
+		Kind:      "agent_packet",
+		SessionID: "run-1",
+		Summary:   "coder packet",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("SaveScratch returned error: %v", err)
+	}
+	if err := store.SaveScratch(context.Background(), domain.ScratchRecord{
+		ID:        "scratch-2",
+		Kind:      "packet_digest",
+		SessionID: "run-1",
+		Summary:   "digest",
+		CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("SaveScratch returned error: %v", err)
+	}
+
+	items, err := store.ListScratch(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListScratch returned error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected two scratch records, got %+v", items)
+	}
+	if items[0].ID != "scratch-2" || items[1].ID != "scratch-1" {
+		t.Fatalf("expected reverse chronological scratch ordering, got %+v", items)
+	}
+}

@@ -38,6 +38,7 @@ func NewFileStore(root string) (*FileStore, error) {
 		store.artifactsDir(),
 		store.executionsDir(),
 		store.mutationsDir(),
+		store.scratchDir(),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("state ディレクトリの作成に失敗しました: %w", err)
@@ -202,6 +203,23 @@ func (s *FileStore) SaveExecution(_ context.Context, execution domain.ToolExecut
 	return s.writeJSON(s.executionPath(execution.ID), execution)
 }
 
+func (s *FileStore) ListExecutions(_ context.Context, limit int) ([]domain.ToolExecutionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	items, err := s.readExecutionRecords()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].UpdatedAt.After(items[j].UpdatedAt)
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
 func (s *FileStore) FindReusableExecution(_ context.Context, semanticKey string, readSet []string) (*domain.ToolExecutionRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -247,6 +265,23 @@ func (s *FileStore) SaveMutation(ctx context.Context, mutation domain.MutationRe
 	}
 	s.mu.Unlock()
 	return s.MarkStaleByPaths(ctx, mutation.WriteSet)
+}
+
+func (s *FileStore) ListMutations(_ context.Context, limit int) ([]domain.MutationRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	items, err := s.readMutationRecords()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
 }
 
 func (s *FileStore) MarkStaleByPaths(ctx context.Context, paths []string) error {
@@ -322,6 +357,46 @@ func (s *FileStore) SaveWorkspaceSnapshot(_ context.Context, snapshot *domain.Wo
 	return s.writeJSON(filepath.Join(s.workspaceDir(), workspaceSnapshotFile), snapshot)
 }
 
+func (s *FileStore) SaveScratch(_ context.Context, record domain.ScratchRecord) error {
+	if record.ID == "" {
+		return fmt.Errorf("scratch id が必要です")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = time.Now()
+	}
+	return s.writeJSON(s.scratchPath(record.ID), record)
+}
+
+func (s *FileStore) ListScratch(_ context.Context, limit int) ([]domain.ScratchRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.scratchDir())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.ScratchRecord, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		var item domain.ScratchRecord
+		if err := s.readJSON(filepath.Join(s.scratchDir(), entry.Name()), &item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
 func (s *FileStore) ListRuns() ([]string, error) {
 	entries, err := os.ReadDir(s.sessionsDir())
 	if err != nil {
@@ -390,6 +465,25 @@ func (s *FileStore) readExecutionRecords() ([]domain.ToolExecutionRecord, error)
 	return items, nil
 }
 
+func (s *FileStore) readMutationRecords() ([]domain.MutationRecord, error) {
+	entries, err := os.ReadDir(s.mutationsDir())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.MutationRecord, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		var item domain.MutationRecord
+		if err := s.readJSON(filepath.Join(s.mutationsDir(), entry.Name()), &item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 func (s *FileStore) writeJSON(path string, value any) error {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
@@ -448,6 +542,14 @@ func (s *FileStore) mutationsDir() string {
 
 func (s *FileStore) mutationPath(id string) string {
 	return filepath.Join(s.mutationsDir(), id+".json")
+}
+
+func (s *FileStore) scratchDir() string {
+	return filepath.Join(s.root, "scratch")
+}
+
+func (s *FileStore) scratchPath(id string) string {
+	return filepath.Join(s.scratchDir(), id+".json")
 }
 
 func appendOrReplaceFact(items []domain.WorkspaceFact, fact domain.WorkspaceFact) []domain.WorkspaceFact {

@@ -108,10 +108,6 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		return domain.TurnResult{}, err
 	}
 
-	manager, ok := s.catalog.Resolve("manager")
-	if !ok {
-		return domain.TurnResult{}, fmt.Errorf("manager agent が見つかりません")
-	}
 	prompt := strings.TrimSpace(run.UserGoal)
 	if prompt == "" {
 		prompt = strings.TrimSpace(latestUserMessage(request.Messages))
@@ -124,9 +120,11 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	if s.config.DisablePhaseHarness {
 		run.ExecutionPlan = disabledHarnessExecutionPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
+		run.WorkUnits = workUnitsFromExecutionPlan(run, run.ExecutionPlan)
 		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhaseIntake, "manager", run.ExecutionPlan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
-		result, events, err := s.runDirectPhase(ctx, run, manager, request)
+		s.ensureRepoMapArtifact(ctx, run, domain.RunPhaseIntake, "manager")
+		result, events, err := s.runWorkGraph(ctx, run, run.ExecutionPlan, request)
 		allEvents = append(allEvents, events...)
 		if err != nil {
 			run.Status = domain.RunStatusFailed
@@ -134,22 +132,21 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 			return domain.TurnResult{}, err
 		}
 		run.Status = domain.RunStatusCompleted
-		run.CurrentPhase = domain.RunPhaseExecute
-		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-		artifact := newFinalResponseArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, result.Message.Content)
+		artifact := newFinalResponseArtifact(run, run.CurrentPhase, result.Message.AgentID, result.Message.Content)
 		run.Artifacts = append(run.Artifacts, artifact)
-		if s.config.MemoryStore != nil {
-			_ = s.rememberRun(ctx, run)
-		}
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, result.Message.Content))
+		_ = s.rememberRun(ctx, run)
 		_ = s.saveRun(ctx, run)
 		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
 	}
 	if shouldBypassPlanner(prompt) {
 		run.ExecutionPlan = directConversationPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
+		run.WorkUnits = workUnitsFromExecutionPlan(run, run.ExecutionPlan)
 		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhaseIntake, "manager", run.ExecutionPlan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
-		result, events, err := s.runDirectPhase(ctx, run, manager, request)
+		s.ensureRepoMapArtifact(ctx, run, domain.RunPhaseIntake, "manager")
+		final, events, err := s.runWorkGraph(ctx, run, run.ExecutionPlan, request)
 		allEvents = append(allEvents, events...)
 		if err != nil {
 			run.Status = domain.RunStatusFailed
@@ -157,15 +154,12 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 			return domain.TurnResult{}, err
 		}
 		run.Status = domain.RunStatusCompleted
-		run.CurrentPhase = domain.RunPhaseExecute
-		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-		artifact := newFinalResponseArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, result.Message.Content)
+		artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
 		run.Artifacts = append(run.Artifacts, artifact)
-		if s.config.MemoryStore != nil {
-			_ = s.rememberRun(ctx, run)
-		}
+		run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
+		_ = s.rememberRun(ctx, run)
 		_ = s.saveRun(ctx, run)
-		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
+		return domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}, nil
 	}
 
 	executionPlan, planEvents, err := s.runPlanPhase(ctx, run, request, inventory)
@@ -176,43 +170,9 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		return domain.TurnResult{}, err
 	}
 
-	executionResult, executeEvents, err := s.runExecutePhase(ctx, run, executionPlan, request)
-	allEvents = append(allEvents, executeEvents...)
-	if err != nil {
-		run.Status = domain.RunStatusFailed
-		_ = s.saveRun(ctx, run)
-		return domain.TurnResult{}, err
-	}
-
-	finalExecution := executionResult
-	if len(executionPlan.Verify) > 0 {
-		for attempt := 1; attempt <= s.config.MaxVerificationAttempts; attempt++ {
-			verification, verifyEvents, err := s.runVerifyPhase(ctx, run, executionPlan, request, finalExecution, attempt)
-			allEvents = append(allEvents, verifyEvents...)
-			if err != nil {
-				run.Status = domain.RunStatusFailed
-				_ = s.saveRun(ctx, run)
-				return domain.TurnResult{}, err
-			}
-			if verification.Status == "pass" {
-				break
-			}
-			if attempt >= s.config.MaxVerificationAttempts {
-				break
-			}
-			repaired, recoverEvents, err := s.runRecoverPhase(ctx, run, executionPlan, request, verification, attempt+1)
-			allEvents = append(allEvents, recoverEvents...)
-			if err != nil {
-				run.Status = domain.RunStatusFailed
-				_ = s.saveRun(ctx, run)
-				return domain.TurnResult{}, err
-			}
-			finalExecution = repaired
-		}
-	}
-
-	final, finalizeEvents, err := s.runFinalizePhase(ctx, run, executionPlan, request, finalExecution)
-	allEvents = append(allEvents, finalizeEvents...)
+	s.ensureRepoMapArtifact(ctx, run, domain.RunPhasePlan, fallbackString(planAgentID(executionPlan), "planner"))
+	final, graphEvents, err := s.runWorkGraph(ctx, run, executionPlan, request)
+	allEvents = append(allEvents, graphEvents...)
 	if err != nil {
 		run.Status = domain.RunStatusFailed
 		_ = s.saveRun(ctx, run)
@@ -220,7 +180,6 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	}
 
 	run.Status = domain.RunStatusCompleted
-	run.CurrentPhase = lastExecutionPlanPhase(executionPlan)
 	artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
 	run.Artifacts = append(run.Artifacts, artifact)
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))

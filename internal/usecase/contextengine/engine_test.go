@@ -8,6 +8,7 @@ import (
 
 	"yagent/internal/config"
 	"yagent/internal/domain"
+	"yagent/internal/infra/state"
 )
 
 type stubMemoryStore struct {
@@ -44,7 +45,7 @@ func TestBuildIncludesPlanArtifactsAndMemory(t *testing.T) {
 			Summary: "go test ./...",
 		}},
 		KnownFailures: []string{"missing regression coverage"},
-	}}, 8)
+	}}, nil, 8)
 
 	run := &domain.RunState{
 		UserGoal: "Improve the coding agent.",
@@ -89,7 +90,7 @@ func TestMaybeCompactCreatesArtifactWhenThresholdExceeded(t *testing.T) {
 		CompactAfterToolCalls:    10,
 		CompactAfterEstTokens:    1000,
 		CompactAfterVerifyCycles: 2,
-	}, nil, 8)
+	}, nil, nil, 8)
 	run := &domain.RunState{
 		CurrentPhase: domain.RunPhaseExecute,
 		Messages: []domain.Message{
@@ -129,7 +130,7 @@ func TestBuildScopesArtifactsAndObservationsByRole(t *testing.T) {
 			{ObservationID: "obs-1", ToolName: "fs_read", Summary: "read file"},
 			{ObservationID: "obs-2", ToolName: "task_run", Summary: "ran tests"},
 		},
-	}}, 8)
+	}}, nil, 8)
 
 	run := &domain.RunState{
 		UserGoal: "Refactor runtime.",
@@ -175,7 +176,7 @@ func TestMaybeCompactPayloadIncludesWorkUnits(t *testing.T) {
 		CompactAfterToolCalls:    10,
 		CompactAfterEstTokens:    1000,
 		CompactAfterVerifyCycles: 2,
-	}, nil, 8)
+	}, nil, nil, 8)
 	run := &domain.RunState{
 		CurrentPhase: domain.RunPhaseExecute,
 		Messages:     []domain.Message{{Role: domain.RoleUser, Content: "compact"}},
@@ -199,5 +200,40 @@ func TestMaybeCompactPayloadIncludesWorkUnits(t *testing.T) {
 	}
 	if len(payload.WorkUnits) != 1 || payload.WorkUnits[0].ID != "execute:primary:coder" {
 		t.Fatalf("expected work unit digest, got %+v", payload.WorkUnits)
+	}
+}
+
+func TestBuildRecordsPacketScratch(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        4,
+		MaxArtifacts:             4,
+		MaxRelevantFiles:         4,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, nil, store, 8)
+
+	run := &domain.RunState{
+		ID:        "run-1",
+		RootRunID: "run-1",
+		UserGoal:  "Ship the refactor.",
+		Artifacts: []domain.RunArtifact{{ID: "a1", Name: "Execution plan", Kind: "execution_plan"}},
+	}
+	ctx := engine.Build(run, domain.AgentSpec{ID: "coder"}, domain.RunPhaseExecute, []domain.Message{{Role: domain.RoleUser, Content: "update README.md"}}, nil)
+	if ctx.PacketRole != "coder" {
+		t.Fatalf("unexpected packet role: %+v", ctx)
+	}
+
+	items, err := store.ListScratch(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListScratch returned error: %v", err)
+	}
+	if len(items) == 0 || items[0].Kind != "agent_packet" {
+		t.Fatalf("expected packet scratch record, got %+v", items)
 	}
 }

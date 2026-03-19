@@ -180,7 +180,6 @@ type RunContext struct {
 	UnresolvedTODOs     []string
 	RecentFailures      []string
 	VerificationNotes   []string
-	RecentSummary       string
 	AvailableToolNames  []string
 	EnabledCapabilities []string
 	ToolState           ToolState

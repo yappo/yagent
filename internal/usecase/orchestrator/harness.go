@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"yagent/internal/domain"
 )
 
@@ -58,7 +56,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		plan := buildFallbackExecutionPlan(inventory, "planner agent was not available")
 		run.ExecutionPlan = plan
 		run.Plan = planNodesFromExecutionPlan(plan)
-		run.WorkUnits = workUnitsFromExecutionPlan(plan)
+		run.WorkUnits = workUnitsFromExecutionPlan(run, plan)
 		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhasePlan, fallbackString(plan.Primary.AgentID, "manager"), plan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 		_ = s.saveRun(ctx, run)
@@ -75,7 +73,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		plan := buildFallbackExecutionPlan(inventory, "planner call failed: "+err.Error())
 		run.ExecutionPlan = plan
 		run.Plan = planNodesFromExecutionPlan(plan)
-		run.WorkUnits = workUnitsFromExecutionPlan(plan)
+		run.WorkUnits = workUnitsFromExecutionPlan(run, plan)
 		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhasePlan, planner.ID, plan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 		_ = s.saveRun(ctx, run)
@@ -107,280 +105,13 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 
 	run.ExecutionPlan = plan
 	run.Plan = planNodesFromExecutionPlan(plan)
-	run.WorkUnits = workUnitsFromExecutionPlan(plan)
+	run.WorkUnits = workUnitsFromExecutionPlan(run, plan)
 	markPlanNodeStatus(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "done")
 	run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), plan))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 	s.maybeCompactRun(run)
 	_ = s.saveRun(ctx, run)
 	return plan, events, nil
-}
-
-func (s *Service) runDirectPhase(ctx context.Context, run *domain.RunState, manager domain.AgentSpec, request domain.TurnRequest) (domain.AgentResult, []domain.ExecutionEvent, error) {
-	run.CurrentPhase = domain.RunPhaseExecute
-	run.Attempt = 1
-	_ = s.saveRun(ctx, run)
-
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, manager, request, domain.RunPhaseExecute, 1, run.Messages, "Handle the request directly and produce the final answer."), 0)
-	if err != nil {
-		return domain.AgentResult{}, nil, err
-	}
-	markPlanNodeStatus(run, domain.RunPhaseExecute, result.Message.AgentID, "done")
-	run.Artifacts = append(run.Artifacts, newAgentMessageArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content, nil))
-	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
-	s.maybeCompactRun(run)
-	_ = s.saveRun(ctx, run)
-	return result, result.Events, nil
-}
-
-func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest) (domain.AgentResult, []domain.ExecutionEvent, error) {
-	run.CurrentPhase = domain.RunPhaseExecute
-	run.Attempt = 1
-	_ = s.saveRun(ctx, run)
-
-	messages := cloneMessages(run.Messages)
-	if plan == nil {
-		return domain.AgentResult{}, nil, fmt.Errorf("execution plan がありません")
-	}
-	messages = phaseMessages(messages, "Execution plan:\n"+stablePlanJSON(plan))
-
-	prepEvents := []domain.ExecutionEvent{}
-	prepArtifacts := []domain.RunArtifact{}
-	if len(plan.Preparation) > 0 {
-		scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
-		specs := make([]scheduleSpec, 0, len(plan.Preparation))
-		assignments := make([]domain.PlannedAgentAssignment, 0, len(plan.Preparation))
-		for _, item := range plan.Preparation {
-			specs = append(specs, scheduleSpec{
-				ID:              "prep:" + item.AgentID,
-				Source:          item.AgentID,
-				SourceLimit:     1,
-				SideEffectClass: domain.SideEffectNone,
-			})
-			assignments = append(assignments, item)
-			markWorkUnitStatus(run, "execute:prep:"+item.AgentID, "running")
-		}
-		completed := map[string]bool{}
-		for len(completed) < len(specs) {
-			batch := scheduler.nextBatch(specs, completed)
-			if len(batch) == 0 {
-				break
-			}
-			group, groupCtx := errgroup.WithContext(ctx)
-			type prepResult struct {
-				index    int
-				artifact domain.RunArtifact
-				events   []domain.ExecutionEvent
-			}
-			results := make([]prepResult, len(batch))
-			for batchIdx, specIdx := range batch {
-				batchIdx := batchIdx
-				specIdx := specIdx
-				group.Go(func() error {
-					item := assignments[specIdx]
-					agent, ok := s.catalog.Resolve(item.AgentID)
-					if !ok {
-						return nil
-					}
-					prepTask := fallbackString(strings.TrimSpace(item.Reason), fmt.Sprintf("Prepare focused context for the primary agent %s. Return only findings that materially help the task.", fallbackString(plan.Primary.AgentID, "manager")))
-					invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseExecute, 1, messages, prepTask)
-					invocation.Context.ExpectedOutput = map[string]any{
-						"goal": "Return only the findings that materially help the primary agent.",
-					}
-					research, err := s.runAgent(groupCtx, invocation, 0)
-					if err != nil {
-						return nil
-					}
-					results[batchIdx] = prepResult{
-						index:    specIdx,
-						artifact: newAgentMessageArtifact(run, domain.RunPhaseExecute, agent.ID, agent.Name+" evidence", "evidence_bundle", research.Message.Content, nil),
-						events:   research.Events,
-					}
-					return nil
-				})
-			}
-			if err := group.Wait(); err != nil {
-				return domain.AgentResult{}, prepEvents, err
-			}
-			for _, item := range results {
-				if item.artifact.ID == "" {
-					continue
-				}
-				prepArtifacts = append(prepArtifacts, item.artifact)
-				prepEvents = append(prepEvents, item.events...)
-				run.Artifacts = append(run.Artifacts, item.artifact)
-				markPlanNodeStatus(run, domain.RunPhaseExecute, item.artifact.AgentID, "done")
-				markWorkUnitStatus(run, "execute:prep:"+item.artifact.AgentID, "done")
-				completed[specs[item.index].ID] = true
-			}
-		}
-	}
-
-	if bundle := buildEvidenceBundleArtifact(run, prepArtifacts); bundle.ID != "" {
-		run.Artifacts = append(run.Artifacts, bundle)
-		messages = phaseMessages(messages, "Evidence bundle:\n"+bundle.Summary)
-	}
-
-	primaryID := fallbackString(plan.Primary.AgentID, "manager")
-	primary, ok := s.catalog.Resolve(primaryID)
-	if !ok {
-		return domain.AgentResult{}, prepEvents, fmt.Errorf("primary agent %q が見つかりません", primaryID)
-	}
-	taskBrief := fallbackString(strings.TrimSpace(plan.Primary.Reason), "Handle the request directly using the prepared context and available tools.")
-	if primary.ID == "manager" {
-		taskBrief = fallbackString(strings.TrimSpace(plan.Primary.Reason), "Coordinate execution using the prepared context and produce the implementation result.")
-	}
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, primary, request, domain.RunPhaseExecute, 1, messages, taskBrief), 0)
-	if err != nil {
-		return domain.AgentResult{}, prepEvents, err
-	}
-	markPlanNodeStatus(run, domain.RunPhaseExecute, primary.ID, "done")
-	markWorkUnitStatus(run, "execute:primary:"+primary.ID, "done")
-	run.Artifacts = append(run.Artifacts, newAgentMessageArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content, nil))
-	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
-	s.maybeCompactRun(run)
-	_ = s.saveRun(ctx, run)
-	return result, append(prepEvents, result.Events...), nil
-}
-
-func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, execution domain.AgentResult, attempt int) (domain.VerificationResult, []domain.ExecutionEvent, error) {
-	run.CurrentPhase = domain.RunPhaseVerify
-	run.Attempt = attempt
-	_ = s.saveRun(ctx, run)
-
-	input := phaseMessages(run.Messages, "Execution summary:\n"+execution.Message.Content, "Execution plan:\n"+stablePlanJSON(plan))
-	results := []domain.VerificationResult{}
-	allEvents := []domain.ExecutionEvent{}
-	if len(plan.Verify) > 0 {
-		scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
-		specs := make([]scheduleSpec, 0, len(plan.Verify))
-		for _, item := range plan.Verify {
-			specs = append(specs, scheduleSpec{
-				ID:              "verify:" + item.AgentID,
-				Source:          item.AgentID,
-				SourceLimit:     1,
-				SideEffectClass: domain.SideEffectNone,
-			})
-			markWorkUnitStatus(run, "verify:"+item.AgentID, "running")
-		}
-		completed := map[string]bool{}
-		for len(completed) < len(specs) {
-			batch := scheduler.nextBatch(specs, completed)
-			if len(batch) == 0 {
-				break
-			}
-			group, groupCtx := errgroup.WithContext(ctx)
-			type verifyResult struct {
-				index    int
-				parsed   domain.VerificationResult
-				artifact domain.RunArtifact
-				events   []domain.ExecutionEvent
-			}
-			batchResults := make([]verifyResult, len(batch))
-			for batchIdx, specIdx := range batch {
-				batchIdx := batchIdx
-				specIdx := specIdx
-				group.Go(func() error {
-					item := plan.Verify[specIdx]
-					agent, ok := s.catalog.Resolve(item.AgentID)
-					if !ok {
-						return nil
-					}
-					agent = withVerificationInstruction(agent)
-					taskBrief := fallbackString(strings.TrimSpace(item.Reason), "Verify the latest implementation. Return VERIFICATION_STATUS, SUMMARY, and REPAIR_BRIEF.")
-					invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseVerify, attempt, input, taskBrief)
-					invocation.Context.ExpectedOutput = verificationOutputContract()
-					result, err := s.runAgent(groupCtx, invocation, 0)
-					if err != nil {
-						return err
-					}
-					parsed := parseVerification(result.Message.Content, agent.ID, attempt)
-					batchResults[batchIdx] = verifyResult{
-						index:    specIdx,
-						parsed:   parsed,
-						artifact: newVerificationArtifact(run, domain.RunPhaseVerify, agent.ID, agent.Name+" verification", result.Message.Content, parsed),
-						events:   result.Events,
-					}
-					return nil
-				})
-			}
-			if err := group.Wait(); err != nil {
-				return domain.VerificationResult{}, allEvents, err
-			}
-			for _, item := range batchResults {
-				if item.parsed.SourceAgent == "" {
-					continue
-				}
-				results = append(results, item.parsed)
-				allEvents = append(allEvents, item.events...)
-				run.Verification = append(run.Verification, item.parsed)
-				run.Artifacts = append(run.Artifacts, item.artifact)
-				markPlanNodeStatus(run, domain.RunPhaseVerify, item.parsed.SourceAgent, "done")
-				markWorkUnitStatus(run, "verify:"+item.parsed.SourceAgent, "done")
-				completed[specs[item.index].ID] = true
-			}
-		}
-	}
-	merged := mergeVerification(results, attempt)
-	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseVerify, merged.Summary))
-	s.maybeCompactRun(run)
-	_ = s.saveRun(ctx, run)
-	return merged, allEvents, nil
-}
-
-func (s *Service) runRecoverPhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, verification domain.VerificationResult, attempt int) (domain.AgentResult, []domain.ExecutionEvent, error) {
-	run.CurrentPhase = domain.RunPhaseRecover
-	run.Attempt = attempt
-	_ = s.saveRun(ctx, run)
-
-	if plan == nil || plan.Recovery == nil {
-		return domain.AgentResult{}, nil, fmt.Errorf("recovery plan がありません")
-	}
-	coder, ok := s.catalog.Resolve(fallbackString(plan.Recovery.AgentID, "coder"))
-	if !ok {
-		return domain.AgentResult{}, nil, fmt.Errorf("recovery agent %q が見つかりません", plan.Recovery.AgentID)
-	}
-	repairPrompt := strings.TrimSpace("Repair the implementation using this brief:\n" + verification.RepairBrief)
-	taskBrief := fallbackString(strings.TrimSpace(plan.Recovery.Reason), repairPrompt)
-	invocation := s.phaseInvocation(run, coder, request, domain.RunPhaseRecover, attempt, phaseMessages(run.Messages, repairPrompt, "Execution plan:\n"+stablePlanJSON(plan)), taskBrief)
-	invocation.Context.ExpectedOutput = repairOutputContract()
-	result, err := s.runAgent(ctx, invocation, 0)
-	if err != nil {
-		return domain.AgentResult{}, nil, err
-	}
-	markPlanNodeStatus(run, domain.RunPhaseRecover, coder.ID, "done")
-	run.Artifacts = append(run.Artifacts, newAgentMessageArtifact(run, domain.RunPhaseRecover, coder.ID, "Recovery result", "recovery", result.Message.Content, nil))
-	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseRecover, result.Message.Content))
-	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: coder.ID, Content: result.Message.Content})
-	s.maybeCompactRun(run)
-	_ = s.saveRun(ctx, run)
-	return result, result.Events, nil
-}
-
-func (s *Service) runFinalizePhase(ctx context.Context, run *domain.RunState, plan *domain.ExecutionPlan, request domain.TurnRequest, execution domain.AgentResult) (domain.AgentResult, []domain.ExecutionEvent, error) {
-	if plan == nil || plan.Finalize == nil || plan.Finalize.AgentID == "" {
-		return execution, execution.Events, nil
-	}
-	manager, ok := s.catalog.Resolve(plan.Finalize.AgentID)
-	if !ok {
-		return domain.AgentResult{}, nil, fmt.Errorf("finalize agent %q が見つかりません", plan.Finalize.AgentID)
-	}
-	run.CurrentPhase = domain.RunPhaseFinalize
-	_ = s.saveRun(ctx, run)
-	input := phaseMessages(run.Messages,
-		"Execution summary:\n"+execution.Message.Content,
-		"Verification summary:\n"+latestVerificationSummary(run),
-		"Execution plan:\n"+stablePlanJSON(plan),
-	)
-	taskBrief := fallbackString(strings.TrimSpace(plan.Finalize.Reason), "Summarize the completed work, verification status, and remaining risks.")
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, manager, request, domain.RunPhaseFinalize, run.Attempt, input, taskBrief), 0)
-	if err != nil {
-		return domain.AgentResult{}, nil, err
-	}
-	markPlanNodeStatus(run, domain.RunPhaseFinalize, manager.ID, "done")
-	s.maybeCompactRun(run)
-	return result, result.Events, nil
 }
 
 func (s *Service) phaseInvocation(run *domain.RunState, agent domain.AgentSpec, request domain.TurnRequest, phase domain.RunPhase, attempt int, messages []domain.Message, task string) domain.AgentInvocation {
@@ -614,17 +345,11 @@ func (s *Service) rememberRun(ctx context.Context, run *domain.RunState) error {
 			memory.KnownFailures = appendUnique(memory.KnownFailures, verification.Summary)
 		}
 	}
-	for _, artifact := range lastArtifacts(run.Artifacts, 4) {
-		if artifact.Summary == "" {
-			continue
-		}
-		memory.StableFacts = appendOrReplaceWorkspaceFact(memory.StableFacts, domain.WorkspaceFact{
-			ID:         artifact.ID,
-			Kind:       artifact.Kind,
-			Summary:    artifact.Summary,
-			ArtifactID: artifact.ID,
-			UpdatedAt:  time.Now(),
-		})
+	for _, failure := range knownFailuresFromArtifacts(lastArtifacts(run.Artifacts, 8)) {
+		memory.KnownFailures = appendUnique(memory.KnownFailures, failure)
+	}
+	for _, fact := range typedWorkspaceFacts(lastArtifacts(run.Artifacts, 8)) {
+		memory.StableFacts = appendOrReplaceWorkspaceFact(memory.StableFacts, fact)
 	}
 	return s.config.MemoryStore.SaveMemory(ctx, memory)
 }
@@ -668,80 +393,79 @@ func appendOrReplaceWorkspaceFact(items []domain.WorkspaceFact, fact domain.Work
 	return append(items, fact)
 }
 
-func workUnitsFromExecutionPlan(plan *domain.ExecutionPlan) []domain.WorkUnit {
+func workUnitsFromExecutionPlan(run *domain.RunState, plan *domain.ExecutionPlan) []domain.WorkUnit {
 	if plan == nil {
 		return nil
 	}
-	units := make([]domain.WorkUnit, 0, len(plan.Preparation)+len(plan.Verify)+4)
+	artifactRefs := []domain.ArtifactReference{}
+	knownFailures := []string{}
+	if run != nil {
+		artifactRefs = recentArtifactReferences(lastArtifacts(run.Artifacts, 8), 8)
+		knownFailures = append([]string(nil), run.KnownFailures...)
+	}
+	units := make([]domain.WorkUnit, 0, len(plan.Preparation)+len(plan.Verify)+2)
 	prepIDs := make([]string, 0, len(plan.Preparation))
 	for _, item := range plan.Preparation {
 		id := "execute:prep:" + item.AgentID
 		prepIDs = append(prepIDs, id)
 		units = append(units, domain.WorkUnit{
-			ID:     id,
-			Kind:   "preparation",
-			Role:   item.AgentID,
-			Phase:  domain.RunPhaseExecute,
-			Task:   item.Reason,
-			Status: "pending",
-			Source: item.AgentID,
+			ID:               id,
+			Kind:             "preparation",
+			Role:             item.AgentID,
+			Phase:            domain.RunPhaseExecute,
+			Attempt:          1,
+			Task:             item.Reason,
+			Status:           "pending",
+			Source:           item.AgentID,
+			ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
+			KnownFailureRefs: append([]string(nil), knownFailures...),
 		})
 	}
 	primaryID := "execute:primary:" + plan.Primary.AgentID
 	units = append(units, domain.WorkUnit{
-		ID:        primaryID,
-		Kind:      "primary",
-		Role:      plan.Primary.AgentID,
-		Phase:     domain.RunPhaseExecute,
-		Task:      plan.Primary.Reason,
-		Status:    "pending",
-		DependsOn: append([]string(nil), prepIDs...),
-		Source:    plan.Primary.AgentID,
+		ID:               primaryID,
+		Kind:             "primary",
+		Role:             plan.Primary.AgentID,
+		Phase:            domain.RunPhaseExecute,
+		Attempt:          1,
+		Task:             plan.Primary.Reason,
+		Status:           "pending",
+		DependsOn:        append([]string(nil), prepIDs...),
+		Source:           plan.Primary.AgentID,
+		SideEffectClass:  workUnitSideEffect(plan.TaskKind, "primary"),
+		WriteSet:         workUnitWriteSet(plan.TaskKind, "primary"),
+		ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
+		KnownFailureRefs: append([]string(nil), knownFailures...),
 	})
-	verifyIDs := make([]string, 0, len(plan.Verify))
 	for _, item := range plan.Verify {
-		id := "verify:" + item.AgentID
-		verifyIDs = append(verifyIDs, id)
+		id := verifyUnitID(item.AgentID, 1)
 		units = append(units, domain.WorkUnit{
-			ID:        id,
-			Kind:      "verification",
-			Role:      item.AgentID,
-			Phase:     domain.RunPhaseVerify,
-			Task:      item.Reason,
-			Status:    "pending",
-			DependsOn: []string{primaryID},
-			Source:    item.AgentID,
+			ID:               id,
+			Kind:             "verification",
+			Role:             item.AgentID,
+			Phase:            domain.RunPhaseVerify,
+			Attempt:          1,
+			Task:             item.Reason,
+			Status:           "pending",
+			DependsOn:        []string{primaryID},
+			Source:           item.AgentID,
+			ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
+			KnownFailureRefs: append([]string(nil), knownFailures...),
 		})
 	}
-	if plan.Recovery != nil && plan.Recovery.AgentID != "" {
+	if len(plan.Verify) == 0 && plan.Finalize != nil && plan.Finalize.AgentID != "" {
 		units = append(units, domain.WorkUnit{
-			ID:              "recover:" + plan.Recovery.AgentID,
-			Kind:            "recovery",
-			Role:            plan.Recovery.AgentID,
-			Phase:           domain.RunPhaseRecover,
-			Task:            plan.Recovery.Reason,
-			Status:          "pending",
-			DependsOn:       append([]string(nil), verifyIDs...),
-			Source:          plan.Recovery.AgentID,
-			SideEffectClass: domain.SideEffectExternal,
-		})
-	}
-	if plan.Finalize != nil && plan.Finalize.AgentID != "" {
-		dependsOn := []string{primaryID}
-		if plan.Recovery != nil && plan.Recovery.AgentID != "" {
-			dependsOn = []string{"recover:" + plan.Recovery.AgentID}
-		} else if len(verifyIDs) > 0 {
-			dependsOn = append([]string(nil), verifyIDs...)
-		}
-		units = append(units, domain.WorkUnit{
-			ID:        "finalize:" + plan.Finalize.AgentID,
-			Kind:      "finalize",
-			Role:      plan.Finalize.AgentID,
-			Phase:     domain.RunPhaseFinalize,
-			Task:      plan.Finalize.Reason,
-			Status:    "pending",
-			DependsOn: dependsOn,
-			Source:    plan.Finalize.AgentID,
+			ID:               finalizeUnitID(plan, 1),
+			Kind:             "finalize",
+			Role:             plan.Finalize.AgentID,
+			Phase:            domain.RunPhaseFinalize,
+			Attempt:          1,
+			Task:             plan.Finalize.Reason,
+			Status:           "pending",
+			DependsOn:        []string{primaryID},
+			Source:           plan.Finalize.AgentID,
+			ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
+			KnownFailureRefs: append([]string(nil), knownFailures...),
 		})
 	}
 	return units

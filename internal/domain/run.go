@@ -149,6 +149,8 @@ type ObservationRecord struct {
 type MutationRecord struct {
 	ID                  string    `json:"id"`
 	SessionID           string    `json:"session_id,omitempty"`
+	AgentID             string    `json:"agent_id,omitempty"`
+	ExecutionID         string    `json:"execution_id,omitempty"`
 	ToolName            string    `json:"tool_name"`
 	WriteSet            []string  `json:"write_set,omitempty"`
 	MutationFingerprint string    `json:"mutation_fingerprint,omitempty"`
@@ -189,6 +191,7 @@ type WorkUnit struct {
 	Kind             string              `json:"kind"`
 	Role             string              `json:"role"`
 	Phase            RunPhase            `json:"phase"`
+	Attempt          int                 `json:"attempt,omitempty"`
 	Task             string              `json:"task"`
 	Status           string              `json:"status"`
 	DependsOn        []string            `json:"depends_on,omitempty"`
@@ -211,7 +214,6 @@ type RunState struct {
 	Attempt             int                  `json:"attempt"`
 	Profile             string               `json:"profile,omitempty"`
 	UserGoal            string               `json:"user_goal,omitempty"`
-	ConversationSummary string               `json:"conversation_summary,omitempty"`
 	Messages            []Message            `json:"messages,omitempty"`
 	ExecutionPlan       *ExecutionPlan       `json:"execution_plan,omitempty"`
 	Plan                []PlanNode           `json:"plan,omitempty"`
@@ -252,11 +254,15 @@ type RuntimeStateStore interface {
 	SaveObservation(context.Context, ObservationRecord) error
 	ListObservations(context.Context, int) ([]ObservationRecord, error)
 	SaveExecution(context.Context, ToolExecutionRecord) error
+	ListExecutions(context.Context, int) ([]ToolExecutionRecord, error)
 	FindReusableExecution(context.Context, string, []string) (*ToolExecutionRecord, error)
 	SaveMutation(context.Context, MutationRecord) error
+	ListMutations(context.Context, int) ([]MutationRecord, error)
 	MarkStaleByPaths(context.Context, []string) error
 	LoadWorkspaceSnapshot(context.Context) (*WorkspaceSnapshot, error)
 	SaveWorkspaceSnapshot(context.Context, *WorkspaceSnapshot) error
+	SaveScratch(context.Context, ScratchRecord) error
+	ListScratch(context.Context, int) ([]ScratchRecord, error)
 }
 
 type ContextEngine interface {

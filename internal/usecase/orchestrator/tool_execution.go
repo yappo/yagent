@@ -120,7 +120,7 @@ func (s *Service) recordToolExecution(ctx context.Context, invocation domain.Age
 	}
 
 	if len(spec.writeSet) > 0 || spec.semantics.Class == domain.ToolClassMutate {
-		mutation := s.applyMutationSnapshot(ctx, spec)
+		mutation := s.applyMutationSnapshot(ctx, invocation, execution.ID, spec)
 		execution.MutationID = mutation.ID
 		execution.MutationFingerprint = mutation.MutationFingerprint
 		execution.WorkspaceRevision = mutation.AfterRevision
@@ -159,7 +159,7 @@ func (s *Service) recordReadSnapshot(ctx context.Context, states []domain.Worksp
 	_ = s.config.RuntimeStore.SaveWorkspaceSnapshot(ctx, snapshot)
 }
 
-func (s *Service) applyMutationSnapshot(ctx context.Context, spec toolRuntimeSpec) domain.MutationRecord {
+func (s *Service) applyMutationSnapshot(ctx context.Context, invocation domain.AgentInvocation, executionID string, spec toolRuntimeSpec) domain.MutationRecord {
 	snapshot, err := s.config.RuntimeStore.LoadWorkspaceSnapshot(ctx)
 	if err != nil || snapshot == nil {
 		snapshot = &domain.WorkspaceSnapshot{Paths: map[string]domain.WorkspacePathState{}}
@@ -176,7 +176,9 @@ func (s *Service) applyMutationSnapshot(ctx context.Context, spec toolRuntimeSpe
 	_ = s.config.RuntimeStore.SaveWorkspaceSnapshot(ctx, snapshot)
 	return domain.MutationRecord{
 		ID:                  nextExecutionID("mut", spec.semanticKey),
-		SessionID:           spec.call.RequestedByAgentID,
+		SessionID:           invocation.RootRunID,
+		AgentID:             invocation.Agent.ID,
+		ExecutionID:         executionID,
 		ToolName:            spec.call.Name,
 		WriteSet:            spec.writeSet,
 		MutationFingerprint: writeSetFingerprint(spec.writeSet),

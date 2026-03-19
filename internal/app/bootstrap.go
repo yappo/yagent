@@ -97,7 +97,7 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 		contextCfg.CompactAfterEstTokens = 1 << 30
 		contextCfg.CompactAfterVerifyCycles = 1 << 30
 	}
-	contextEngine := contextengine.New(contextCfg, memoryStore, cfg.Memory.MaxFacts)
+	contextEngine := contextengine.New(contextCfg, memoryStore, runStore, cfg.Memory.MaxFacts)
 
 	taskCatalog, err := taskcatalog.New(pwd)
 	if err != nil {

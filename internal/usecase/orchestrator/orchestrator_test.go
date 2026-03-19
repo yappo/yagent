@@ -1238,6 +1238,192 @@ func TestRunTurnRunsVerificationAndRecoveryLoop(t *testing.T) {
 	if !foundRecovery {
 		t.Fatalf("expected recovery artifact, got %+v", result.Run.Artifacts)
 	}
+	foundTestReport := false
+	foundSecondAttempt := false
+	for _, artifact := range result.Run.Artifacts {
+		if artifact.Kind == "test_report" {
+			foundTestReport = true
+		}
+	}
+	for _, unit := range result.Run.WorkUnits {
+		if unit.ID == "recover:2:coder" || unit.ID == "verify:2:tester" {
+			foundSecondAttempt = true
+		}
+	}
+	if !foundTestReport {
+		t.Fatalf("expected typed test_report artifact, got %+v", result.Run.Artifacts)
+	}
+	if !foundSecondAttempt {
+		t.Fatalf("expected dynamic second-attempt work units, got %+v", result.Run.WorkUnits)
+	}
+}
+
+func TestRunTurnBuildsTypedArtifactsAndTypedMemoryFacts(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "full",
+  "task_kind": "mutate",
+  "summary": "Update README, verify it, then summarize.",
+  "primary": {
+    "agent_id": "coder",
+    "reason": "Update README.md"
+  },
+  "verify": [
+    {
+      "agent_id": "tester",
+      "reason": "Verify the README update."
+    }
+  ],
+  "finalize": {
+    "agent_id": "manager",
+    "reason": "Summarize the README update."
+  }
+}`},
+				}},
+				"coder": {{
+					Message: domain.Message{
+						Role: domain.RoleAssistant,
+						ToolCalls: []domain.ToolCall{
+							{ID: "call-read", Name: "fs_read", Arguments: map[string]any{"path": "README.md"}},
+							{ID: "call-write", Name: "fs_write", Arguments: map[string]any{"path": "README.md", "content": "updated"}},
+						},
+					},
+				}, {
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "README updated"},
+				}},
+				"tester": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: README looks good\nREPAIR_BRIEF: none"},
+				}},
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "all done"},
+				}},
+			},
+		},
+		&fakeToolExecutor{
+			defs: map[string][]domain.ToolDefinition{
+				"coder": {{
+					Name:         "fs_read",
+					ReadOnly:     true,
+					ParallelSafe: true,
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassObserve,
+						ReusePolicy:     domain.ToolReuseOnSuccess,
+						DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+						SideEffectClass: domain.SideEffectNone,
+						Source:          "fs",
+						ReadPathArgs:    []string{"path"},
+					},
+				}, {
+					Name:             "fs_write",
+					MutatesWorkspace: true,
+					Semantics: domain.ToolSemantics{
+						Class:           domain.ToolClassMutate,
+						ReusePolicy:     domain.ToolReuseNever,
+						DuplicatePolicy: domain.ToolDuplicateAllow,
+						Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+						SideEffectClass: domain.SideEffectWorkspace,
+						Source:          "fs",
+						WritePathArgs:   []string{"path"},
+					},
+				}},
+			},
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				switch call.Name {
+				case "fs_read":
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "old README"}
+				case "fs_write":
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "wrote README"}
+				default:
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "ok"}
+				}
+			},
+		},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"planner": {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"coder":   {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+			"tester":  {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+		}},
+		Config{
+			MaxParallelAgents:       2,
+			MaxHandoffDepth:         2,
+			MaxVerificationAttempts: 1,
+			RunStore:                store,
+			MemoryStore:             store,
+			RuntimeStore:            store,
+		},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "update README.md"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+
+	foundKinds := map[string]domain.RunArtifact{}
+	for _, artifact := range result.Run.Artifacts {
+		foundKinds[artifact.Kind] = artifact
+	}
+	for _, kind := range []string{"repo_map", "change_set", "test_report", "final_response"} {
+		if _, ok := foundKinds[kind]; !ok {
+			t.Fatalf("expected %s artifact, got %+v", kind, result.Run.Artifacts)
+		}
+	}
+
+	var repoMap domain.RepoMapArtifactPayload
+	if err := json.Unmarshal(foundKinds["repo_map"].Payload, &repoMap); err != nil {
+		t.Fatalf("repo_map payload decode failed: %v", err)
+	}
+	foundREADMERef := false
+	for _, entry := range repoMap.Entries {
+		if strings.HasSuffix(entry.Path, "README.md") {
+			foundREADMERef = true
+			break
+		}
+	}
+	if !foundREADMERef {
+		t.Fatalf("expected README.md in repo_map, got %+v", repoMap.Entries)
+	}
+
+	var changeSet domain.ChangeSetArtifactPayload
+	if err := json.Unmarshal(foundKinds["change_set"].Payload, &changeSet); err != nil {
+		t.Fatalf("change_set payload decode failed: %v", err)
+	}
+	foundChangedREADME := false
+	for _, file := range changeSet.Files {
+		if strings.HasSuffix(file.Path, "README.md") {
+			foundChangedREADME = true
+			break
+		}
+	}
+	if !foundChangedREADME {
+		t.Fatalf("expected README.md in change_set, got %+v", changeSet.Files)
+	}
+
+	memory, err := store.LoadMemory(context.Background())
+	if err != nil {
+		t.Fatalf("LoadMemory returned error: %v", err)
+	}
+	foundTypedFact := false
+	for _, fact := range memory.StableFacts {
+		if strings.HasPrefix(fact.ID, workspaceFactRepoPathPrefix) || strings.HasPrefix(fact.ID, workspaceFactChangedPathPrefix) {
+			foundTypedFact = true
+			break
+		}
+	}
+	if !foundTypedFact {
+		t.Fatalf("expected typed workspace facts, got %+v", memory.StableFacts)
+	}
 }
 
 func TestRunTurnSuppressesDuplicateToolCalls(t *testing.T) {
@@ -1388,6 +1574,9 @@ func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
 	model := &concurrentModelClient{
 		delay: 60 * time.Millisecond,
 		responses: map[string]domain.ModelResponse{
+			"coder": {
+				Message: domain.Message{Role: domain.RoleAssistant, Content: "implemented"},
+			},
 			"tester": {
 				Message: domain.Message{Role: domain.RoleAssistant, Content: "VERIFICATION_STATUS: pass\nSUMMARY: tests good\nREPAIR_BRIEF: none"},
 			},
@@ -1400,6 +1589,7 @@ func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
 		model,
 		&fakeToolExecutor{},
 		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"coder":    {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
 			"tester":   {ID: "tester", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
 			"reviewer": {ID: "reviewer", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
 		}},
@@ -1416,15 +1606,13 @@ func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
 	run := &domain.RunState{
 		ID:        "run-1",
 		RootRunID: "run-1",
-		WorkUnits: workUnitsFromExecutionPlan(plan),
 		Messages:  []domain.Message{{Role: domain.RoleUser, Content: "fix it"}},
 	}
+	run.WorkUnits = workUnitsFromExecutionPlan(run, plan)
 
-	_, _, err := service.runVerifyPhase(context.Background(), run, plan, domain.TurnRequest{}, domain.AgentResult{
-		Message: domain.Message{Role: domain.RoleAssistant, Content: "done"},
-	}, 1)
+	_, _, err := service.runWorkGraph(context.Background(), run, plan, domain.TurnRequest{})
 	if err != nil {
-		t.Fatalf("runVerifyPhase returned error: %v", err)
+		t.Fatalf("runWorkGraph returned error: %v", err)
 	}
 	if model.maxConcurrent.Load() < 2 {
 		t.Fatalf("expected parallel verification, max concurrency was %d", model.maxConcurrent.Load())

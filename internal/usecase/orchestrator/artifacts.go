@@ -22,6 +22,20 @@ func newExecutionPlanArtifact(run *domain.RunState, phase domain.RunPhase, agent
 	}, nil)
 }
 
+func newRepoMapArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, entries []domain.RepoMapEntry) domain.RunArtifact {
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		line := entry.Path
+		if entry.Observation != "" {
+			line += ": " + entry.Observation
+		}
+		lines = append(lines, line)
+	}
+	return newTypedArtifact(run, phase, agentID, "Repository map", "repo_map", strings.Join(lines, "\n"), domain.RepoMapArtifactPayload{
+		Entries: entries,
+	}, nil)
+}
+
 func newAgentMessageArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, name string, kind string, content string, refs []domain.ArtifactReference) domain.RunArtifact {
 	return newTypedArtifact(run, phase, agentID, name, kind, content, domain.AgentMessageArtifactPayload{
 		Message:       content,
@@ -37,6 +51,26 @@ func newVerificationArtifact(run *domain.RunState, phase domain.RunPhase, agentI
 	}, nil)
 }
 
+func newChangeSetArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, payload domain.ChangeSetArtifactPayload) domain.RunArtifact {
+	lines := make([]string, 0, len(payload.Files))
+	for _, file := range payload.Files {
+		line := file.Path
+		if file.Operation != "" {
+			line += " [" + file.Operation + "]"
+		}
+		lines = append(lines, line)
+	}
+	return newTypedArtifact(run, phase, agentID, "Change set", "change_set", strings.Join(lines, "\n"), payload, payload.SourceArtifacts)
+}
+
+func newTestReportArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, payload domain.TestReportArtifactPayload) domain.RunArtifact {
+	lines := make([]string, 0, len(payload.Entries))
+	for _, entry := range payload.Entries {
+		lines = append(lines, entry.AgentID+": "+entry.Status+" - "+entry.Summary)
+	}
+	return newTypedArtifact(run, phase, agentID, "Test report", "test_report", strings.Join(lines, "\n"), payload, nil)
+}
+
 func newFinalResponseArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, content string) domain.RunArtifact {
 	refs := recentArtifactReferences(lastArtifacts(run.Artifacts, 6), 6)
 	return newTypedArtifact(run, phase, agentID, "Final response", "final_response", content, domain.FinalResponseArtifactPayload{
@@ -48,8 +82,9 @@ func newFinalResponseArtifact(run *domain.RunState, phase domain.RunPhase, agent
 }
 
 func newTypedArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, name string, kind string, content string, payload any, refs []domain.ArtifactReference) domain.RunArtifact {
+	seed := fmt.Sprintf("%s:%s:%s:%d", fallbackString(run.RootRunID, run.ID), phase, kind, time.Now().UnixNano())
 	return domain.RunArtifact{
-		ID:            fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
+		ID:            nextExecutionID("artifact", seed),
 		Name:          name,
 		Kind:          kind,
 		SchemaVersion: kind + ".v1",
