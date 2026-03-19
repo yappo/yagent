@@ -395,8 +395,8 @@ func (s *Service) appendRecoveryUnit(run *domain.RunState, plan *domain.Executio
 		DependsOn:       append([]string(nil), dependsOn...),
 		Source:          plan.Recovery.AgentID,
 		SideEffectClass: workUnitSideEffect(plan.TaskKind, "recovery"),
-		WriteSet:        workUnitWriteSet(plan.TaskKind, "recovery"),
 	})
+	hydrateWorkUnit(run, &run.WorkUnits[len(run.WorkUnits)-1])
 }
 
 func (s *Service) appendVerificationUnits(run *domain.RunState, plan *domain.ExecutionPlan, attempt int, dependsOn []string) {
@@ -419,6 +419,7 @@ func (s *Service) appendVerificationUnits(run *domain.RunState, plan *domain.Exe
 			DependsOn: append([]string(nil), dependsOn...),
 			Source:    item.AgentID,
 		})
+		hydrateWorkUnit(run, &run.WorkUnits[len(run.WorkUnits)-1])
 	}
 }
 
@@ -442,6 +443,7 @@ func (s *Service) appendFinalizeUnit(run *domain.RunState, plan *domain.Executio
 		DependsOn: append([]string(nil), dependsOn...),
 		Source:    plan.Finalize.AgentID,
 	})
+	hydrateWorkUnit(run, &run.WorkUnits[len(run.WorkUnits)-1])
 	state.finalizeAdded = true
 }
 
@@ -449,11 +451,8 @@ func (s *Service) refreshWorkUnits(run *domain.RunState) {
 	if run == nil {
 		return
 	}
-	refs := recentArtifactReferences(lastArtifacts(run.Artifacts, 8), 8)
-	failures := append([]string(nil), run.KnownFailures...)
 	for idx := range run.WorkUnits {
-		run.WorkUnits[idx].ArtifactRefs = append([]domain.ArtifactReference(nil), refs...)
-		run.WorkUnits[idx].KnownFailureRefs = append([]string(nil), failures...)
+		hydrateWorkUnit(run, &run.WorkUnits[idx])
 	}
 }
 
@@ -642,13 +641,6 @@ func workUnitSideEffect(kind domain.TaskKind, unitKind string) domain.SideEffect
 		return domain.SideEffectWorkspace
 	}
 	return domain.SideEffectNone
-}
-
-func workUnitWriteSet(kind domain.TaskKind, unitKind string) []string {
-	if kind == domain.TaskKindMutate && (unitKind == "primary" || unitKind == "recovery") {
-		return []string{"workspace"}
-	}
-	return nil
 }
 
 func maxInt(left int, right int) int {

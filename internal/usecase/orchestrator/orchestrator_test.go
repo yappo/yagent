@@ -1424,6 +1424,25 @@ func TestRunTurnBuildsTypedArtifactsAndTypedMemoryFacts(t *testing.T) {
 	if !foundTypedFact {
 		t.Fatalf("expected typed workspace facts, got %+v", memory.StableFacts)
 	}
+
+	expectedPath := normalizePathForWorkspace("README.md")
+	foundPrimaryScope := false
+	foundVerifyScope := false
+	for _, unit := range result.Run.WorkUnits {
+		switch {
+		case unit.Kind == "primary" && len(unit.WriteSet) > 0:
+			if containsString(unit.WriteSet, expectedPath) {
+				foundPrimaryScope = true
+			}
+		case unit.Kind == "verification" && len(unit.ReadSet) > 0:
+			if containsString(unit.ReadSet, expectedPath) {
+				foundVerifyScope = true
+			}
+		}
+	}
+	if !foundPrimaryScope || !foundVerifyScope {
+		t.Fatalf("expected scoped work units, got %+v", result.Run.WorkUnits)
+	}
 }
 
 func TestRunTurnSuppressesDuplicateToolCalls(t *testing.T) {
@@ -1627,6 +1646,15 @@ func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
 func hasEventType(events []domain.ExecutionEvent, typ string) bool {
 	for _, event := range events {
 		if event.Type == typ {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
 			return true
 		}
 	}

@@ -422,63 +422,6 @@ func roleScopedMessages(messages []domain.Message, role string, limit int) []dom
 	return tailMessages(messages, limit)
 }
 
-func selectArtifactsForRole(artifacts []domain.RunArtifact, role string, limit int) []domain.RunArtifact {
-	if len(artifacts) == 0 {
-		return nil
-	}
-	allowed := map[string]bool{}
-	switch role {
-	case "planner":
-		allowed["agent_inventory"] = true
-		allowed["repo_map"] = true
-		allowed["evidence_bundle"] = true
-	case "researcher":
-		allowed["execution_plan"] = true
-		allowed["repo_map"] = true
-		allowed["evidence_bundle"] = true
-	case "coder":
-		allowed["execution_plan"] = true
-		allowed["repo_map"] = true
-		allowed["evidence_bundle"] = true
-		allowed["review_findings"] = true
-		allowed["test_report"] = true
-		allowed["change_set"] = true
-	case "tester":
-		allowed["execution"] = true
-		allowed["change_set"] = true
-		allowed["evidence_bundle"] = true
-		allowed["test_report"] = true
-	case "reviewer":
-		allowed["execution"] = true
-		allowed["change_set"] = true
-		allowed["evidence_bundle"] = true
-		allowed["review_findings"] = true
-	case "manager", "finalizer":
-		allowed["execution_plan"] = true
-		allowed["execution"] = true
-		allowed["evidence_bundle"] = true
-		allowed["test_report"] = true
-		allowed["review_findings"] = true
-		allowed["final_response"] = true
-	default:
-		return lastArtifacts(artifacts, limit)
-	}
-
-	filtered := make([]domain.RunArtifact, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		if allowed[artifact.Kind] {
-			filtered = append(filtered, artifact)
-		}
-	}
-	if len(filtered) == 0 {
-		filtered = lastArtifacts(artifacts, limit)
-	}
-	if limit > 0 && len(filtered) > limit {
-		filtered = filtered[len(filtered)-limit:]
-	}
-	return filtered
-}
-
 func selectObservationsForRole(items []domain.ObservationSummary, role string) []domain.ObservationRecord {
 	if len(items) == 0 {
 		return nil

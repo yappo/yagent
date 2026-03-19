@@ -13,52 +13,85 @@ type packetBuilder interface {
 	Build(packetBase) domain.RunContext
 }
 
-type rolePacketBuilder struct {
-	role             string
-	messageLimit     int
-	allowedArtifacts map[string]bool
-	constraints      []string
-}
+type plannerPacketBuilder struct{}
+type researcherPacketBuilder struct{}
+type coderPacketBuilder struct{}
+type testerPacketBuilder struct{}
+type reviewerPacketBuilder struct{}
+type finalizerPacketBuilder struct{}
+type defaultPacketBuilder struct{}
 
 func packetBuilderForRole(role string) packetBuilder {
 	switch role {
 	case "planner":
-		return rolePacketBuilder{role: role, messageLimit: 6, allowedArtifacts: artifactKinds("agent_inventory", "repo_map", "evidence_bundle"), constraints: []string{"Return structured plan output only."}}
+		return plannerPacketBuilder{}
 	case "researcher":
-		return rolePacketBuilder{role: role, messageLimit: 5, allowedArtifacts: artifactKinds("execution_plan", "repo_map", "evidence_bundle"), constraints: []string{"Return facts and evidence only."}}
+		return researcherPacketBuilder{}
 	case "coder":
-		return rolePacketBuilder{role: role, messageLimit: 4, allowedArtifacts: artifactKinds("execution_plan", "repo_map", "evidence_bundle", "review_findings", "test_report", "change_set"), constraints: []string{"Prefer runtime facts over speculative reasoning."}}
+		return coderPacketBuilder{}
 	case "tester":
-		return rolePacketBuilder{role: role, messageLimit: 4, allowedArtifacts: artifactKinds("execution", "change_set", "evidence_bundle", "test_report"), constraints: []string{"Report concrete verification evidence."}}
+		return testerPacketBuilder{}
 	case "reviewer":
-		return rolePacketBuilder{role: role, messageLimit: 4, allowedArtifacts: artifactKinds("execution", "change_set", "evidence_bundle", "review_findings", "test_report"), constraints: []string{"Focus on bugs, regressions, and risks."}}
+		return reviewerPacketBuilder{}
 	case "manager", "finalizer":
-		return rolePacketBuilder{role: role, messageLimit: 5, allowedArtifacts: artifactKinds("execution_plan", "execution", "change_set", "evidence_bundle", "test_report", "review_findings", "final_response"), constraints: []string{"Synthesize using artifact facts first."}}
+		return finalizerPacketBuilder{}
 	default:
-		return rolePacketBuilder{role: role, messageLimit: 6}
+		return defaultPacketBuilder{}
 	}
 }
 
-func (b rolePacketBuilder) Build(base packetBase) domain.RunContext {
+func (plannerPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, "planner", 6, artifactKinds("agent_inventory", "repo_map", "evidence_bundle"), []string{"Return structured plan output only."})
+}
+
+func (researcherPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, "researcher", 5, artifactKinds("execution_plan", "repo_map", "evidence_bundle"), []string{"Return facts and evidence only."})
+}
+
+func (coderPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, "coder", 4, artifactKinds("execution_plan", "repo_map", "evidence_bundle", "review_findings", "test_report", "change_set"), []string{"Prefer runtime facts over speculative reasoning."})
+}
+
+func (testerPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, "tester", 4, artifactKinds("execution", "change_set", "evidence_bundle", "test_report"), []string{"Report concrete verification evidence."})
+}
+
+func (reviewerPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, "reviewer", 4, artifactKinds("execution", "change_set", "evidence_bundle", "review_findings", "test_report"), []string{"Focus on bugs, regressions, and risks."})
+}
+
+func (finalizerPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, "finalizer", 5, artifactKinds("execution_plan", "execution", "change_set", "evidence_bundle", "test_report", "review_findings", "final_response"), []string{"Synthesize using artifact facts first."})
+}
+
+func (defaultPacketBuilder) Build(base packetBase) domain.RunContext {
+	return buildScopedPacket(base, base.role, 6, nil, nil)
+}
+
+func buildScopedPacket(base packetBase, role string, messageLimit int, allowedArtifacts map[string]bool, constraints []string) domain.RunContext {
 	ctx := base.context
+	if role == "" {
+		role = base.role
+	}
+	if messageLimit <= 0 {
+		messageLimit = 6
+	}
 	if base.run == nil {
-		ctx.RecentMessages = tailMessages(base.messages, b.messageLimit)
-		ctx.ScopedConstraints = append([]string(nil), b.constraints...)
+		ctx.PacketRole = role
+		ctx.PacketKind = role
+		ctx.RecentMessages = tailMessages(base.messages, messageLimit)
+		ctx.ScopedConstraints = append([]string(nil), constraints...)
 		return ctx
 	}
 
-	limit := b.messageLimit
-	if limit <= 0 {
-		limit = 6
-	}
-	ctx.PacketRole = b.role
-	ctx.PacketKind = b.role
-	ctx.RecentMessages = roleScopedMessages(base.messages, b.role, limit)
-	relevantArtifacts := selectArtifactsByKind(base.run.Artifacts, b.allowedArtifacts)
+	ctx.PacketRole = role
+	ctx.PacketKind = role
+	ctx.RecentMessages = roleScopedMessages(base.messages, role, messageLimit)
+	relevantArtifacts := selectArtifactsByKind(base.run.Artifacts, allowedArtifacts)
 	ctx.ArtifactRefs = artifactRefs(relevantArtifacts, 8)
 	ctx.Artifacts = artifactReferences(relevantArtifacts, 8)
-	ctx.ScopedConstraints = append(ctx.ScopedConstraints, b.constraints...)
-	ctx.ScopedConstraints = append(ctx.ScopedConstraints, packetConstraints(base.run, b.role)...)
+	ctx.ScopedConstraints = append(ctx.ScopedConstraints, constraints...)
+	ctx.ScopedConstraints = append(ctx.ScopedConstraints, packetConstraints(base.run, role)...)
 	return ctx
 }
 

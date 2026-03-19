@@ -408,21 +408,23 @@ func workUnitsFromExecutionPlan(run *domain.RunState, plan *domain.ExecutionPlan
 	for _, item := range plan.Preparation {
 		id := "execute:prep:" + item.AgentID
 		prepIDs = append(prepIDs, id)
-		units = append(units, domain.WorkUnit{
-			ID:               id,
-			Kind:             "preparation",
-			Role:             item.AgentID,
-			Phase:            domain.RunPhaseExecute,
-			Attempt:          1,
-			Task:             item.Reason,
-			Status:           "pending",
-			Source:           item.AgentID,
-			ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
-			KnownFailureRefs: append([]string(nil), knownFailures...),
-		})
+		unit := domain.WorkUnit{
+			ID:      id,
+			Kind:    "preparation",
+			Role:    item.AgentID,
+			Phase:   domain.RunPhaseExecute,
+			Attempt: 1,
+			Task:    item.Reason,
+			Status:  "pending",
+			Source:  item.AgentID,
+		}
+		unit.ArtifactRefs = append([]domain.ArtifactReference(nil), artifactRefs...)
+		unit.KnownFailureRefs = append([]string(nil), knownFailures...)
+		hydrateWorkUnit(run, &unit)
+		units = append(units, unit)
 	}
 	primaryID := "execute:primary:" + plan.Primary.AgentID
-	units = append(units, domain.WorkUnit{
+	primaryUnit := domain.WorkUnit{
 		ID:               primaryID,
 		Kind:             "primary",
 		Role:             plan.Primary.AgentID,
@@ -433,13 +435,14 @@ func workUnitsFromExecutionPlan(run *domain.RunState, plan *domain.ExecutionPlan
 		DependsOn:        append([]string(nil), prepIDs...),
 		Source:           plan.Primary.AgentID,
 		SideEffectClass:  workUnitSideEffect(plan.TaskKind, "primary"),
-		WriteSet:         workUnitWriteSet(plan.TaskKind, "primary"),
 		ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
 		KnownFailureRefs: append([]string(nil), knownFailures...),
-	})
+	}
+	hydrateWorkUnit(run, &primaryUnit)
+	units = append(units, primaryUnit)
 	for _, item := range plan.Verify {
 		id := verifyUnitID(item.AgentID, 1)
-		units = append(units, domain.WorkUnit{
+		unit := domain.WorkUnit{
 			ID:               id,
 			Kind:             "verification",
 			Role:             item.AgentID,
@@ -451,10 +454,12 @@ func workUnitsFromExecutionPlan(run *domain.RunState, plan *domain.ExecutionPlan
 			Source:           item.AgentID,
 			ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
 			KnownFailureRefs: append([]string(nil), knownFailures...),
-		})
+		}
+		hydrateWorkUnit(run, &unit)
+		units = append(units, unit)
 	}
 	if len(plan.Verify) == 0 && plan.Finalize != nil && plan.Finalize.AgentID != "" {
-		units = append(units, domain.WorkUnit{
+		unit := domain.WorkUnit{
 			ID:               finalizeUnitID(plan, 1),
 			Kind:             "finalize",
 			Role:             plan.Finalize.AgentID,
@@ -466,7 +471,9 @@ func workUnitsFromExecutionPlan(run *domain.RunState, plan *domain.ExecutionPlan
 			Source:           plan.Finalize.AgentID,
 			ArtifactRefs:     append([]domain.ArtifactReference(nil), artifactRefs...),
 			KnownFailureRefs: append([]string(nil), knownFailures...),
-		})
+		}
+		hydrateWorkUnit(run, &unit)
+		units = append(units, unit)
 	}
 	return units
 }
