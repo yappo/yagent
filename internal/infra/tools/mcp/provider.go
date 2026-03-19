@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"yagent/internal/domain"
@@ -66,8 +68,7 @@ func (p *Provider) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 					}
 					return domain.SideEffectExternal
 				}(),
-				Source:       "mcp",
-				IdentityArgs: []string{},
+				Source: "mcp",
 				SourceLimit: func() int {
 					if item.ParallelSafe {
 						return 2
@@ -94,14 +95,7 @@ func (p *Provider) Execute(ctx context.Context, agent domain.AgentSpec, call dom
 		}, true
 	}
 
-	var bound *domain.BoundMCPTool
-	for _, item := range p.bindings.BoundTools() {
-		if item.QualifiedName == call.Name {
-			copied := item
-			bound = &copied
-			break
-		}
-	}
+	bound := p.lookupBoundTool(call.Name)
 	if bound == nil {
 		return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: bind 済み MCP tool が見つかりません"}, true
 	}
@@ -113,6 +107,39 @@ func (p *Provider) Execute(ctx context.Context, agent domain.AgentSpec, call dom
 		return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: " + err.Error()}, true
 	}
 	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: output}, true
+}
+
+func (p *Provider) InferRuntime(_ context.Context, _ domain.AgentSpec, call domain.ToolCall, _ domain.ToolDefinition) (domain.ToolRuntimeHint, bool) {
+	if !strings.HasPrefix(call.Name, "mcp__") {
+		return domain.ToolRuntimeHint{}, false
+	}
+	bound := p.lookupBoundTool(call.Name)
+	if bound == nil {
+		return domain.ToolRuntimeHint{}, false
+	}
+
+	readSet, writeSet := inferMCPAccess(call.Arguments, *bound)
+	if !bound.ReadOnly && len(writeSet) == 0 {
+		writeSet = append(writeSet, mcpStateScope(bound.TaskID))
+	}
+	return domain.ToolRuntimeHint{
+		ReadSet:       readSet,
+		WriteSet:      writeSet,
+		ReplaceAccess: true,
+		SideEffectClass: func() domain.SideEffectClass {
+			if bound.ReadOnly {
+				return domain.SideEffectNone
+			}
+			return domain.SideEffectExternal
+		}(),
+		Source: "mcp:" + bound.TaskID,
+		SourceLimit: func() int {
+			if bound.ParallelSafe {
+				return 2
+			}
+			return 1
+		}(),
+	}, true
 }
 
 func (p *Provider) authorize(ctx context.Context, call domain.ToolCall, bound domain.BoundMCPTool) error {
@@ -158,4 +185,125 @@ func allowed(agent domain.AgentSpec, toolName string) bool {
 		}
 	}
 	return false
+}
+
+func (p *Provider) lookupBoundTool(name string) *domain.BoundMCPTool {
+	for _, item := range p.bindings.BoundTools() {
+		if item.QualifiedName != name {
+			continue
+		}
+		copied := item
+		return &copied
+	}
+	return nil
+}
+
+func inferMCPAccess(args map[string]any, bound domain.BoundMCPTool) ([]string, []string) {
+	reads := []string{}
+	writes := []string{}
+	visitArgumentPaths(args, func(key string, value string) {
+		switch {
+		case bound.ReadOnly:
+			if looksLikePathKey(key) {
+				reads = append(reads, normalizeToolPath(value))
+			}
+		case looksLikeReadPathKey(key):
+			reads = append(reads, normalizeToolPath(value))
+		case looksLikeWritePathKey(key):
+			writes = append(writes, normalizeToolPath(value))
+		case looksLikePathKey(key):
+			writes = append(writes, normalizeToolPath(value))
+		}
+	})
+	if !bound.ReadOnly {
+		writes = append(writes, mcpStateScope(bound.TaskID))
+	}
+	return compactToolPaths(reads), compactToolPaths(writes)
+}
+
+func visitArgumentPaths(value any, visit func(key string, value string)) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			switch child := item.(type) {
+			case string:
+				visit(key, child)
+			default:
+				visitArgumentPaths(child, visit)
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			visitArgumentPaths(item, visit)
+		}
+	}
+}
+
+func looksLikePathKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, token := range []string{"path", "file", "dir", "directory", "root", "cwd", "repo", "workspace"} {
+		if strings.Contains(key, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeReadPathKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, token := range []string{"source", "src", "input", "from", "read"} {
+		if strings.Contains(key, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeWritePathKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, token := range []string{"target", "destination", "dest", "output", "write", "create", "save", "path"} {
+		if strings.Contains(key, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeToolPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "file://") {
+		value = strings.TrimPrefix(value, "file://")
+	}
+	if strings.Contains(value, "://") && !strings.HasPrefix(value, "file://") {
+		return ""
+	}
+	return filepath.Clean(value)
+}
+
+func compactToolPaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func mcpStateScope(taskID string) string {
+	return "mcp/" + strings.TrimSpace(taskID) + "/state"
 }

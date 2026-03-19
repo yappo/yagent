@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -60,7 +59,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		run.ExecutionPlan = plan
 		run.Plan = planNodesFromExecutionPlan(plan)
 		run.WorkUnits = workUnitsFromExecutionPlan(plan)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, fallbackString(plan.Primary.AgentID, "manager"), "Execution plan", "execution_plan", stablePlanJSON(plan)))
+		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhasePlan, fallbackString(plan.Primary.AgentID, "manager"), plan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 		_ = s.saveRun(ctx, run)
 		return plan, nil, nil
@@ -77,7 +76,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		run.ExecutionPlan = plan
 		run.Plan = planNodesFromExecutionPlan(plan)
 		run.WorkUnits = workUnitsFromExecutionPlan(plan)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, planner.ID, "Execution plan", "execution_plan", stablePlanJSON(plan)))
+		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhasePlan, planner.ID, plan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 		_ = s.saveRun(ctx, run)
 		return plan, events, nil
@@ -110,7 +109,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 	run.Plan = planNodesFromExecutionPlan(plan)
 	run.WorkUnits = workUnitsFromExecutionPlan(plan)
 	markPlanNodeStatus(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "done")
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), "Execution plan", "execution_plan", stablePlanJSON(plan)))
+	run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhasePlan, fallbackString(planAgentID(plan), "planner"), plan))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhasePlan, plan.Summary))
 	s.maybeCompactRun(run)
 	_ = s.saveRun(ctx, run)
@@ -127,7 +126,7 @@ func (s *Service) runDirectPhase(ctx context.Context, run *domain.RunState, mana
 		return domain.AgentResult{}, nil, err
 	}
 	markPlanNodeStatus(run, domain.RunPhaseExecute, result.Message.AgentID, "done")
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content))
+	run.Artifacts = append(run.Artifacts, newAgentMessageArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content, nil))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
 	s.maybeCompactRun(run)
 	_ = s.saveRun(ctx, run)
@@ -194,7 +193,7 @@ func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, pla
 					}
 					results[batchIdx] = prepResult{
 						index:    specIdx,
-						artifact: newArtifact(run, domain.RunPhaseExecute, agent.ID, agent.Name+" evidence", "evidence_bundle", research.Message.Content),
+						artifact: newAgentMessageArtifact(run, domain.RunPhaseExecute, agent.ID, agent.Name+" evidence", "evidence_bundle", research.Message.Content, nil),
 						events:   research.Events,
 					}
 					return nil
@@ -237,7 +236,7 @@ func (s *Service) runExecutePhase(ctx context.Context, run *domain.RunState, pla
 	}
 	markPlanNodeStatus(run, domain.RunPhaseExecute, primary.ID, "done")
 	markWorkUnitStatus(run, "execute:primary:"+primary.ID, "done")
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content))
+	run.Artifacts = append(run.Artifacts, newAgentMessageArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, "Execution result", "execution", result.Message.Content, nil))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: result.Message.AgentID, Content: result.Message.Content})
 	s.maybeCompactRun(run)
@@ -296,10 +295,11 @@ func (s *Service) runVerifyPhase(ctx context.Context, run *domain.RunState, plan
 					if err != nil {
 						return err
 					}
+					parsed := parseVerification(result.Message.Content, agent.ID, attempt)
 					batchResults[batchIdx] = verifyResult{
 						index:    specIdx,
-						parsed:   parseVerification(result.Message.Content, agent.ID, attempt),
-						artifact: newArtifact(run, domain.RunPhaseVerify, agent.ID, agent.Name+" verification", "review_findings", result.Message.Content),
+						parsed:   parsed,
+						artifact: newVerificationArtifact(run, domain.RunPhaseVerify, agent.ID, agent.Name+" verification", result.Message.Content, parsed),
 						events:   result.Events,
 					}
 					return nil
@@ -350,7 +350,7 @@ func (s *Service) runRecoverPhase(ctx context.Context, run *domain.RunState, pla
 		return domain.AgentResult{}, nil, err
 	}
 	markPlanNodeStatus(run, domain.RunPhaseRecover, coder.ID, "done")
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseRecover, coder.ID, "Recovery result", "recovery", result.Message.Content))
+	run.Artifacts = append(run.Artifacts, newAgentMessageArtifact(run, domain.RunPhaseRecover, coder.ID, "Recovery result", "recovery", result.Message.Content, nil))
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseRecover, result.Message.Content))
 	run.Messages = append(run.Messages, domain.Message{Role: domain.RoleAssistant, AgentID: coder.ID, Content: result.Message.Content})
 	s.maybeCompactRun(run)
@@ -464,25 +464,6 @@ func phaseMessages(base []domain.Message, additions ...string) []domain.Message 
 		out = append(out, domain.Message{Role: domain.RoleUser, Content: addition})
 	}
 	return out
-}
-
-func newArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, name string, kind string, content string) domain.RunArtifact {
-	payload, _ := json.Marshal(map[string]any{
-		"text": content,
-	})
-	return domain.RunArtifact{
-		ID:            fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-		Name:          name,
-		Kind:          kind,
-		SchemaVersion: kind + ".v1",
-		Phase:         phase,
-		AgentID:       agentID,
-		Summary:       truncateSummary(content),
-		Text:          content,
-		Content:       content,
-		Payload:       payload,
-		CreatedAt:     time.Now(),
-	}
 }
 
 func checkpoint(run *domain.RunState, phase domain.RunPhase, summary string) domain.RunCheckpoint {
@@ -791,26 +772,20 @@ func buildEvidenceBundleArtifact(run *domain.RunState, artifacts []domain.RunArt
 	}
 	summaries := make([]string, 0, len(artifacts))
 	refs := make([]domain.ArtifactReference, 0, len(artifacts))
+	entries := make([]domain.EvidenceBundleEntry, 0, len(artifacts))
 	for _, artifact := range artifacts {
 		summaries = append(summaries, artifact.Name+": "+artifact.Summary)
-		refs = append(refs, domain.ArtifactReference{ID: artifact.ID, Kind: artifact.Kind, Name: artifact.Name})
+		ref := domain.ArtifactReference{ID: artifact.ID, Kind: artifact.Kind, Name: artifact.Name}
+		refs = append(refs, ref)
+		entries = append(entries, domain.EvidenceBundleEntry{
+			Artifact: ref,
+			AgentID:  artifact.AgentID,
+			Summary:  artifact.Summary,
+		})
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"artifacts": refs,
-	})
-	return domain.RunArtifact{
-		ID:            fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-		Name:          "Evidence bundle",
-		Kind:          "evidence_bundle",
-		SchemaVersion: "evidence_bundle.v1",
-		Phase:         domain.RunPhaseExecute,
-		Summary:       truncateSummary(strings.Join(summaries, " | ")),
-		Text:          strings.Join(summaries, "\n"),
-		Content:       strings.Join(summaries, "\n"),
-		Payload:       payload,
-		References:    refs,
-		CreatedAt:     time.Now(),
-	}
+	return newTypedArtifact(run, domain.RunPhaseExecute, "", "Evidence bundle", "evidence_bundle", strings.Join(summaries, "\n"), domain.EvidenceBundleArtifactPayload{
+		Entries: entries,
+	}, refs)
 }
 
 func lastArtifacts(items []domain.RunArtifact, limit int) []domain.RunArtifact {

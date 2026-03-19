@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -277,6 +278,53 @@ func TestRunTurnCanDisablePhaseHarness(t *testing.T) {
 	}
 	if result.Run == nil || result.Run.ExecutionPlan == nil || result.Run.ExecutionPlan.Source != "disabled_harness" || len(result.Run.Verification) != 0 {
 		t.Fatalf("expected disabled harness execution plan, got %+v", result.Run)
+	}
+}
+
+func TestRunTurnPersistsTypedArtifacts(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "done directly with README.md"},
+				}},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DisablePhaseHarness: true},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Run == nil || len(result.Run.Artifacts) < 3 {
+		t.Fatalf("expected artifacts, got %+v", result.Run)
+	}
+
+	var planPayload domain.ExecutionPlanArtifactPayload
+	if err := json.Unmarshal(result.Run.Artifacts[1].Payload, &planPayload); err != nil {
+		t.Fatalf("expected typed execution plan payload: %v", err)
+	}
+	if planPayload.Plan == nil || planPayload.Plan.Source == "" {
+		t.Fatalf("expected execution plan payload, got %+v", planPayload)
+	}
+
+	finalArtifact := result.Run.Artifacts[len(result.Run.Artifacts)-1]
+	if finalArtifact.Kind != "final_response" {
+		t.Fatalf("expected final response artifact, got %+v", finalArtifact)
+	}
+	var finalPayload domain.FinalResponseArtifactPayload
+	if err := json.Unmarshal(finalArtifact.Payload, &finalPayload); err != nil {
+		t.Fatalf("expected typed final response payload: %v", err)
+	}
+	if !strings.Contains(finalPayload.Response, "README.md") {
+		t.Fatalf("expected final response payload content, got %+v", finalPayload)
 	}
 }
 

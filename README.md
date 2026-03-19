@@ -543,7 +543,7 @@ internal/
 - `patch_apply`
 - `list_capabilities` / `enable_capability`
 
-Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` と自動検出テンプレートから構築されます。  
+Task catalog は `.yagent/tasks.toml` の `[[tasks]]` / `[[mcpservers]]` とユーザー共通の `~/.config/yagent/tasks.toml` から構築されます。  
 MCP まわりでは、visible な `mcp__*` が空でも `task_list` / `task_bind` による lazy-bind が使える場合があります。  
 write-capable agent では `fs_write` / `patch_apply` を直接実行でき、その後の書き込み承認は通常の assistant 返答ではなく approval dialog で行われます。  
 一方で write tool が見えない理由が current agent の read-only 制約である場合は、「tool が存在しない」のではなく write-capable agent へ委譲すべきケースです。

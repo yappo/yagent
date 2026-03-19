@@ -82,6 +82,28 @@ func (r *Registry) Execute(ctx context.Context, agent domain.AgentSpec, call dom
 	return tool.Execute(ctx, call)
 }
 
+func (r *Registry) InferRuntime(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall, def domain.ToolDefinition) (domain.ToolRuntimeHint, bool) {
+	for _, provider := range r.providers {
+		inspector, ok := provider.(domain.ToolRuntimeInspector)
+		if !ok {
+			continue
+		}
+		if hint, ok := inspector.InferRuntime(ctx, agent, call, def); ok {
+			return hint, true
+		}
+	}
+
+	tool, ok := r.tools[call.Name]
+	if !ok {
+		return domain.ToolRuntimeHint{}, false
+	}
+	inspector, ok := tool.(domain.ToolRuntimeInspector)
+	if !ok {
+		return domain.ToolRuntimeHint{}, false
+	}
+	return inspector.InferRuntime(ctx, agent, call, def)
+}
+
 func isAllowed(agent domain.AgentSpec, toolName string) bool {
 	if len(agent.AllowedTools) == 0 {
 		return true

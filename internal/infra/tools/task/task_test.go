@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -186,6 +187,67 @@ func TestBindToolReturnsExposedToolNamesAndNextActionHint(t *testing.T) {
 		if !strings.Contains(result.Output, fragment) {
 			t.Fatalf("expected bind output to contain %q, got %s", fragment, result.Output)
 		}
+	}
+}
+
+func TestRunToolInferRuntimeUsesConfiguredWorkspaceAccess(t *testing.T) {
+	root := t.TempDir()
+	tool := NewRunTool(fakeCatalog{items: map[string]domain.TaskDefinition{
+		"generic": {
+			ID:          "generic",
+			Description: "Generic task",
+			Kind:        domain.TaskSpecKindCommand,
+			Command: &domain.CommandTaskSpec{
+				Command: "make",
+				Args:    []string{"all"},
+				Cwd:     root,
+			},
+		},
+		"scoped": {
+			ID:          "scoped",
+			Description: "Scoped task",
+			Kind:        domain.TaskSpecKindCommand,
+			Command: &domain.CommandTaskSpec{
+				Command:    "custom-runner",
+				Args:       []string{"--check"},
+				Cwd:        root,
+				ReadPaths:  []string{filepath.Join(root, "internal")},
+				WritePaths: []string{filepath.Join(root, "internal")},
+			},
+		},
+	}}, nil, nil, nil)
+
+	inspector, ok := tool.(domain.ToolRuntimeInspector)
+	if !ok {
+		t.Fatalf("run tool should expose runtime inference")
+	}
+
+	generic, ok := inspector.InferRuntime(context.Background(), domain.AgentSpec{}, domain.ToolCall{
+		Name:      "task_run",
+		Arguments: map[string]any{"task_id": "generic"},
+	}, domain.ToolDefinition{})
+	if !ok {
+		t.Fatalf("expected runtime hint for generic task")
+	}
+	if len(generic.ReadSet) != 0 {
+		t.Fatalf("expected no implicit read set, got %+v", generic)
+	}
+	if len(generic.WriteSet) != 1 || generic.WriteSet[0] != root {
+		t.Fatalf("expected conservative cwd write set, got %+v", generic)
+	}
+
+	scoped, ok := inspector.InferRuntime(context.Background(), domain.AgentSpec{}, domain.ToolCall{
+		Name:      "task_run",
+		Arguments: map[string]any{"task_id": "scoped"},
+	}, domain.ToolDefinition{})
+	if !ok {
+		t.Fatalf("expected runtime hint for scoped task")
+	}
+	if len(scoped.ReadSet) != 1 || scoped.ReadSet[0] != filepath.Join(root, "internal") {
+		t.Fatalf("expected explicit read set, got %+v", scoped)
+	}
+	if len(scoped.WriteSet) != 1 || scoped.WriteSet[0] != filepath.Join(root, "internal") {
+		t.Fatalf("expected explicit write set, got %+v", scoped)
 	}
 }
 

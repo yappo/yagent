@@ -77,11 +77,6 @@ func (e *Engine) MaybeCompact(run *domain.RunState) (*domain.RunArtifact, bool) 
 		return nil, false
 	}
 	summary := compactSummary(run)
-	payload, _ := json.Marshal(map[string]any{
-		"latest_artifacts": artifactReferences(lastArtifacts(run.Artifacts, 4), 4),
-		"known_failures":   run.KnownFailures,
-		"work_units":       len(run.WorkUnits),
-	})
 	artifact := &domain.RunArtifact{
 		ID:            fmt.Sprintf("compact-%d", len(run.Artifacts)+1),
 		Name:          "Packet Digest",
@@ -91,11 +86,45 @@ func (e *Engine) MaybeCompact(run *domain.RunState) (*domain.RunArtifact, bool) 
 		Summary:       summary,
 		Text:          summary,
 		Content:       summary,
-		Payload:       payload,
+		Payload:       marshalPacketPayload(run),
 		CreatedAt:     run.UpdatedAt,
 	}
 	run.Artifacts = append(run.Artifacts, *artifact)
 	return artifact, true
+}
+
+func marshalPacketPayload(run *domain.RunState) []byte {
+	if run == nil {
+		return nil
+	}
+	payload := domain.PacketDigestArtifactPayload{
+		LatestArtifacts: artifactReferences(lastArtifacts(run.Artifacts, 4), 4),
+		KnownFailures:   append([]string(nil), run.KnownFailures...),
+		WorkUnits:       workUnitDigests(run.WorkUnits, 6),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func workUnitDigests(units []domain.WorkUnit, limit int) []domain.WorkUnitDigest {
+	if limit > 0 && len(units) > limit {
+		units = units[len(units)-limit:]
+	}
+	out := make([]domain.WorkUnitDigest, 0, len(units))
+	for _, unit := range units {
+		out = append(out, domain.WorkUnitDigest{
+			ID:     unit.ID,
+			Kind:   unit.Kind,
+			Role:   unit.Role,
+			Phase:  unit.Phase,
+			Status: unit.Status,
+			Task:   unit.Task,
+		})
+	}
+	return out
 }
 
 func (e *Engine) shouldCompact(run *domain.RunState) bool {

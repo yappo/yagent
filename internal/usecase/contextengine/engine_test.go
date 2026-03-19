@@ -2,6 +2,7 @@ package contextengine
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -108,6 +109,10 @@ func TestMaybeCompactCreatesArtifactWhenThresholdExceeded(t *testing.T) {
 	if artifact.SchemaVersion != "packet_digest.v1" {
 		t.Fatalf("expected schema version, got %+v", artifact)
 	}
+	var payload domain.PacketDigestArtifactPayload
+	if err := json.Unmarshal(artifact.Payload, &payload); err != nil {
+		t.Fatalf("expected typed payload: %v", err)
+	}
 }
 
 func TestBuildScopesArtifactsAndObservationsByRole(t *testing.T) {
@@ -158,5 +163,41 @@ func TestBuildScopesArtifactsAndObservationsByRole(t *testing.T) {
 	}
 	if !foundFinal {
 		t.Fatalf("finalizer packet should include final response artifacts: %+v", finalizer.Artifacts)
+	}
+}
+
+func TestMaybeCompactPayloadIncludesWorkUnits(t *testing.T) {
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        1,
+		MaxArtifacts:             4,
+		MaxRelevantFiles:         4,
+		CompactAfterTurns:        1,
+		CompactAfterToolCalls:    10,
+		CompactAfterEstTokens:    1000,
+		CompactAfterVerifyCycles: 2,
+	}, nil, 8)
+	run := &domain.RunState{
+		CurrentPhase: domain.RunPhaseExecute,
+		Messages:     []domain.Message{{Role: domain.RoleUser, Content: "compact"}},
+		WorkUnits: []domain.WorkUnit{{
+			ID:     "execute:primary:coder",
+			Kind:   "primary",
+			Role:   "coder",
+			Phase:  domain.RunPhaseExecute,
+			Status: "done",
+			Task:   "Implement runtime changes",
+		}},
+	}
+
+	artifact, ok := engine.MaybeCompact(run)
+	if !ok || artifact == nil {
+		t.Fatalf("expected compaction artifact")
+	}
+	var payload domain.PacketDigestArtifactPayload
+	if err := json.Unmarshal(artifact.Payload, &payload); err != nil {
+		t.Fatalf("expected typed payload: %v", err)
+	}
+	if len(payload.WorkUnits) != 1 || payload.WorkUnits[0].ID != "execute:primary:coder" {
+		t.Fatalf("expected work unit digest, got %+v", payload.WorkUnits)
 	}
 }

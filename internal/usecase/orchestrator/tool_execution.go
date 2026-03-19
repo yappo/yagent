@@ -2,14 +2,13 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"yagent/internal/domain"
 )
 
 func (s *Service) executeToolCall(ctx context.Context, invocation domain.AgentInvocation, item executableCall) (domain.Message, []domain.ExecutionEvent) {
-	spec := s.prepareToolRuntimeSpec(ctx, item)
+	spec := s.prepareToolRuntimeSpec(ctx, invocation.Agent, item)
 	if cached, ok := s.lookupReusableExecution(ctx, invocation, spec); ok {
 		return toolMessage(item.call, cached.Output), []domain.ExecutionEvent{
 			s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, "cache_hit", invocation.Phase, invocation.Attempt, "done", item.call.Name, cached.OutputArtifactID, map[string]any{"semantic_key": cached.SemanticKey}, countContextItems(invocation.Messages, invocation.Context)),
@@ -55,13 +54,6 @@ func (s *Service) recordToolExecution(ctx context.Context, invocation domain.Age
 	}
 
 	outputArtifactID := nextExecutionID("artifact", spec.semanticKey)
-	payload, _ := json.Marshal(map[string]any{
-		"tool_name":       spec.call.Name,
-		"normalized_args": spec.normalizedArgs,
-		"semantic_key":    spec.semanticKey,
-		"success":         result.Success,
-		"output":          result.Output,
-	})
 	artifact := domain.RunArtifact{
 		ID:            outputArtifactID,
 		Name:          "Tool output " + spec.call.Name,
@@ -72,8 +64,16 @@ func (s *Service) recordToolExecution(ctx context.Context, invocation domain.Age
 		Summary:       truncateSummary(result.Output),
 		Text:          result.Output,
 		Content:       result.Output,
-		Payload:       payload,
-		CreatedAt:     time.Now(),
+		Payload: marshalArtifactPayload(domain.ToolOutputArtifactPayload{
+			ToolName:       spec.call.Name,
+			NormalizedArgs: spec.normalizedArgs,
+			SemanticKey:    spec.semanticKey,
+			Success:        result.Success,
+			Output:         result.Output,
+			ReadSet:        spec.readSet,
+			WriteSet:       spec.writeSet,
+		}),
+		CreatedAt: time.Now(),
 	}
 	_ = s.config.RuntimeStore.SaveArtifact(ctx, artifact)
 

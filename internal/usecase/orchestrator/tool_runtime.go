@@ -26,19 +26,41 @@ type toolRuntimeSpec struct {
 	semantics      domain.ToolSemantics
 }
 
-func (s *Service) prepareToolRuntimeSpec(ctx context.Context, item executableCall) toolRuntimeSpec {
-	normalizedArgs := normalizeArguments(item.call.Arguments)
-	semantics := effectiveSemantics(item.definition)
-	readSet, writeSet := resolveAccessSets(item.call, item.definition, semantics)
-	pathStates := s.capturePathStates(ctx, append([]string(nil), readSet...))
+type toolRuntimeDescriptor struct {
+	normalizedArgs string
+	semanticKey    string
+	readSet        []string
+	writeSet       []string
+	semantics      domain.ToolSemantics
+}
+
+func (s *Service) prepareToolRuntimeSpec(ctx context.Context, agent domain.AgentSpec, item executableCall) toolRuntimeSpec {
+	descriptor := s.describeToolRuntime(ctx, agent, item)
+	pathStates := s.capturePathStates(ctx, append([]string(nil), descriptor.readSet...))
 	return toolRuntimeSpec{
 		call:           item.call,
 		definition:     item.definition,
+		normalizedArgs: descriptor.normalizedArgs,
+		semanticKey:    descriptor.semanticKey,
+		readSet:        descriptor.readSet,
+		writeSet:       descriptor.writeSet,
+		pathStates:     pathStates,
+		semantics:      descriptor.semantics,
+	}
+}
+
+func (s *Service) describeToolRuntime(ctx context.Context, agent domain.AgentSpec, item executableCall) toolRuntimeDescriptor {
+	normalizedArgs := normalizeArguments(item.call.Arguments)
+	semantics := effectiveSemantics(item.definition)
+	hint := s.inferToolRuntime(ctx, agent, item.call, item.definition)
+	semantics = applyRuntimeHint(semantics, hint)
+	semanticArgs := semanticArguments(item.call.Arguments, semantics.IdentityArgs)
+	readSet, writeSet := resolveAccessSets(item.call, item.definition, semantics, hint)
+	return toolRuntimeDescriptor{
 		normalizedArgs: normalizedArgs,
-		semanticKey:    semanticFingerprint(item.call.Name, normalizedArgs),
+		semanticKey:    semanticFingerprint(item.call.Name, semanticArgs),
 		readSet:        readSet,
 		writeSet:       writeSet,
-		pathStates:     pathStates,
 		semantics:      semantics,
 	}
 }
@@ -102,11 +124,19 @@ func effectiveSemantics(def domain.ToolDefinition) domain.ToolSemantics {
 	return sem
 }
 
-func resolveAccessSets(call domain.ToolCall, def domain.ToolDefinition, sem domain.ToolSemantics) ([]string, []string) {
+func resolveAccessSets(call domain.ToolCall, def domain.ToolDefinition, sem domain.ToolSemantics, hint domain.ToolRuntimeHint) ([]string, []string) {
 	readSet := valuesFromArgs(call.Arguments, sem.ReadPathArgs)
 	writeSet := valuesFromArgs(call.Arguments, sem.WritePathArgs)
 
-	if len(readSet) == 0 && len(writeSet) == 0 {
+	if !hint.ReplaceAccess && (len(readSet) > 0 || len(writeSet) > 0) {
+		readSet = append(readSet, hint.ReadSet...)
+		writeSet = append(writeSet, hint.WriteSet...)
+		readSet = compactPaths(readSet)
+		writeSet = compactPaths(writeSet)
+		return readSet, writeSet
+	}
+
+	if !hint.ReplaceAccess && len(readSet) == 0 && len(writeSet) == 0 {
 		switch call.Name {
 		case "fs_read", "fs_stat", "fs_list":
 			readSet = append(readSet, firstPathArg(call.Arguments, "path"))
@@ -136,6 +166,14 @@ func resolveAccessSets(call domain.ToolCall, def domain.ToolDefinition, sem doma
 				}
 			}
 		}
+	}
+
+	if hint.ReplaceAccess {
+		readSet = append([]string(nil), hint.ReadSet...)
+		writeSet = append([]string(nil), hint.WriteSet...)
+	} else {
+		readSet = append(readSet, hint.ReadSet...)
+		writeSet = append(writeSet, hint.WriteSet...)
 	}
 
 	readSet = compactPaths(readSet)
@@ -203,6 +241,19 @@ func normalizeArguments(args map[string]any) string {
 	return string(data)
 }
 
+func semanticArguments(args map[string]any, keys []string) string {
+	if keys == nil {
+		return normalizeArguments(args)
+	}
+	filtered := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := args[key]; ok {
+			filtered[key] = value
+		}
+	}
+	return normalizeArguments(filtered)
+}
+
 func canonicalizeValue(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -230,6 +281,31 @@ func canonicalizeValue(value any) any {
 func semanticFingerprint(name string, normalizedArgs string) string {
 	sum := sha1.Sum([]byte(name + "\n" + normalizedArgs))
 	return name + ":" + hex.EncodeToString(sum[:])
+}
+
+func (s *Service) inferToolRuntime(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall, def domain.ToolDefinition) domain.ToolRuntimeHint {
+	inspector, ok := s.tools.(domain.ToolRuntimeInspector)
+	if !ok {
+		return domain.ToolRuntimeHint{}
+	}
+	hint, ok := inspector.InferRuntime(ctx, agent, call, def)
+	if !ok {
+		return domain.ToolRuntimeHint{}
+	}
+	return hint
+}
+
+func applyRuntimeHint(sem domain.ToolSemantics, hint domain.ToolRuntimeHint) domain.ToolSemantics {
+	if hint.SideEffectClass != "" {
+		sem.SideEffectClass = hint.SideEffectClass
+	}
+	if hint.Source != "" {
+		sem.Source = hint.Source
+	}
+	if hint.SourceLimit > 0 {
+		sem.SourceLimit = hint.SourceLimit
+	}
+	return sem
 }
 
 func (s *Service) capturePathStates(_ context.Context, paths []string) []domain.WorkspacePathState {

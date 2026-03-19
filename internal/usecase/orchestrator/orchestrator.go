@@ -117,14 +117,14 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		prompt = strings.TrimSpace(latestUserMessage(request.Messages))
 	}
 	inventory := s.buildAgentInventory()
-	run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "planner", "Agent inventory", "agent_inventory", inventoryArtifactSummary(inventory)))
+	run.Artifacts = append(run.Artifacts, newInventoryArtifact(run, domain.RunPhaseIntake, "planner", inventory))
 	_ = s.saveRun(ctx, run)
 
 	var allEvents []domain.ExecutionEvent
 	if s.config.DisablePhaseHarness {
 		run.ExecutionPlan = disabledHarnessExecutionPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "manager", "Execution plan", "execution_plan", stablePlanJSON(run.ExecutionPlan)))
+		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhaseIntake, "manager", run.ExecutionPlan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
 		result, events, err := s.runDirectPhase(ctx, run, manager, request)
 		allEvents = append(allEvents, events...)
@@ -136,16 +136,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		run.Status = domain.RunStatusCompleted
 		run.CurrentPhase = domain.RunPhaseExecute
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-		artifact := domain.RunArtifact{
-			ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-			Name:      "Final response",
-			Kind:      "final_response",
-			Phase:     domain.RunPhaseExecute,
-			AgentID:   result.Message.AgentID,
-			Summary:   truncateSummary(result.Message.Content),
-			Content:   result.Message.Content,
-			CreatedAt: time.Now(),
-		}
+		artifact := newFinalResponseArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, result.Message.Content)
 		run.Artifacts = append(run.Artifacts, artifact)
 		if s.config.MemoryStore != nil {
 			_ = s.rememberRun(ctx, run)
@@ -156,7 +147,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	if shouldBypassPlanner(prompt) {
 		run.ExecutionPlan = directConversationPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
-		run.Artifacts = append(run.Artifacts, newArtifact(run, domain.RunPhaseIntake, "manager", "Execution plan", "execution_plan", stablePlanJSON(run.ExecutionPlan)))
+		run.Artifacts = append(run.Artifacts, newExecutionPlanArtifact(run, domain.RunPhaseIntake, "manager", run.ExecutionPlan))
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseIntake, run.ExecutionPlan.Summary))
 		result, events, err := s.runDirectPhase(ctx, run, manager, request)
 		allEvents = append(allEvents, events...)
@@ -168,16 +159,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 		run.Status = domain.RunStatusCompleted
 		run.CurrentPhase = domain.RunPhaseExecute
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, domain.RunPhaseExecute, result.Message.Content))
-		artifact := domain.RunArtifact{
-			ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-			Name:      "Final response",
-			Kind:      "final_response",
-			Phase:     domain.RunPhaseExecute,
-			AgentID:   result.Message.AgentID,
-			Summary:   truncateSummary(result.Message.Content),
-			Content:   result.Message.Content,
-			CreatedAt: time.Now(),
-		}
+		artifact := newFinalResponseArtifact(run, domain.RunPhaseExecute, result.Message.AgentID, result.Message.Content)
 		run.Artifacts = append(run.Artifacts, artifact)
 		if s.config.MemoryStore != nil {
 			_ = s.rememberRun(ctx, run)
@@ -239,16 +221,7 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 
 	run.Status = domain.RunStatusCompleted
 	run.CurrentPhase = lastExecutionPlanPhase(executionPlan)
-	artifact := domain.RunArtifact{
-		ID:        fmt.Sprintf("artifact-%d", len(run.Artifacts)+1),
-		Name:      "Final response",
-		Kind:      "final_response",
-		Phase:     run.CurrentPhase,
-		AgentID:   final.Message.AgentID,
-		Summary:   truncateSummary(final.Message.Content),
-		Content:   final.Message.Content,
-		CreatedAt: time.Now(),
-	}
+	artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
 	run.Artifacts = append(run.Artifacts, artifact)
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
 	_ = s.rememberRun(ctx, run)
@@ -387,7 +360,7 @@ func (s *Service) executeCalls(ctx context.Context, invocation domain.AgentInvoc
 	scheduler := newRuntimeScheduler(s.config.MaxParallelAgents)
 	specs := make([]scheduleSpec, len(executable))
 	for idx, item := range executable {
-		specs[idx] = scheduleSpecForExecutable(item)
+		specs[idx] = s.scheduleSpecForExecutable(ctx, invocation.Agent, item)
 	}
 
 	results := make([]domain.Message, len(executable))
@@ -634,26 +607,27 @@ func (s *Service) executeOne(ctx context.Context, invocation domain.AgentInvocat
 	}
 }
 
-func scheduleSpecForExecutable(item executableCall) scheduleSpec {
-	semantics := effectiveSemantics(item.definition)
+func (s *Service) scheduleSpecForExecutable(ctx context.Context, agent domain.AgentSpec, item executableCall) scheduleSpec {
+	descriptor := s.describeToolRuntime(ctx, agent, item)
 	duplicateKey := ""
-	if semantics.DuplicatePolicy == domain.ToolDuplicateSuppressInflight || semantics.DuplicatePolicy == domain.ToolDuplicateSuppressSemantic {
-		duplicateKey = semanticFingerprint(item.call.Name, normalizeArguments(item.call.Arguments))
+	if descriptor.semantics.DuplicatePolicy == domain.ToolDuplicateSuppressInflight || descriptor.semantics.DuplicatePolicy == domain.ToolDuplicateSuppressSemantic {
+		duplicateKey = descriptor.semanticKey
 	}
-	readSet, writeSet := resolveAccessSets(item.call, item.definition, semantics)
 	if item.targetAgent != nil || item.ephemeral != nil || item.handoff {
-		semantics.SideEffectClass = domain.SideEffectExternal
-		semantics.Source = "agent"
-		semantics.SourceLimit = 1
+		descriptor.semantics.SideEffectClass = domain.SideEffectExternal
+		descriptor.semantics.Source = "agent"
+		descriptor.semantics.SourceLimit = 1
+		descriptor.readSet = nil
+		descriptor.writeSet = nil
 	}
 	return scheduleSpec{
-		ID:              fallbackString(item.call.ID, semanticFingerprint(item.call.Name, normalizeArguments(item.call.Arguments))),
-		ReadSet:         readSet,
-		WriteSet:        writeSet,
-		SideEffectClass: semantics.SideEffectClass,
+		ID:              fallbackString(item.call.ID, descriptor.semanticKey),
+		ReadSet:         descriptor.readSet,
+		WriteSet:        descriptor.writeSet,
+		SideEffectClass: descriptor.semantics.SideEffectClass,
 		DuplicateKey:    duplicateKey,
-		Source:          semantics.Source,
-		SourceLimit:     semantics.SourceLimit,
+		Source:          descriptor.semantics.Source,
+		SourceLimit:     descriptor.semantics.SourceLimit,
 	}
 }
 
