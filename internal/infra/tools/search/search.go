@@ -211,8 +211,7 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 	if err != nil {
 		return err
 	}
-	request.AgentID = execctx.AgentID(ctx)
-	request.Purpose = execctx.Purpose(ctx)
+	execctx.FillPermissionRequest(ctx, &request)
 	if decision == domain.PolicyAllow {
 		return nil
 	}

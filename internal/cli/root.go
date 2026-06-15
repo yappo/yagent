@@ -22,6 +22,10 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newTUICommand(&configPath, &logPath))
 	root.AddCommand(newExecCommand(&configPath, &logPath))
 	root.AddCommand(newBenchmarkCommand(&configPath, &logPath))
+	root.AddCommand(newSetupCommand(&configPath))
+	root.AddCommand(newDoctorCommand(&configPath))
+	root.AddCommand(newAuditCommand(&configPath))
+	root.AddCommand(newSchemaCommand())
 
 	return root
 }

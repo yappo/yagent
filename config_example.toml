@@ -1,29 +1,124 @@
 [server]
-default = "lmstudio"
+default = "local"
 
 [[server.servers]]
-name = "lmstudio"
+name = "local"
 url = "http://127.0.0.1:1234"
-token = "your-api-token"
-model = "gpt-5"
+token = ""
+model = "Qwen/Qwen3.6-35B-A3B"
+api = "chat_completions"
 # 文字列の duration 形式。未指定時は 20m
 timeout = "20m"
+
+[server.servers.generation]
+# Qwen3.6 の thinking mode で使う local runner 向けの例。
+# runner が未対応の項目を拒否する場合は、その項目を消してください。
+max_output_tokens = 8192
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[server.servers]]
+name = "openai"
+url = "https://api.openai.com"
+token = ""
+token_env = "OPENAI_API_KEY"
+model = "gpt-5.5"
+api = "responses"
+timeout = "20m"
+
+[server.servers.generation]
+reasoning_effort = "high"
+text_verbosity = "low"
+parallel_tool_calls = true
+store = false
 
 [file]
 # ファイル操作の許可範囲を設定
 # 例: allow_paths = ["/home/user/project", "/tmp"]
 allow_paths = []
+deny_paths = [".env", "*.pem"]
+
+[[file.rules]]
+decision = "deny"
+paths = [".git", ".yagent/state/*"]
+
+[permission]
+# 明示 rule に一致した tool call だけ allow / deny / require_approval で上書きします。
+# 何も一致しない場合は従来通り approval UI に確認します。
+
+[[permission.rules]]
+tool = "fs_stat"
+risk = "low"
+decision = "allow"
+
+[[permission.rules]]
+tool = "task_run"
+side_effect = "network_access"
+decision = "deny"
+
+[[permission.rules]]
+tool = "fs_write"
+agent = "researcher"
+decision = "deny"
 
 [execution]
 max_parallel_agents = 2
 max_handoff_depth = 2
 default_timeout = "120s"
 
+[features]
+phase_harness = true
+adaptive_compaction = true
+role_routing = true
+repo_memory = true
+
+[routing.profiles.fast]
+server = "local"
+model = "Qwen/Qwen3.6-35B-A3B"
+
+[routing.profiles.strong]
+server = "local"
+model = "Qwen/Qwen3.6-35B-A3B"
+fallback_server = "openai"
+fallback_model = "gpt-5.5"
+
+[routing.profiles.strong.generation]
+reasoning_effort = "high"
+
+[harness]
+max_verification_attempts = 2
+force_planner = true
+force_researcher = false
+continuation_policy = "prompt"
+
+[context]
+max_recent_messages = 12
+max_artifacts = 8
+max_relevant_files = 16
+compact_after_turns = 12
+compact_after_tool_calls = 12
+compact_after_est_tokens = 12000
+compact_after_verify_cycles = 2
+
+[memory]
+enabled = true
+state_dir = ".yagent/state"
+max_runs = 20
+max_facts = 50
+
+[benchmark]
+default_runs = 2
+
 [agent_catalog]
 paths = []
 
 [agents.coder]
-model = "gpt-5"
+model = "Qwen/Qwen3.6-35B-A3B"
+routing_profile = "strong"
 
 # task はこの config.toml には書きません。
 # task を使う場合は、別ファイルとして次のどちらかを作成します。
@@ -47,4 +142,9 @@ model = "gpt-5"
 #   command = "npx"
 #   args = ["-y", "@example/docs-mcp"]
 #   tool_prefix = "docs"
+#   # 既定は untrusted。trusted にした場合だけ server の readOnlyHint/destructiveHint 系 annotation を信頼します。
+#   trust = "untrusted"
+#   read_only_tools = ["search_docs", "get_doc"]
+#   mutating_tools = ["write_doc"]
+#   parallel_safe_tools = ["search_docs"]
 #   parallel_safe = false

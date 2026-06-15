@@ -1,12 +1,13 @@
 package catalog
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/pelletier/go-toml/v2"
 
@@ -30,7 +31,7 @@ type fileAgentSpec struct {
 	OutputSchema            map[string]any    `toml:"output_schema"`
 	Model                   string            `toml:"model"`
 	RoutingProfile          string            `toml:"routing_profile"`
-	Timeout                 time.Duration     `toml:"timeout"`
+	Timeout                 config.Duration   `toml:"timeout"`
 	MaxTurns                int               `toml:"max_turns"`
 	TokenBudget             int               `toml:"token_budget"`
 	Tags                    []string          `toml:"tags"`
@@ -141,11 +142,11 @@ func (c *Catalog) loadFile(path string) error {
 	}
 
 	var parsed fileAgentSpec
-	if err := toml.Unmarshal(data, &parsed); err != nil {
+	if err := decodeAgentFile(data, &parsed); err != nil {
 		return fmt.Errorf("agent DSL のパースに失敗しました: %w", err)
 	}
-	if parsed.ID == "" {
-		return fmt.Errorf("agent DSL に id が必要です: %s", path)
+	if err := validateAgentFile(path, parsed); err != nil {
+		return err
 	}
 	if existing, ok := c.agents[parsed.ID]; ok && existing.BuiltIn && !existing.AllowOverride {
 		return fmt.Errorf("built-in agent %q は外部 DSL で上書きできません", parsed.ID)
@@ -163,7 +164,7 @@ func (c *Catalog) loadFile(path string) error {
 		OutputSchema:    cloneMap(parsed.OutputSchema),
 		Model:           parsed.Model,
 		RoutingProfile:  parsed.RoutingProfile,
-		Timeout:         parsed.Timeout,
+		Timeout:         parsed.Timeout.Duration,
 		MaxTurns:        parsed.MaxTurns,
 		TokenBudget:     parsed.TokenBudget,
 		Tags:            append([]string(nil), parsed.Tags...),
@@ -182,6 +183,111 @@ func (c *Catalog) loadFile(path string) error {
 	return nil
 }
 
+func decodeAgentFile(data []byte, parsed *fileAgentSpec) error {
+	err := toml.NewDecoder(bytes.NewReader(data)).DisallowUnknownFields().Decode(parsed)
+	if err == nil {
+		return nil
+	}
+	var missing *toml.StrictMissingError
+	if errors.As(err, &missing) {
+		return fmt.Errorf("%w: %s", err, missing.String())
+	}
+	return err
+}
+
+func validateAgentFile(path string, parsed fileAgentSpec) error {
+	if strings.TrimSpace(parsed.ID) == "" {
+		return fmt.Errorf("agent DSL に id が必要です: %s", path)
+	}
+	location := fmt.Sprintf("%s id=%q", path, parsed.ID)
+	if parsed.Mode != "" && !validAgentMode(parsed.Mode) {
+		return fmt.Errorf("%s: mode=%q は不正です。対応値: manager, tool, handoff", location, parsed.Mode)
+	}
+	if parsed.Timeout.Duration < 0 {
+		return fmt.Errorf("%s: timeout は 0 以上である必要があります", location)
+	}
+	if parsed.MaxTurns < 0 {
+		return fmt.Errorf("%s: max_turns は 0 以上である必要があります", location)
+	}
+	if parsed.TokenBudget < 0 {
+		return fmt.Errorf("%s: token_budget は 0 以上である必要があります", location)
+	}
+	if parsed.VerificationMaxAttempts < 0 {
+		return fmt.Errorf("%s: verification_max_attempts は 0 以上である必要があります", location)
+	}
+	if err := validateStringList(location, "allowed_tools", parsed.AllowedTools); err != nil {
+		return err
+	}
+	if err := validateStringList(location, "tags", parsed.Tags); err != nil {
+		return err
+	}
+	if err := validateStringList(location, "capabilities", parsed.Capabilities); err != nil {
+		return err
+	}
+	if err := validateStringList(location, "scope_hints", parsed.ScopeHints); err != nil {
+		return err
+	}
+	for idx, kind := range parsed.TaskKinds {
+		if !validTaskKind(kind) {
+			return fmt.Errorf("%s: task_kinds[%d]=%q は不正です。対応値: unknown, casual, question, research, docs, review, test, mutate", location, idx, kind)
+		}
+	}
+	for idx, phase := range parsed.PreferredPhases {
+		if !validRunPhase(phase) {
+			return fmt.Errorf("%s: preferred_phases[%d]=%q は不正です。対応値: intake, plan, execute, verify, recover, finalize", location, idx, phase)
+		}
+	}
+	return nil
+}
+
+func validAgentMode(mode domain.AgentMode) bool {
+	switch mode {
+	case domain.AgentModeManager, domain.AgentModeTool, domain.AgentModeHandoff:
+		return true
+	default:
+		return false
+	}
+}
+
+func validTaskKind(kind domain.TaskKind) bool {
+	switch kind {
+	case domain.TaskKindUnknown,
+		domain.TaskKindCasual,
+		domain.TaskKindQuestion,
+		domain.TaskKindResearch,
+		domain.TaskKindDocs,
+		domain.TaskKindReview,
+		domain.TaskKindTest,
+		domain.TaskKindMutate:
+		return true
+	default:
+		return false
+	}
+}
+
+func validRunPhase(phase domain.RunPhase) bool {
+	switch phase {
+	case domain.RunPhaseIntake,
+		domain.RunPhasePlan,
+		domain.RunPhaseExecute,
+		domain.RunPhaseVerify,
+		domain.RunPhaseRecover,
+		domain.RunPhaseFinalize:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateStringList(location string, name string, values []string) error {
+	for idx, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s: %s[%d] が空です", location, name, idx)
+		}
+	}
+	return nil
+}
+
 func builtInAgents() map[string]domain.AgentSpec {
 	return map[string]domain.AgentSpec{
 		"manager": {
@@ -190,7 +296,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			Description:     "ユーザー窓口として委譲と最終応答を担当します。",
 			Instruction:     builtInInstruction("You are the manager agent. Delegate research, testing, review, and implementation tasks when helpful. Keep the final response concise and grounded in available tool and agent results."),
 			Mode:            domain.AgentModeManager,
-			AllowedTools:    []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
+			AllowedTools:    []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
 			RoutingProfile:  "strong",
 			Tags:            []string{"coordination", "finalize", "manager"},
 			TaskKinds:       []domain.TaskKind{domain.TaskKindQuestion, domain.TaskKindResearch, domain.TaskKindDocs, domain.TaskKindReview, domain.TaskKindTest, domain.TaskKindMutate},
@@ -219,7 +325,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			Capabilities:    []string{"planning", "decomposition"},
 			PreferredPhases: []domain.RunPhase{domain.RunPhasePlan},
 			ScopeHints:      []string{"execution planning", "agent selection"},
-			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
+			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_bind", "mcp__*"},
 			MaxTurns:        200,
 			BuiltIn:         true,
 		},
@@ -236,7 +342,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			Capabilities:    []string{"inspection", "repository reading"},
 			PreferredPhases: []domain.RunPhase{domain.RunPhaseExecute},
 			ScopeHints:      []string{"file discovery", "focused context prep"},
-			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
+			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_bind", "mcp__*"},
 			MaxTurns:        200,
 			BuiltIn:         true,
 		},
@@ -253,7 +359,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			Capabilities:       []string{"implementation", "workspace edits"},
 			PreferredPhases:    []domain.RunPhase{domain.RunPhaseExecute, domain.RunPhaseRecover},
 			ScopeHints:         []string{"code changes", "repo updates"},
-			AllowedTools:       []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
+			AllowedTools:       []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
 			MaxTurns:           200,
 			BuiltIn:            true,
 		},
@@ -270,7 +376,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			Capabilities:    []string{"verification", "task execution"},
 			PreferredPhases: []domain.RunPhase{domain.RunPhaseVerify},
 			ScopeHints:      []string{"regression checks", "validation"},
-			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_run", "task_bind", "mcp__*"},
+			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_run", "task_bind", "mcp__*"},
 			MaxTurns:        200,
 			BuiltIn:         true,
 		},
@@ -287,7 +393,7 @@ func builtInAgents() map[string]domain.AgentSpec {
 			Capabilities:    []string{"review", "risk assessment"},
 			PreferredPhases: []domain.RunPhase{domain.RunPhaseVerify},
 			ScopeHints:      []string{"bug finding", "regression review"},
-			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "task_list", "task_bind", "mcp__*"},
+			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_bind", "mcp__*"},
 			MaxTurns:        200,
 			BuiltIn:         true,
 		},

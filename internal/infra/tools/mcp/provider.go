@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -36,12 +37,21 @@ func (p *Provider) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 			Name:             item.QualifiedName,
 			Description:      item.Description,
 			CapabilityGroup:  "mcp",
-			Risk:             "high",
+			Risk:             fallbackString(item.Risk, "high"),
 			RequiresApproval: true,
 			Parameters:       item.InputSchema,
-			Metadata:         map[string]any{"category": "mcp", "task_id": item.TaskID, "server_tool_name": item.ServerToolName, "source": "mcp"},
-			ReadOnly:         item.ReadOnly,
-			ParallelSafe:     item.ParallelSafe,
+			Metadata: map[string]any{
+				"category":         "mcp",
+				"task_id":          item.TaskID,
+				"server_tool_name": item.ServerToolName,
+				"source":           "mcp",
+				"trust_boundary":   item.TrustBoundary,
+				"safety_source":    item.SafetySource,
+				"allow_network":    item.AllowNetwork,
+				"roots":            append([]string(nil), item.Roots...),
+			},
+			ReadOnly:     item.ReadOnly,
+			ParallelSafe: item.ParallelSafe,
 			Semantics: domain.ToolSemantics{
 				Class: func() domain.ToolClass {
 					if item.ReadOnly {
@@ -146,12 +156,12 @@ func (p *Provider) authorize(ctx context.Context, call domain.ToolCall, bound do
 	if p.engine == nil || p.approver == nil {
 		return nil
 	}
-	decision, request, err := p.engine.Evaluate(ctx, call)
+	policyCall := callWithMCPPolicyMetadata(call, bound)
+	decision, request, err := p.engine.Evaluate(ctx, policyCall)
 	if err != nil {
 		return err
 	}
-	request.AgentID = execctx.AgentID(ctx)
-	request.Purpose = execctx.Purpose(ctx)
+	execctx.FillPermissionRequest(ctx, &request)
 	request.Task = bound.TaskID
 	request.Resource = bound.ServerToolName
 	request.Scope = bound.TaskID + ":" + bound.ServerToolName
@@ -170,6 +180,20 @@ func (p *Provider) authorize(ctx context.Context, call domain.ToolCall, bound do
 		return fmt.Errorf("ユーザーによってキャンセルされました")
 	}
 	return nil
+}
+
+func callWithMCPPolicyMetadata(call domain.ToolCall, bound domain.BoundMCPTool) domain.ToolCall {
+	args := make(map[string]any, len(call.Arguments)+5)
+	for key, value := range call.Arguments {
+		args[key] = value
+	}
+	args["_policy_task_id"] = bound.TaskID
+	args["_policy_server_tool_name"] = bound.ServerToolName
+	args["_policy_risk"] = bound.Risk
+	args["_policy_read_only"] = bound.ReadOnly
+	args["_policy_allow_network"] = bound.AllowNetwork
+	call.Arguments = args
+	return call
 }
 
 func allowed(agent domain.AgentSpec, toolName string) bool {
@@ -205,17 +229,23 @@ func inferMCPAccess(args map[string]any, bound domain.BoundMCPTool) ([]string, [
 		switch {
 		case bound.ReadOnly:
 			if looksLikePathKey(key) {
-				reads = append(reads, normalizeToolPath(value))
+				reads = append(reads, normalizeToolPath(value, bound.Roots))
 			}
 		case looksLikeReadPathKey(key):
-			reads = append(reads, normalizeToolPath(value))
+			reads = append(reads, normalizeToolPath(value, bound.Roots))
 		case looksLikeWritePathKey(key):
-			writes = append(writes, normalizeToolPath(value))
+			writes = append(writes, normalizeToolPath(value, bound.Roots))
 		case looksLikePathKey(key):
-			writes = append(writes, normalizeToolPath(value))
+			writes = append(writes, normalizeToolPath(value, bound.Roots))
 		}
 	})
+	if bound.ReadOnly && len(reads) == 0 {
+		reads = append(reads, bound.Roots...)
+	}
 	if !bound.ReadOnly {
+		if len(writes) == 0 {
+			writes = append(writes, bound.Roots...)
+		}
 		writes = append(writes, mcpStateScope(bound.TaskID))
 	}
 	return compactToolPaths(reads), compactToolPaths(writes)
@@ -269,18 +299,31 @@ func looksLikeWritePathKey(key string) bool {
 	return false
 }
 
-func normalizeToolPath(value string) string {
+func normalizeToolPath(value string, roots []string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
 	}
-	if strings.HasPrefix(value, "file://") {
-		value = strings.TrimPrefix(value, "file://")
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme != "" {
+		if parsed.Scheme != "file" {
+			return ""
+		}
+		value = parsed.Path
 	}
-	if strings.Contains(value, "://") && !strings.HasPrefix(value, "file://") {
+	if strings.Contains(value, "://") {
 		return ""
 	}
+	if !filepath.IsAbs(value) && len(roots) > 0 {
+		value = filepath.Join(roots[0], value)
+	}
 	return filepath.Clean(value)
+}
+
+func fallbackString(value string, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
 }
 
 func compactToolPaths(paths []string) []string {

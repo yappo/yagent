@@ -51,6 +51,36 @@ func newVerificationArtifact(run *domain.RunState, phase domain.RunPhase, agentI
 	}, nil)
 }
 
+func newPermissionAuditArtifact(run *domain.RunState, phase domain.RunPhase, payload domain.PermissionAuditArtifactPayload) domain.RunArtifact {
+	lines := make([]string, 0, len(payload.Records))
+	for _, record := range payload.Records {
+		line := strings.TrimSpace(strings.Join([]string{
+			string(record.Decision),
+			record.ToolName,
+			record.Resource,
+		}, " "))
+		if record.AgentID != "" {
+			line += " [" + record.AgentID + "]"
+		}
+		if changes := permissionRecordChangeSummary(record); changes != "" {
+			line += " changes=" + changes
+		}
+		lines = append(lines, line)
+	}
+	return newTypedArtifact(run, phase, "permission", "Permission audit", "permission_audit", strings.Join(lines, "\n"), payload, nil)
+}
+
+func permissionRecordChangeSummary(record domain.PermissionDecisionRecord) string {
+	parts := make([]string, 0, 3)
+	if record.ChangeFiles > 0 {
+		parts = append(parts, fmt.Sprintf("files=%d", record.ChangeFiles))
+	}
+	if record.Additions > 0 || record.Deletions > 0 {
+		parts = append(parts, fmt.Sprintf("+%d", record.Additions), fmt.Sprintf("-%d", record.Deletions))
+	}
+	return strings.Join(parts, " ")
+}
+
 func newChangeSetArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, payload domain.ChangeSetArtifactPayload) domain.RunArtifact {
 	lines := make([]string, 0, len(payload.Files))
 	for _, file := range payload.Files {
@@ -71,13 +101,39 @@ func newTestReportArtifact(run *domain.RunState, phase domain.RunPhase, agentID 
 	return newTypedArtifact(run, phase, agentID, "Test report", "test_report", strings.Join(lines, "\n"), payload, nil)
 }
 
-func newFinalResponseArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, content string) domain.RunArtifact {
+func newFinalResponseArtifact(run *domain.RunState, phase domain.RunPhase, message domain.Message) domain.RunArtifact {
 	refs := recentArtifactReferences(lastArtifacts(run.Artifacts, 6), 6)
-	return newTypedArtifact(run, phase, agentID, "Final response", "final_response", content, domain.FinalResponseArtifactPayload{
+	agentID := message.AgentID
+	content := strings.TrimSpace(message.Content)
+	payload := domain.FinalResponseArtifactPayload{
 		Response:            content,
 		Summary:             truncateSummary(content),
 		VerificationSummary: latestVerificationSummary(run),
 		ArtifactRefs:        refs,
+	}
+	if raw := message.Metadata[finalResponseRawJSONMetadataKey]; raw != "" {
+		if parsed, ok := parseFinalResponseJSON(raw); ok {
+			payload = parsed
+			if payload.Response == "" {
+				payload.Response = content
+			}
+			if payload.Summary == "" {
+				payload.Summary = truncateSummary(payload.Response)
+			}
+			if payload.VerificationSummary == "" {
+				payload.VerificationSummary = latestVerificationSummary(run)
+			}
+			payload.ArtifactRefs = refs
+			content = payload.Response
+		}
+	}
+	return newTypedArtifact(run, phase, agentID, "Final response", "final_response", content, domain.FinalResponseArtifactPayload{
+		Response:            payload.Response,
+		Summary:             payload.Summary,
+		VerificationSummary: payload.VerificationSummary,
+		RemainingRisks:      payload.RemainingRisks,
+		NextSteps:           payload.NextSteps,
+		ArtifactRefs:        payload.ArtifactRefs,
 	}, refs)
 }
 

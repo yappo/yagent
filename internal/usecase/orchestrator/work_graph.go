@@ -251,9 +251,10 @@ func (s *Service) executeVerificationUnit(ctx context.Context, run *domain.RunSt
 	agent = withVerificationInstruction(agent)
 	execution := latestExecutionForAttempt(state.latestExecution, maxInt(1, unit.Attempt))
 	input := phaseMessages(run.Messages, "Execution summary:\n"+execution.Message.Content, "Execution plan:\n"+stablePlanJSON(plan))
-	taskBrief := fallbackString(strings.TrimSpace(unit.Task), "Verify the latest implementation. Return VERIFICATION_STATUS, SUMMARY, and REPAIR_BRIEF.")
+	taskBrief := fallbackString(strings.TrimSpace(unit.Task), "Verify the latest implementation and return strict JSON with status, summary, and repair_brief.")
 	invocation := s.phaseInvocation(run, agent, request, domain.RunPhaseVerify, maxInt(1, unit.Attempt), input, taskBrief)
 	invocation.Context.ExpectedOutput = verificationOutputContract()
+	invocation.ResponseFormat = verificationResponseFormat()
 	result, err := s.runAgent(ctx, invocation, 0)
 	if err != nil {
 		return workUnitOutcome{unit: unit, err: err}
@@ -308,6 +309,7 @@ func (s *Service) executeFinalizeUnit(ctx context.Context, run *domain.RunState,
 	if !ok {
 		return workUnitOutcome{unit: unit, err: fmt.Errorf("finalize agent %q が見つかりません", plan.Finalize.AgentID)}
 	}
+	manager = withFinalResponseInstruction(manager)
 	execution := latestExecutionForAttempt(state.latestExecution, maxInt(1, unit.Attempt))
 	verification := latestVerificationForAttempt(state.mergedVerification, maxInt(1, unit.Attempt))
 	input := phaseMessages(run.Messages,
@@ -315,11 +317,15 @@ func (s *Service) executeFinalizeUnit(ctx context.Context, run *domain.RunState,
 		"Verification summary:\n"+verification.Summary,
 		"Execution plan:\n"+stablePlanJSON(plan),
 	)
-	taskBrief := fallbackString(strings.TrimSpace(unit.Task), "Summarize the completed work, verification status, and remaining risks.")
-	result, err := s.runAgent(ctx, s.phaseInvocation(run, manager, request, domain.RunPhaseFinalize, maxInt(1, unit.Attempt), input, taskBrief), 0)
+	taskBrief := fallbackString(strings.TrimSpace(unit.Task), "Summarize the completed work, verification status, and remaining risks. Return strict JSON only.")
+	invocation := s.phaseInvocation(run, manager, request, domain.RunPhaseFinalize, maxInt(1, unit.Attempt), input, taskBrief)
+	invocation.Context.ExpectedOutput = finalResponseOutputContract()
+	invocation.ResponseFormat = finalResponseResponseFormat()
+	result, err := s.runAgent(ctx, invocation, 0)
 	if err != nil {
 		return workUnitOutcome{unit: unit, err: err}
 	}
+	result.Message = normalizeFinalResponseMessage(result.Message)
 	return workUnitOutcome{unit: unit, result: result}
 }
 

@@ -46,6 +46,38 @@ type ReviewFindingsArtifactPayload struct {
 	Message string             `json:"message,omitempty"`
 }
 
+type PermissionDecisionRecord struct {
+	RunID        string             `json:"run_id,omitempty"`
+	RootRunID    string             `json:"root_run_id,omitempty"`
+	Phase        RunPhase           `json:"phase,omitempty"`
+	Attempt      int                `json:"attempt,omitempty"`
+	AgentID      string             `json:"agent_id,omitempty"`
+	ToolName     string             `json:"tool_name,omitempty"`
+	Operation    string             `json:"operation,omitempty"`
+	Resource     string             `json:"resource,omitempty"`
+	Action       string             `json:"action,omitempty"`
+	ResourceKind string             `json:"resource_kind,omitempty"`
+	Risk         string             `json:"risk,omitempty"`
+	Scope        string             `json:"scope,omitempty"`
+	Summary      string             `json:"summary,omitempty"`
+	SideEffects  []string           `json:"side_effects,omitempty"`
+	Purpose      string             `json:"purpose,omitempty"`
+	Task         string             `json:"task,omitempty"`
+	PreviewKind  string             `json:"preview_kind,omitempty"`
+	PreviewLines int                `json:"preview_lines,omitempty"`
+	ChangeFiles  int                `json:"change_files,omitempty"`
+	Additions    int                `json:"additions,omitempty"`
+	Deletions    int                `json:"deletions,omitempty"`
+	Decision     PermissionDecision `json:"decision,omitempty"`
+	Error        string             `json:"error,omitempty"`
+	CreatedAt    time.Time          `json:"created_at"`
+}
+
+type PermissionAuditArtifactPayload struct {
+	SessionID string                     `json:"session_id,omitempty"`
+	Records   []PermissionDecisionRecord `json:"records,omitempty"`
+}
+
 type ChangeSetFile struct {
 	Path                string              `json:"path"`
 	Operation           string              `json:"operation,omitempty"`
@@ -83,10 +115,25 @@ type TestReportArtifactPayload struct {
 	KnownFail []string          `json:"known_fail,omitempty"`
 }
 
+type BenchmarkReportArtifactPayload struct {
+	Prompt           string          `json:"prompt,omitempty"`
+	Runs             int             `json:"runs"`
+	Profiles         []string        `json:"profiles,omitempty"`
+	Cases            []string        `json:"cases,omitempty"`
+	RecordCount      int             `json:"record_count"`
+	EvaluationPasses int             `json:"evaluation_passes"`
+	EvaluationFailed int             `json:"evaluation_failed"`
+	PreflightDoctor  bool            `json:"preflight_doctor,omitempty"`
+	Report           json.RawMessage `json:"report,omitempty"`
+	Records          json.RawMessage `json:"records,omitempty"`
+}
+
 type FinalResponseArtifactPayload struct {
 	Response            string              `json:"response"`
 	Summary             string              `json:"summary,omitempty"`
 	VerificationSummary string              `json:"verification_summary,omitempty"`
+	RemainingRisks      []string            `json:"remaining_risks,omitempty"`
+	NextSteps           []string            `json:"next_steps,omitempty"`
 	ArtifactRefs        []ArtifactReference `json:"artifact_refs,omitempty"`
 }
 
@@ -113,6 +160,8 @@ type ScratchRecord struct {
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 }
+
+const ScratchKindModelInvocation = "model_invocation"
 
 type ToolOutputArtifactPayload struct {
 	ToolName       string   `json:"tool_name"`

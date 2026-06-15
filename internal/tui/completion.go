@@ -169,7 +169,14 @@ func (m model) activeCompletion() *completionContext {
 }
 
 func (m model) activeSlashCompletion() *completionContext {
-	input := m.currentInput()
+	rawInput := m.textarea.Value()
+	if ctx := m.activeProfileCompletion(rawInput); ctx != nil {
+		return ctx
+	}
+	if ctx := m.activeThemeCompletion(rawInput); ctx != nil {
+		return ctx
+	}
+	input := strings.TrimSpace(rawInput)
 	if !strings.HasPrefix(input, "/") || strings.ContainsAny(input, " \t\n") {
 		return nil
 	}
@@ -193,6 +200,88 @@ func (m model) activeSlashCompletion() *completionContext {
 		start:      0,
 		end:        len([]rune(m.textarea.Value())),
 		token:      input,
+		candidates: candidates,
+	}
+}
+
+func (m model) activeProfileCompletion(input string) *completionContext {
+	const command = "/profile"
+	if !strings.HasPrefix(input, command) || len(input) == len(command) {
+		return nil
+	}
+	after := input[len(command):]
+	if after == "" || (after[0] != ' ' && after[0] != '\t') || strings.Contains(after, "\n") {
+		return nil
+	}
+	arg := strings.TrimLeft(after, " \t")
+	if strings.ContainsAny(arg, " \t") {
+		return nil
+	}
+	values := append([]string{"clear"}, m.routingProfiles...)
+	values = uniqueSortedStrings(values)
+	candidates := make([]completionCandidate, 0, len(values))
+	for _, value := range values {
+		if !strings.HasPrefix(value, arg) {
+			continue
+		}
+		description := "routing profile"
+		if value == "clear" {
+			description = "routing profile を解除"
+		}
+		candidates = append(candidates, completionCandidate{
+			value:       value,
+			display:     value,
+			description: description,
+		})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	return &completionContext{
+		kind:       completionKindSlash,
+		start:      len([]rune(input)) - len([]rune(arg)),
+		end:        len([]rune(input)),
+		token:      arg,
+		candidates: candidates,
+	}
+}
+
+func (m model) activeThemeCompletion(input string) *completionContext {
+	const command = "/theme"
+	if !strings.HasPrefix(input, command) || len(input) == len(command) {
+		return nil
+	}
+	after := input[len(command):]
+	if after == "" || (after[0] != ' ' && after[0] != '\t') || strings.Contains(after, "\n") {
+		return nil
+	}
+	arg := strings.TrimLeft(after, " \t")
+	if strings.ContainsAny(arg, " \t") {
+		return nil
+	}
+	candidates := make([]completionCandidate, 0, len(themeNames))
+	for _, value := range themeNames {
+		if !strings.HasPrefix(value, arg) {
+			continue
+		}
+		description := "TUI theme"
+		if value == defaultThemeName {
+			description = "TUI theme を既定に戻す"
+		}
+		candidates = append(candidates, completionCandidate{
+			value:       value,
+			display:     value,
+			description: description,
+		})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	return &completionContext{
+		kind:       completionKindSlash,
+		start:      len([]rune(input)) - len([]rune(arg)),
+		end:        len([]rune(input)),
+		token:      arg,
 		candidates: candidates,
 	}
 }

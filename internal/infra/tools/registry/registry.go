@@ -120,5 +120,6 @@ func isAllowed(agent domain.AgentSpec, toolName string) bool {
 }
 
 func filetoolContext(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall) context.Context {
-	return execctx.WithExecutionContext(ctx, agent.ID, call.Purpose)
+	ctx = execctx.WithExecutionContext(ctx, agent.ID, call.Purpose)
+	return execctx.WithRunContext(ctx, call.RunID, call.RootRunID, call.Phase, call.Attempt)
 }

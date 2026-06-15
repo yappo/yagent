@@ -86,7 +86,7 @@ func conflictsWithBatch(candidate scheduleSpec, items []scheduleSpec, batch []in
 		if accessConflict(candidate.ReadSet, candidate.WriteSet, current.ReadSet, current.WriteSet) {
 			return true
 		}
-		if serialSideEffect(candidate.SideEffectClass) || serialSideEffect(current.SideEffectClass) {
+		if sideEffectConflict(candidate, current) {
 			return true
 		}
 	}
@@ -109,6 +109,23 @@ func serialSideEffect(class domain.SideEffectClass) bool {
 	default:
 		return false
 	}
+}
+
+func sideEffectConflict(left scheduleSpec, right scheduleSpec) bool {
+	if !serialSideEffect(left.SideEffectClass) && !serialSideEffect(right.SideEffectClass) {
+		return false
+	}
+	if scopedSideEffect(left) && scopedSideEffect(right) {
+		return false
+	}
+	return true
+}
+
+func scopedSideEffect(item scheduleSpec) bool {
+	if !serialSideEffect(item.SideEffectClass) {
+		return true
+	}
+	return len(item.ReadSet) > 0 || len(item.WriteSet) > 0
 }
 
 func accessConflict(readLeft []string, writeLeft []string, readRight []string, writeRight []string) bool {

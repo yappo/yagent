@@ -31,6 +31,7 @@ func (e *Engine) Build(run *domain.RunState, agent domain.AgentSpec, phase domai
 	base := e.baseContext(run, agent, phase, messages, tools)
 	builder := packetBuilderForRole(packetRole(agent, phase))
 	ctx := builder.Build(base)
+	ctx = applyPacketBudget(ctx, agent.TokenBudget)
 	e.recordPacketScratch(run, ctx)
 	return ctx
 }
@@ -100,7 +101,7 @@ func (e *Engine) baseContext(run *domain.RunState, agent domain.AgentSpec, phase
 	if e.memory != nil {
 		if memory, err := e.memory.LoadMemory(context.Background()); err == nil && memory != nil {
 			ctx.StableFacts = stableFacts(memory, e.maxFacts)
-			ctx.Observations = selectObservationsForRole(memory.ReusableObservations, role)
+			ctx.Observations = selectObservationsForRole(e.reusableObservationRecords(context.Background(), memory.ReusableObservations), role, relevanceQuery(ctx, messages, role))
 			ctx.KnownFailures = append(ctx.KnownFailures, memory.KnownFailures...)
 		}
 	}
@@ -117,6 +118,8 @@ func (e *Engine) recordPacketScratch(run *domain.RunState, ctx domain.RunContext
 	payload, err := json.Marshal(map[string]any{
 		"packet_role":        ctx.PacketRole,
 		"packet_kind":        ctx.PacketKind,
+		"packet_budget":      ctx.PacketBudgetTokens,
+		"packet_estimated":   ctx.PacketEstimatedTokens,
 		"artifact_refs":      ctx.Artifacts,
 		"observation_ids":    observationIDs(ctx.Observations),
 		"known_failures":     ctx.KnownFailures,
@@ -271,10 +274,10 @@ func extractRelevantFiles(messages []domain.Message, limit int) []string {
 }
 
 func artifactRefs(artifacts []domain.RunArtifact, limit int) []string {
-	if limit <= 0 || len(artifacts) <= limit {
-		return artifactNames(artifacts)
+	if limit > 0 && len(artifacts) > limit {
+		artifacts = artifacts[:limit]
 	}
-	return artifactNames(artifacts[len(artifacts)-limit:])
+	return artifactNames(artifacts)
 }
 
 func artifactNames(artifacts []domain.RunArtifact) []string {
@@ -287,7 +290,7 @@ func artifactNames(artifacts []domain.RunArtifact) []string {
 
 func artifactReferences(artifacts []domain.RunArtifact, limit int) []domain.ArtifactReference {
 	if limit > 0 && len(artifacts) > limit {
-		artifacts = artifacts[len(artifacts)-limit:]
+		artifacts = artifacts[:limit]
 	}
 	out := make([]domain.ArtifactReference, 0, len(artifacts))
 	for _, artifact := range artifacts {
@@ -345,14 +348,60 @@ func observationRecords(items []domain.ObservationSummary) []domain.ObservationR
 	out := make([]domain.ObservationRecord, 0, len(items))
 	for _, item := range items {
 		out = append(out, domain.ObservationRecord{
-			ID:        item.ObservationID,
-			ToolName:  item.ToolName,
-			Summary:   item.Summary,
-			Reusable:  true,
-			UpdatedAt: item.UpdatedAt,
+			ID:              item.ObservationID,
+			ToolName:        item.ToolName,
+			Summary:         item.Summary,
+			ReadSet:         append([]string(nil), item.ReadSet...),
+			IntegritySHA256: item.IntegritySHA256,
+			Reusable:        true,
+			UpdatedAt:       item.UpdatedAt,
 		})
 	}
 	return out
+}
+
+func (e *Engine) reusableObservationRecords(ctx context.Context, summaries []domain.ObservationSummary) []domain.ObservationRecord {
+	if e.runtime == nil {
+		return observationRecords(summaries)
+	}
+	items, err := e.runtime.ListObservations(ctx, 256)
+	if err != nil || len(items) == 0 {
+		return observationRecords(summaries)
+	}
+	snapshot, _ := e.runtime.LoadWorkspaceSnapshot(ctx)
+	fresh := make([]domain.ObservationRecord, 0, len(items))
+	for _, item := range items {
+		if !item.Reusable || item.Stale {
+			continue
+		}
+		if !observationPathStatesFresh(snapshot, item.PathStates) {
+			continue
+		}
+		fresh = append(fresh, item)
+	}
+	return fresh
+}
+
+func observationPathStatesFresh(snapshot *domain.WorkspaceSnapshot, recorded []domain.WorkspacePathState) bool {
+	if len(recorded) == 0 {
+		return true
+	}
+	if snapshot == nil {
+		return false
+	}
+	for _, item := range recorded {
+		current, ok := snapshot.Paths[item.Path]
+		if !ok {
+			return false
+		}
+		if current.Exists != item.Exists || current.IsDir != item.IsDir || current.Size != item.Size || current.ModTimeUnix != item.ModTimeUnix {
+			return false
+		}
+		if item.ContentSHA256 != "" && current.ContentSHA256 != "" && item.ContentSHA256 != current.ContentSHA256 {
+			return false
+		}
+	}
+	return true
 }
 
 func compactSummary(run *domain.RunState) string {
@@ -422,11 +471,10 @@ func roleScopedMessages(messages []domain.Message, role string, limit int) []dom
 	return tailMessages(messages, limit)
 }
 
-func selectObservationsForRole(items []domain.ObservationSummary, role string) []domain.ObservationRecord {
-	if len(items) == 0 {
+func selectObservationsForRole(records []domain.ObservationRecord, role string, query map[string]int) []domain.ObservationRecord {
+	if len(records) == 0 {
 		return nil
 	}
-	records := observationRecords(items)
 	filtered := make([]domain.ObservationRecord, 0, len(records))
 	for _, item := range records {
 		switch role {
@@ -445,8 +493,9 @@ func selectObservationsForRole(items []domain.ObservationSummary, role string) [
 	if len(filtered) == 0 {
 		filtered = records
 	}
+	filtered = rankObservations(filtered, query)
 	if len(filtered) > 6 {
-		filtered = filtered[len(filtered)-6:]
+		filtered = filtered[:6]
 	}
 	return filtered
 }

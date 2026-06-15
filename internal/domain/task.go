@@ -27,18 +27,24 @@ type CommandTaskSpec struct {
 }
 
 type MCPServerSpec struct {
-	Transport    MCPTransport
-	Command      string
-	Args         []string
-	Cwd          string
-	Env          map[string]string
-	Risk         string
-	AllowNetwork bool
-	Timeout      int
-	ToolPrefix   string
-	ParallelSafe bool
-	IncludeTools []string
-	ExcludeTools []string
+	Transport            MCPTransport
+	Command              string
+	Args                 []string
+	Cwd                  string
+	Env                  map[string]string
+	Risk                 string
+	AllowNetwork         bool
+	Timeout              int
+	ToolPrefix           string
+	Roots                []string
+	Trust                string
+	TrustToolAnnotations bool
+	ParallelSafe         bool
+	ReadOnlyTools        []string
+	MutatingTools        []string
+	ParallelSafeTools    []string
+	IncludeTools         []string
+	ExcludeTools         []string
 }
 
 type TaskDefinition struct {
@@ -96,6 +102,11 @@ type BoundMCPTool struct {
 	ReadOnly       bool
 	ParallelSafe   bool
 	ServerToolName string
+	Risk           string
+	AllowNetwork   bool
+	Roots          []string
+	TrustBoundary  string
+	SafetySource   string
 }
 
 type MCPSession interface {

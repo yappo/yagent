@@ -6,7 +6,7 @@ import (
 )
 
 func runTUI(configPath string, logPath string) error {
-	bridge := tui.NewApproverBridge()
+	bridge := tui.NewRuntimeBridge()
 	container, err := app.Build(configPath, bridge, app.BuildOptions{LogPath: logPath})
 	if err != nil {
 		return err
@@ -26,5 +26,6 @@ func runTUI(configPath string, logPath string) error {
 		container.AgentCatalog,
 		container.RunStore,
 		container.MemoryStore,
+		container.RoutingProfiles,
 	)
 }

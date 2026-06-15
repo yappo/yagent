@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +60,7 @@ func (f *Factory) Open(_ context.Context, task domain.TaskDefinition) (domain.MC
 		pending:  map[int64]chan responseEnvelope{},
 		callLock: &sync.Mutex{},
 		logger:   f.logger,
+		roots:    mcpRoots(task),
 	}
 	go s.copyStderr(stderr)
 	go s.readLoop()
@@ -81,6 +84,7 @@ type Session struct {
 	initializeMu sync.Mutex
 	initialized  bool
 	logger       domain.StructuredLogSink
+	roots        []mcpRoot
 }
 
 type requestEnvelope struct {
@@ -103,6 +107,11 @@ type responseError struct {
 	Message string `json:"message"`
 }
 
+type mcpRoot struct {
+	URI  string `json:"uri"`
+	Name string `json:"name,omitempty"`
+}
+
 func (s *Session) Initialize(ctx context.Context) error {
 	s.initializeMu.Lock()
 	defer s.initializeMu.Unlock()
@@ -115,6 +124,7 @@ func (s *Session) Initialize(ctx context.Context) error {
 			"tools":     map[string]any{},
 			"prompts":   map[string]any{},
 			"resources": map[string]any{},
+			"roots":     map[string]any{"listChanged": false},
 		},
 		"clientInfo": map[string]any{
 			"name":    "yagent",
@@ -273,6 +283,7 @@ func (s *Session) readLoop() {
 			return
 		}
 		if response.Method != "" {
+			s.handleServerRequest(context.Background(), response)
 			continue
 		}
 
@@ -286,6 +297,39 @@ func (s *Session) readLoop() {
 	if err := scanner.Err(); err != nil {
 		s.failPending(err)
 	}
+}
+
+func (s *Session) handleServerRequest(ctx context.Context, request responseEnvelope) {
+	if request.ID == 0 {
+		return
+	}
+	switch request.Method {
+	case "roots/list":
+		_ = s.writeServerResult(ctx, request.ID, map[string]any{"roots": append([]mcpRoot(nil), s.roots...)})
+	case "sampling/createMessage":
+		_ = s.writeServerError(ctx, request.ID, -32000, "MCP sampling is disabled; yagent does not allow server-initiated LLM calls")
+	default:
+		_ = s.writeServerError(ctx, request.ID, -32601, "method not found")
+	}
+}
+
+func (s *Session) writeServerResult(ctx context.Context, id int64, result any) error {
+	return s.writeMessage(ctx, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
+}
+
+func (s *Session) writeServerError(ctx context.Context, id int64, code int, message string) error {
+	return s.writeMessage(ctx, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
 }
 
 func (s *Session) failPending(err error) {
@@ -342,6 +386,38 @@ func mergeEnv(extra map[string]string) []string {
 		cmdEnv = append(cmdEnv, key+"="+value)
 	}
 	return cmdEnv
+}
+
+func mcpRoots(task domain.TaskDefinition) []mcpRoot {
+	if task.MCPServer == nil {
+		return nil
+	}
+	values := append([]string(nil), task.MCPServer.Roots...)
+	if len(values) == 0 && strings.TrimSpace(task.MCPServer.Cwd) != "" {
+		values = append(values, task.MCPServer.Cwd)
+	}
+	roots := make([]mcpRoot, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		abs, err := filepath.Abs(value)
+		if err != nil {
+			continue
+		}
+		abs = filepath.Clean(abs)
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+		roots = append(roots, mcpRoot{
+			URI:  (&url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}).String(),
+			Name: filepath.Base(abs),
+		})
+	}
+	return roots
 }
 
 func (s *Session) logProtocol(ctx context.Context, direction string, payload []byte) {

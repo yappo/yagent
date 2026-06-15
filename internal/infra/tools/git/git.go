@@ -74,6 +74,66 @@ func NewShowTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver 
 	}
 }
 
+func NewBranchTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
+	return &tool{
+		name:        "git_branch",
+		description: "Git branch 一覧を返します。",
+		argsBuilder: func(_ map[string]any) ([]string, error) {
+			return []string{"branch", "--all", "--verbose", "--no-abbrev"}, nil
+		},
+		paths: paths, engine: engine, approver: approver,
+	}
+}
+
+func NewBlameTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
+	return &tool{
+		name:        "git_blame",
+		description: "指定ファイルの git blame を返します。",
+		argsBuilder: func(args map[string]any) ([]string, error) {
+			target, ok := args["path"].(string)
+			if !ok || target == "" {
+				return nil, fmt.Errorf("path パラメータが必要です")
+			}
+			result := []string{"blame", "--date=short"}
+			start := intArg(args, "line_start", 0)
+			end := intArg(args, "line_end", 0)
+			if start > 0 {
+				if end <= 0 {
+					end = start
+				}
+				if end < start {
+					return nil, fmt.Errorf("line_end は line_start 以上である必要があります")
+				}
+				result = append(result, "-L", fmt.Sprintf("%d,%d", start, end))
+			}
+			return append(result, "--", target), nil
+		},
+		paths: paths, engine: engine, approver: approver,
+	}
+}
+
+func NewFileHistoryTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
+	return &tool{
+		name:        "git_file_history",
+		description: "指定ファイルの Git 履歴を --follow 付きで返します。",
+		argsBuilder: func(args map[string]any) ([]string, error) {
+			target, ok := args["path"].(string)
+			if !ok || target == "" {
+				return nil, fmt.Errorf("path パラメータが必要です")
+			}
+			limit := intArg(args, "limit", 20)
+			if limit <= 0 {
+				limit = 20
+			}
+			if limit > 200 {
+				limit = 200
+			}
+			return []string{"log", fmt.Sprintf("-%d", limit), "--follow", "--date=short", "--pretty=format:%h %ad %an %s", "--", target}, nil
+		},
+		paths: paths, engine: engine, approver: approver,
+	}
+}
+
 func (t *tool) Definition() domain.ToolDefinition {
 	props := map[string]any{
 		"repo_path": map[string]any{"type": "string", "description": "対象 Git リポジトリのパス"},
@@ -87,6 +147,15 @@ func (t *tool) Definition() domain.ToolDefinition {
 	case "git_show":
 		props["target"] = map[string]any{"type": "string", "description": "commit hash または object spec"}
 		required = append(required, "target")
+	case "git_blame":
+		props["path"] = map[string]any{"type": "string", "description": "blame 対象 path"}
+		props["line_start"] = map[string]any{"type": "integer", "description": "開始行"}
+		props["line_end"] = map[string]any{"type": "integer", "description": "終了行"}
+		required = append(required, "path")
+	case "git_file_history":
+		props["path"] = map[string]any{"type": "string", "description": "履歴対象 path"}
+		props["limit"] = map[string]any{"type": "integer", "description": "表示件数"}
+		required = append(required, "path")
 	}
 	return domain.ToolDefinition{
 		Name:             t.name,
@@ -108,7 +177,7 @@ func (t *tool) Definition() domain.ToolDefinition {
 			SideEffectClass: domain.SideEffectNone,
 			Source:          "git",
 			ReadPathArgs:    []string{"repo_path"},
-			IdentityArgs:    []string{"repo_path", "path", "limit", "target"},
+			IdentityArgs:    []string{"repo_path", "path", "limit", "target", "line_start", "line_end"},
 			SourceLimit:     4,
 		},
 	}
@@ -149,8 +218,7 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 	if err != nil {
 		return err
 	}
-	request.AgentID = execctx.AgentID(ctx)
-	request.Purpose = execctx.Purpose(ctx)
+	execctx.FillPermissionRequest(ctx, &request)
 	if decision == domain.PolicyAllow {
 		return nil
 	}
@@ -165,6 +233,23 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 		return fmt.Errorf("ユーザーによってキャンセルされました")
 	}
 	return nil
+}
+
+func intArg(args map[string]any, key string, fallback int) int {
+	value, ok := args[key]
+	if !ok {
+		return fallback
+	}
+	switch n := value.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return fallback
+	}
 }
 
 func failure(call domain.ToolCall, output string) domain.ToolResult {

@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,6 +66,13 @@ func TestRunToolRejectsUnknownTask(t *testing.T) {
 	if result.Success {
 		t.Fatalf("expected failure")
 	}
+	var payload taskErrorOutput
+	if err := json.Unmarshal([]byte(result.Output), &payload); err != nil {
+		t.Fatalf("expected structured error JSON, got %s: %v", result.Output, err)
+	}
+	if payload.OK || payload.Error.Code != "unknown_task" || payload.Error.TaskID != "missing" || payload.Error.Tool != "task_run" {
+		t.Fatalf("unexpected structured error: %+v", payload)
+	}
 }
 
 func TestRunToolAddsNetworkSideEffect(t *testing.T) {
@@ -114,6 +122,13 @@ func TestBindToolRejectsCommandTask(t *testing.T) {
 	if result.Success {
 		t.Fatalf("expected failure")
 	}
+	var payload taskErrorOutput
+	if err := json.Unmarshal([]byte(result.Output), &payload); err != nil {
+		t.Fatalf("expected structured error JSON, got %s: %v", result.Output, err)
+	}
+	if payload.Error.Code != "invalid_task_kind" || payload.Error.TaskID != "go:test" || payload.Error.Details["kind"] != string(domain.TaskSpecKindCommand) {
+		t.Fatalf("unexpected structured error: %+v", payload)
+	}
 }
 
 func TestListToolIncludesMCPBindingState(t *testing.T) {
@@ -124,6 +139,7 @@ func TestListToolIncludesMCPBindingState(t *testing.T) {
 			Kind:        domain.TaskSpecKindMCPServer,
 			MCPServer: &domain.MCPServerSpec{
 				Command: "npx",
+				Roots:   []string{"/repo/docs"},
 			},
 		},
 	}}, &fakeBindings{
@@ -141,6 +157,9 @@ func TestListToolIncludesMCPBindingState(t *testing.T) {
 	}
 	if !strings.Contains(result.Output, "\"exposed_tools\": [") || !strings.Contains(result.Output, "\"mcp__docs\"") {
 		t.Fatalf("expected bind metadata, got %s", result.Output)
+	}
+	if !strings.Contains(result.Output, "\"roots\": [") || !strings.Contains(result.Output, "\"/repo/docs\"") {
+		t.Fatalf("expected MCP roots, got %s", result.Output)
 	}
 }
 

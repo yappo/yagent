@@ -2,7 +2,9 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -67,6 +69,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 	invocation.Context.AgentInventory = inventory
 	invocation.Context.ExpectedOutput = plannerOutputContract()
 	invocation.Context.TaskBrief = "Create the execution plan for this request and return strict JSON only."
+	invocation.ResponseFormat = executionPlanResponseFormat()
 	result, err := s.runAgent(ctx, invocation, 0)
 	events := append([]domain.ExecutionEvent(nil), result.Events...)
 	if err != nil {
@@ -90,6 +93,7 @@ func (s *Service) runPlanPhase(ctx context.Context, run *domain.RunState, reques
 		repairInvocation := s.phaseInvocation(run, planner, request, domain.RunPhasePlan, 1, repairMessages, "Repair the invalid execution plan JSON and return strict JSON only.")
 		repairInvocation.Context.AgentInventory = inventory
 		repairInvocation.Context.ExpectedOutput = plannerOutputContract()
+		repairInvocation.ResponseFormat = executionPlanResponseFormat()
 		repaired, repairErr := s.runAgent(ctx, repairInvocation, 0)
 		events = append(events, repaired.Events...)
 		if repairErr == nil {
@@ -132,7 +136,7 @@ func (s *Service) phaseInvocation(run *domain.RunState, agent domain.AgentSpec, 
 		Phase:     phase,
 		Attempt:   attempt,
 		Model:     request.Model,
-		Stream:    false,
+		Stream:    request.Stream,
 	}
 }
 
@@ -253,7 +257,16 @@ func extractPlan(content string) []domain.PlanNode {
 }
 
 func withVerificationInstruction(agent domain.AgentSpec) domain.AgentSpec {
-	extra := "Return lines in this exact format: VERIFICATION_STATUS: pass|fail, SUMMARY: <one sentence>, REPAIR_BRIEF: <short actionable brief>."
+	extra := `Return strict JSON only: {"status":"pass|fail","summary":"<one sentence>","repair_brief":"<short actionable brief>"}.`
+	if strings.Contains(agent.Instruction, extra) {
+		return agent
+	}
+	agent.Instruction = strings.TrimSpace(agent.Instruction + "\n\n" + extra)
+	return agent
+}
+
+func withFinalResponseInstruction(agent domain.AgentSpec) domain.AgentSpec {
+	extra := `Return strict JSON only: {"response":"<complete user-facing answer>","summary":"<one sentence>","verification_summary":"<verification status or empty string>","remaining_risks":[],"next_steps":[]}.`
 	if strings.Contains(agent.Instruction, extra) {
 		return agent
 	}
@@ -262,6 +275,9 @@ func withVerificationInstruction(agent domain.AgentSpec) domain.AgentSpec {
 }
 
 func parseVerification(content string, agentID string, attempt int) domain.VerificationResult {
+	if result, ok := parseVerificationJSON(content, agentID, attempt); ok {
+		return normalizeVerificationResult(result)
+	}
 	result := domain.VerificationResult{
 		Attempt:     attempt,
 		SourceAgent: agentID,
@@ -279,6 +295,102 @@ func parseVerification(content string, agentID string, attempt int) domain.Verif
 		case strings.HasPrefix(line, "REPAIR_BRIEF:"):
 			result.RepairBrief = strings.TrimSpace(strings.TrimPrefix(line, "REPAIR_BRIEF:"))
 		}
+	}
+	return normalizeVerificationResult(result)
+}
+
+func parseVerificationJSON(content string, agentID string, attempt int) (domain.VerificationResult, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
+		return domain.VerificationResult{}, false
+	}
+	var payload struct {
+		Status      string `json:"status"`
+		Summary     string `json:"summary"`
+		RepairBrief string `json:"repair_brief"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return domain.VerificationResult{}, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return domain.VerificationResult{}, false
+	}
+	return domain.VerificationResult{
+		Attempt:     attempt,
+		SourceAgent: agentID,
+		Status:      payload.Status,
+		Summary:     truncateSummary(payload.Summary),
+		RepairBrief: strings.TrimSpace(payload.RepairBrief),
+		CreatedAt:   time.Now(),
+	}, true
+}
+
+const finalResponseRawJSONMetadataKey = "final_response_raw_json"
+
+func normalizeFinalResponseMessage(message domain.Message) domain.Message {
+	payload, ok := parseFinalResponseJSON(message.Content)
+	if !ok || strings.TrimSpace(payload.Response) == "" {
+		return message
+	}
+	if message.Metadata == nil {
+		message.Metadata = map[string]string{}
+	}
+	message.Metadata[finalResponseRawJSONMetadataKey] = message.Content
+	message.Content = strings.TrimSpace(payload.Response)
+	return message
+}
+
+func parseFinalResponseJSON(content string) (domain.FinalResponseArtifactPayload, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
+		return domain.FinalResponseArtifactPayload{}, false
+	}
+	var payload struct {
+		Response            string   `json:"response"`
+		Summary             string   `json:"summary"`
+		VerificationSummary string   `json:"verification_summary"`
+		RemainingRisks      []string `json:"remaining_risks"`
+		NextSteps           []string `json:"next_steps"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return domain.FinalResponseArtifactPayload{}, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return domain.FinalResponseArtifactPayload{}, false
+	}
+	return domain.FinalResponseArtifactPayload{
+		Response:            strings.TrimSpace(payload.Response),
+		Summary:             strings.TrimSpace(payload.Summary),
+		VerificationSummary: strings.TrimSpace(payload.VerificationSummary),
+		RemainingRisks:      cleanStringList(payload.RemainingRisks),
+		NextSteps:           cleanStringList(payload.NextSteps),
+	}, true
+}
+
+func cleanStringList(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func normalizeVerificationResult(result domain.VerificationResult) domain.VerificationResult {
+	result.Status = strings.ToLower(strings.TrimSpace(result.Status))
+	if result.Status != "fail" {
+		result.Status = "pass"
+	}
+	result.Summary = strings.TrimSpace(result.Summary)
+	if result.Summary == "" {
+		result.Summary = "Verification completed."
 	}
 	if result.RepairBrief == "" && looksLikeFailure(result.Summary) {
 		result.RepairBrief = result.Summary

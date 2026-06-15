@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,10 +16,13 @@ import (
 )
 
 type captureLogger struct {
+	mu    sync.Mutex
 	types []string
 }
 
 func (c *captureLogger) WriteRecord(_ context.Context, typ string, fields map[string]any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if method, ok := fields["method"].(string); ok {
 		typ += ":" + method
 	}
@@ -27,6 +31,12 @@ func (c *captureLogger) WriteRecord(_ context.Context, typ string, fields map[st
 	}
 	c.types = append(c.types, typ)
 	return nil
+}
+
+func (c *captureLogger) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.types...)
 }
 
 func TestSessionInitializeListToolsAndCall(t *testing.T) {
@@ -79,11 +89,12 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 	if !strings.Contains(output, "search_docs") {
 		t.Fatalf("unexpected output: %q", output)
 	}
-	assertContains(t, logger.types, "mcp.protocol:initialize")
-	assertContains(t, logger.types, "mcp.protocol:notifications/initialized")
-	assertContains(t, logger.types, "mcp.protocol:tools/list")
-	assertContains(t, logger.types, "mcp.protocol:tools/call")
-	assertContains(t, logger.types, "mcp.stderr:helper stderr ready")
+	types := logger.snapshot()
+	assertContains(t, types, "mcp.protocol:initialize")
+	assertContains(t, types, "mcp.protocol:notifications/initialized")
+	assertContains(t, types, "mcp.protocol:tools/list")
+	assertContains(t, types, "mcp.protocol:tools/call")
+	assertContains(t, types, "mcp.stderr:helper stderr ready")
 }
 
 func TestSessionInitializeFailsOnInvalidPayload(t *testing.T) {
@@ -110,6 +121,42 @@ func TestSessionInitializeFailsOnInvalidPayload(t *testing.T) {
 	if err := session.Initialize(ctx); err == nil {
 		t.Fatal("expected initialize failure")
 	}
+}
+
+func TestSessionHandlesRootsAndRejectsSamplingRequests(t *testing.T) {
+	root := t.TempDir()
+	logger := &captureLogger{}
+	task := domain.TaskDefinition{
+		ID:   "docs",
+		Kind: domain.TaskSpecKindMCPServer,
+		MCPServer: &domain.MCPServerSpec{
+			Transport: domain.MCPTransportStdio,
+			Command:   os.Args[0],
+			Args:      []string{"-test.run", "TestHelperProcess", "--", "mcp-client-requests"},
+			Cwd:       t.TempDir(),
+			Roots:     []string{root},
+			Env: map[string]string{
+				"GO_WANT_HELPER_PROCESS":   "1",
+				"YAGENT_MCP_ROOT_BASENAME": filepath.Base(root),
+			},
+		},
+	}
+
+	session, err := NewFactory(logger).Open(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer session.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := session.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	assertContains(t, logger.types, "mcp.protocol:roots/list")
+	assertEventuallyContains(t, logger, "mcp.protocol:sampling/createMessage")
+	assertEventuallyContains(t, logger, "mcp.stderr:roots ok")
+	assertEventuallyContains(t, logger, "mcp.stderr:sampling denied")
 }
 
 func TestHelperProcess(t *testing.T) {
@@ -158,6 +205,26 @@ func TestHelperProcess(t *testing.T) {
 				"capabilities":    map[string]any{},
 				"serverInfo":      map[string]any{"name": "helper", "version": "1.0.0"},
 			})
+			if mode == "mcp-client-requests" {
+				writeHelperRequest(writer, 9001, "roots/list", nil)
+				rootResponse := readHelperResponsePayload(reader)
+				if helperRootsOK(rootResponse) {
+					_, _ = fmt.Fprintln(os.Stderr, "roots ok")
+				}
+				writeHelperRequest(writer, 9002, "sampling/createMessage", map[string]any{
+					"messages": []map[string]any{{
+						"role": "user",
+						"content": map[string]any{
+							"type": "text",
+							"text": "nested sampling",
+						},
+					}},
+				})
+				samplingResponse := readHelperResponsePayload(reader)
+				if strings.Contains(string(samplingResponse), "sampling is disabled") {
+					_, _ = fmt.Fprintln(os.Stderr, "sampling denied")
+				}
+			}
 		case "notifications/initialized":
 			initialized = true
 		case "tools/list":
@@ -191,6 +258,35 @@ func TestHelperProcess(t *testing.T) {
 	}
 }
 
+func readHelperResponsePayload(reader *bufio.Reader) []byte {
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			os.Exit(3)
+		}
+		payload := bytesTrimSpace(line)
+		if len(payload) == 0 {
+			continue
+		}
+		var message struct {
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal(payload, &message); err == nil && message.Method == "" {
+			return payload
+		}
+	}
+}
+
+func helperRootsOK(payload []byte) bool {
+	rootName := os.Getenv("YAGENT_MCP_ROOT_BASENAME")
+	if rootName == "" {
+		return false
+	}
+	return strings.Contains(string(payload), `"roots"`) &&
+		strings.Contains(string(payload), `"file://`) &&
+		strings.Contains(string(payload), rootName)
+}
+
 func bumpCounterFile() {
 	path := os.Getenv("YAGENT_MCP_COUNTER_FILE")
 	if path == "" {
@@ -214,12 +310,39 @@ func writeHelperResponse(w *bufio.Writer, id int64, result map[string]any) {
 	_ = w.Flush()
 }
 
+func writeHelperRequest(w *bufio.Writer, id int64, method string, params map[string]any) {
+	payload, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params":  params,
+	})
+	fmt.Fprintf(w, "%s\n", payload)
+	_ = w.Flush()
+}
+
 func assertContains(t *testing.T, items []string, want string) {
 	t.Helper()
 	for _, item := range items {
 		if item == want {
 			return
 		}
+	}
+	t.Fatalf("expected %q in %+v", want, items)
+}
+
+func assertEventuallyContains(t *testing.T, logger *captureLogger, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var items []string
+	for time.Now().Before(deadline) {
+		items = logger.snapshot()
+		for _, item := range items {
+			if item == want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("expected %q in %+v", want, items)
 }

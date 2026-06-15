@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -11,7 +15,9 @@ import (
 	"yagent/internal/app"
 	"yagent/internal/config"
 	"yagent/internal/domain"
+	"yagent/internal/infra/state"
 	benchmarkusecase "yagent/internal/usecase/benchmark"
+	"yagent/internal/usecase/llmcheck"
 )
 
 func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
@@ -22,20 +28,48 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 	var output string
 	var runs int
 	var featureProfiles []string
+	var routingCandidates []string
+	var caseIDs []string
+	var caseFiles []string
+	var listCases bool
+	var writeJSONL string
+	var writeCSV string
+	var saveArtifact bool
+	var preflightDoctor bool
+	var preflightDoctorServer string
+	var preflightDoctorRuntime bool
+	var preflightDoctorProbe bool
+	var preflightDoctorProbeStructured bool
+	var preflightFailOnWarning bool
+	var preflightFailOnRecommendation bool
 
 	command := &cobra.Command{
 		Use:   "benchmark",
-		Short: "feature profile ごとの差分をベンチマーク",
+		Short: "feature / routing profile ごとの差分と harness eval を実行",
 	}
+	command.AddCommand(newBenchmarkReportCommand(configPath))
 
-	command.Flags().StringVar(&prompt, "prompt", "", "benchmark に使うプロンプト")
+	command.Flags().StringVar(&prompt, "prompt", "", "benchmark に使うプロンプト。--case 指定時は省略できます")
 	command.Flags().StringVar(&model, "model", "", "使用するモデル名")
 	command.Flags().StringVar(&routingProfile, "profile", "", "routing profile 名")
 	command.Flags().StringVar(&resumeID, "resume", "", "復元する run id。latest も指定できます")
-	command.Flags().StringVar(&output, "output", "table", "出力形式: table または json")
+	command.Flags().StringVar(&output, "output", "table", "出力形式: table, json, jsonl, csv")
 	command.Flags().IntVar(&runs, "runs", 0, "各 feature profile を何回実行するか。0 なら config の既定値")
 	command.Flags().StringSliceVar(&featureProfiles, "feature-profile", nil, "比較する feature profile 名")
-	_ = command.MarkFlagRequired("prompt")
+	command.Flags().StringSliceVar(&routingCandidates, "routing-candidate", nil, "比較する routing profile。例: fast / strong / openai=strong:gpt-5.5")
+	command.Flags().StringSliceVar(&caseIDs, "case", nil, "実行する benchmark case ID。組み込み: repo-readonly, swe-like, terminal-like, permission-gate")
+	command.Flags().StringSliceVar(&caseFiles, "case-file", nil, "追加 benchmark case TOML。[[cases]] を読み込みます")
+	command.Flags().BoolVar(&listCases, "list-cases", false, "利用できる benchmark case を表示して終了")
+	command.Flags().StringVar(&writeJSONL, "write-jsonl", "", "flat result record を JSONL で保存")
+	command.Flags().StringVar(&writeCSV, "write-csv", "", "flat result record を CSV で保存")
+	command.Flags().BoolVar(&saveArtifact, "save-artifact", false, "benchmark report を memory.state_dir の benchmark_report artifact として保存する")
+	command.Flags().BoolVar(&preflightDoctor, "preflight-doctor", false, "benchmark 実行前に LLM doctor gate を実行する")
+	command.Flags().StringVar(&preflightDoctorServer, "preflight-doctor-server", "", "preflight doctor で診断する server 名。未指定なら server.default")
+	command.Flags().BoolVar(&preflightDoctorRuntime, "preflight-doctor-runtime", true, "preflight doctor で LM Studio runtime metadata を確認する")
+	command.Flags().BoolVar(&preflightDoctorProbe, "preflight-doctor-probe", false, "preflight doctor で軽い生成 probe を実行する")
+	command.Flags().BoolVar(&preflightDoctorProbeStructured, "preflight-doctor-probe-structured", false, "preflight doctor で JSON schema structured output probe を実行する。probe を兼ねます")
+	command.Flags().BoolVar(&preflightFailOnWarning, "preflight-fail-on-warning", false, "preflight doctor の warning を benchmark failure にする")
+	command.Flags().BoolVar(&preflightFailOnRecommendation, "preflight-fail-on-recommendation", false, "preflight doctor の recommendation を benchmark failure にする")
 
 	command.RunE = func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(*configPath)
@@ -45,8 +79,35 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 		if runs <= 0 {
 			runs = cfg.Benchmark.DefaultRuns
 		}
+		preflightOptions := benchmarkDoctorPreflightOptions{
+			Enabled:              preflightDoctor,
+			ServerName:           preflightDoctorServer,
+			Runtime:              preflightDoctorRuntime,
+			Probe:                preflightDoctorProbe,
+			ProbeStructured:      preflightDoctorProbeStructured,
+			FailOnWarning:        preflightFailOnWarning,
+			FailOnRecommendation: preflightFailOnRecommendation,
+		}
+		var preflightResult *llmcheck.Result
+		if shouldRunBenchmarkDoctorPreflight(preflightOptions) && !listCases {
+			result, err := runBenchmarkDoctorPreflight(cmd.Context(), cfg, preflightOptions)
+			if err != nil {
+				return err
+			}
+			preflightResult = &result
+			fmt.Fprint(os.Stderr, renderBenchmarkDoctorPreflightSummary(result))
+		}
 
-		profiles, err := resolveBenchmarkProfiles(cfg.Features, featureProfiles)
+		cases, err := resolveBenchmarkCases(caseIDs, caseFiles)
+		if err != nil {
+			return err
+		}
+		if listCases {
+			fmt.Print(renderBenchmarkCases(cases))
+			return nil
+		}
+
+		profiles, err := resolveBenchmarkProfiles(cfg.Features, featureProfiles, routingCandidates)
 		if err != nil {
 			return err
 		}
@@ -58,6 +119,7 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 			Runs:           runs,
 			RoutingProfile: routingProfile,
 			Profiles:       profiles,
+			Cases:          cases,
 		}, func(runCfg config.Config) (domain.Orchestrator, func(), error) {
 			container, err := app.BuildFromConfig(runCfg, NewStdinApprover(), app.BuildOptions{LogPath: *logPath})
 			if err != nil {
@@ -73,6 +135,32 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 		if err != nil {
 			return err
 		}
+		if preflightResult != nil {
+			report.Preflight = &benchmarkusecase.PreflightReport{
+				Doctor: doctorPreflightReportFromResult(*preflightResult),
+			}
+		}
+		if writeJSONL != "" {
+			if err := writeBenchmarkFile(writeJSONL, func(file *os.File) error {
+				return benchmarkusecase.WriteJSONL(file, report)
+			}); err != nil {
+				return err
+			}
+		}
+		if writeCSV != "" {
+			if err := writeBenchmarkFile(writeCSV, func(file *os.File) error {
+				return benchmarkusecase.WriteCSV(file, report)
+			}); err != nil {
+				return err
+			}
+		}
+		if saveArtifact {
+			run, artifact, err := saveBenchmarkArtifact(cmd.Context(), cfg, report)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "Benchmark artifact saved: run=%s artifact=%s\n", run.ID, artifact.ID)
+		}
 
 		switch output {
 		case "json":
@@ -85,6 +173,10 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 		case "table":
 			fmt.Print(renderBenchmarkTable(report))
 			return nil
+		case "jsonl":
+			return benchmarkusecase.WriteJSONL(os.Stdout, report)
+		case "csv":
+			return benchmarkusecase.WriteCSV(os.Stdout, report)
 		default:
 			return fmt.Errorf("unsupported output %q", output)
 		}
@@ -93,18 +185,345 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 	return command
 }
 
-func resolveBenchmarkProfiles(base config.FeaturesConfig, names []string) ([]benchmarkusecase.Profile, error) {
-	if len(names) == 0 {
-		names = []string{"legacy", "current"}
+func saveBenchmarkArtifact(ctx context.Context, cfg config.Config, report benchmarkusecase.Report) (*domain.RunState, domain.RunArtifact, error) {
+	if !cfg.Memory.Enabled {
+		return nil, domain.RunArtifact{}, fmt.Errorf("memory.enabled=false のため benchmark artifact を保存できません")
+	}
+	stateDir := cfg.Memory.StateDir
+	if !filepath.IsAbs(stateDir) {
+		pwd, err := os.Getwd()
+		if err != nil {
+			return nil, domain.RunArtifact{}, err
+		}
+		stateDir = filepath.Join(pwd, stateDir)
+	}
+	store, err := state.NewFileStore(stateDir)
+	if err != nil {
+		return nil, domain.RunArtifact{}, err
+	}
+	run, artifact, err := benchmarkusecase.BuildArtifactRun(report)
+	if err != nil {
+		return nil, domain.RunArtifact{}, err
+	}
+	if err := store.SaveRun(ctx, run); err != nil {
+		return nil, domain.RunArtifact{}, err
+	}
+	return run, artifact, nil
+}
+
+type benchmarkDoctorPreflightOptions struct {
+	Enabled              bool
+	ServerName           string
+	Runtime              bool
+	Probe                bool
+	ProbeStructured      bool
+	FailOnWarning        bool
+	FailOnRecommendation bool
+}
+
+func shouldRunBenchmarkDoctorPreflight(options benchmarkDoctorPreflightOptions) bool {
+	return options.Enabled || options.Probe || options.ProbeStructured || options.FailOnWarning || options.FailOnRecommendation || strings.TrimSpace(options.ServerName) != ""
+}
+
+func runBenchmarkDoctorPreflight(ctx context.Context, cfg config.Config, options benchmarkDoctorPreflightOptions) (llmcheck.Result, error) {
+	result, err := llmcheck.New(nil).CheckWithOptions(ctx, cfg, llmcheck.CheckOptions{
+		ServerName:      options.ServerName,
+		Probe:           options.Probe,
+		ProbeStructured: options.ProbeStructured,
+		Runtime:         options.Runtime,
+	})
+	if err != nil {
+		return result, err
+	}
+	if err := doctorGateError(result, doctorGateOptions{
+		FailOnWarning:        options.FailOnWarning,
+		FailOnRecommendation: options.FailOnRecommendation,
+	}); err != nil {
+		return result, fmt.Errorf("benchmark preflight doctor failed: %w", err)
+	}
+	return result, nil
+}
+
+func renderBenchmarkDoctorPreflightSummary(result llmcheck.Result) string {
+	status := "ok"
+	if len(result.Problems) > 0 {
+		status = "needs_attention"
+	}
+	return fmt.Sprintf(
+		"Benchmark preflight doctor: %s server=%s model=%s warnings=%d recommendations=%d\n",
+		status,
+		fallbackBenchmarkString(result.ServerName, "-"),
+		fallbackBenchmarkString(result.MatchedModel, result.Model),
+		len(result.Warnings),
+		len(result.Recommendations),
+	)
+}
+
+func doctorPreflightReportFromResult(result llmcheck.Result) *benchmarkusecase.DoctorPreflightReport {
+	report := &benchmarkusecase.DoctorPreflightReport{
+		ServerName:      result.ServerName,
+		URL:             result.URL,
+		API:             result.API,
+		Model:           result.Model,
+		MatchedModel:    result.MatchedModel,
+		Warnings:        len(result.Warnings),
+		Problems:        len(result.Problems),
+		Recommendations: len(result.Recommendations),
+		ProbeRequested:  result.Probe.Requested,
+		ProbeStructured: result.Probe.Structured,
+		ProbeOK:         result.Probe.OK,
+	}
+	if result.Runtime.ModelFound {
+		report.RuntimeModel = result.Runtime.MatchedModel.ID
+		report.RuntimeLoaded = result.Runtime.Loaded
+		report.RuntimeContextLength = result.Runtime.ContextLength
+		report.RuntimeMaxContext = result.Runtime.MaxContextLength
+		report.RuntimeQuantization = result.Runtime.MatchedModel.Quantization
+	}
+	return report
+}
+
+func newBenchmarkReportCommand(configPath *string) *cobra.Command {
+	var inputs []string
+	var format string
+	var baselineProfile string
+	var caseIDs []string
+	var profileNames []string
+	var minPassRate float64
+	var failOnRegression bool
+	var runtimeAuditServer string
+	var requireRuntimeAudit bool
+	var minRuntimeContext int
+	var maxRuntimeWarnings int
+	var maxRuntimeRecommendations int
+	var requireRuntimeLoaded bool
+	var requireRuntimeProbeOK bool
+	var requireRuntimeStructuredProbe bool
+
+	command := &cobra.Command{
+		Use:   "report",
+		Short: "保存済み benchmark record を集計して回帰を確認",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if minPassRate < -1 || minPassRate > 1 {
+				return fmt.Errorf("--min-pass-rate は 0.0 から 1.0 の範囲で指定してください")
+			}
+			records, err := benchmarkusecase.LoadRecordFiles(inputs)
+			if err != nil {
+				return err
+			}
+			var minPassRatePtr *float64
+			if minPassRate >= 0 {
+				minPassRatePtr = &minPassRate
+			}
+			var runtimeAudit *benchmarkusecase.RecordRuntimeAuditSummary
+			if shouldLoadBenchmarkRuntimeAudit(benchmarkRuntimeAuditOptions{
+				ServerName:             runtimeAuditServer,
+				RequireAudit:           requireRuntimeAudit,
+				MinContext:             minRuntimeContext,
+				MaxWarnings:            intPtrFromFlag(maxRuntimeWarnings),
+				MaxRecommendations:     intPtrFromFlag(maxRuntimeRecommendations),
+				RequireLoaded:          requireRuntimeLoaded,
+				RequireProbeOK:         requireRuntimeProbeOK,
+				RequireStructuredProbe: requireRuntimeStructuredProbe,
+			}) {
+				audit, err := loadLatestBenchmarkRuntimeAudit(cmd.Context(), *configPath, runtimeAuditServer)
+				if err != nil {
+					return err
+				}
+				if audit != nil {
+					summary := runtimeAuditSummaryFromDoctorAudit(*audit)
+					runtimeAudit = &summary
+				}
+			}
+			report := benchmarkusecase.BuildRecordReport(records, benchmarkusecase.RecordReportOptions{
+				Inputs:                        inputs,
+				ProfileNames:                  profileNames,
+				CaseIDs:                       caseIDs,
+				BaselineProfile:               baselineProfile,
+				MinPassRate:                   minPassRatePtr,
+				FailOnRegression:              failOnRegression,
+				RuntimeAudit:                  runtimeAudit,
+				RequireRuntimeAudit:           requireRuntimeAudit,
+				MinRuntimeContext:             minRuntimeContext,
+				MaxRuntimeWarnings:            intPtrFromFlag(maxRuntimeWarnings),
+				MaxRuntimeRecommendations:     intPtrFromFlag(maxRuntimeRecommendations),
+				RequireRuntimeLoaded:          requireRuntimeLoaded,
+				RequireRuntimeProbeOK:         requireRuntimeProbeOK,
+				RequireRuntimeStructuredProbe: requireRuntimeStructuredProbe,
+			})
+
+			switch format {
+			case "text", "table":
+				fmt.Print(renderBenchmarkRecordReport(report))
+			case "json":
+				data, err := json.MarshalIndent(report, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(data))
+			case "csv":
+				text, err := renderBenchmarkRecordReportCSV(report)
+				if err != nil {
+					return err
+				}
+				fmt.Print(text)
+			case "junit":
+				return benchmarkusecase.WriteRecordReportJUnit(os.Stdout, report)
+			default:
+				return fmt.Errorf("unsupported format %q", format)
+			}
+
+			if report.HasGateFailures() {
+				return fmt.Errorf("benchmark report gate failed: thresholds=%d runtime=%d regressions=%d", len(report.FailedThresholds), len(report.RuntimeGateFailures), len(report.Regressions))
+			}
+			return nil
+		},
+	}
+	command.Flags().StringSliceVar(&inputs, "input", nil, "読み込む benchmark JSONL/CSV record file。複数指定できます")
+	command.Flags().StringVar(&format, "format", "text", "出力形式: text, json, csv, junit")
+	command.Flags().StringVar(&baselineProfile, "baseline", "", "差分比較の基準 profile 名")
+	command.Flags().StringSliceVar(&caseIDs, "case", nil, "集計する case ID")
+	command.Flags().StringSliceVar(&profileNames, "profile", nil, "集計する profile 名")
+	command.Flags().Float64Var(&minPassRate, "min-pass-rate", -1, "各 group に要求する pass rate。0.0-1.0。未指定は無効")
+	command.Flags().BoolVar(&failOnRegression, "fail-on-regression", false, "baseline より pass rate が下がる、または verification failure が増えたら失敗")
+	command.Flags().StringVar(&runtimeAuditServer, "runtime-audit-server", "", "保存済み doctor runtime audit を server 名で読み込み、report に添付する")
+	command.Flags().BoolVar(&requireRuntimeAudit, "require-runtime-audit", false, "runtime audit が見つからなければ report gate を失敗にする")
+	command.Flags().IntVar(&minRuntimeContext, "min-runtime-context", 0, "runtime audit の loaded context length 下限。0 なら無効")
+	maxRuntimeWarnings = -1
+	maxRuntimeRecommendations = -1
+	command.Flags().IntVar(&maxRuntimeWarnings, "max-runtime-warnings", -1, "runtime audit の warning 数上限。-1 なら無効")
+	command.Flags().IntVar(&maxRuntimeRecommendations, "max-runtime-recommendations", -1, "runtime audit の recommendation 数上限。-1 なら無効")
+	command.Flags().BoolVar(&requireRuntimeLoaded, "require-runtime-loaded", false, "runtime audit で model loaded=true を要求する")
+	command.Flags().BoolVar(&requireRuntimeProbeOK, "require-runtime-probe-ok", false, "runtime audit で probe ok を要求する")
+	command.Flags().BoolVar(&requireRuntimeStructuredProbe, "require-runtime-structured-probe", false, "runtime audit で structured probe ok を要求する")
+	return command
+}
+
+type benchmarkRuntimeAuditOptions struct {
+	ServerName             string
+	RequireAudit           bool
+	MinContext             int
+	MaxWarnings            *int
+	MaxRecommendations     *int
+	RequireLoaded          bool
+	RequireProbeOK         bool
+	RequireStructuredProbe bool
+}
+
+func shouldLoadBenchmarkRuntimeAudit(options benchmarkRuntimeAuditOptions) bool {
+	return strings.TrimSpace(options.ServerName) != "" ||
+		options.RequireAudit ||
+		options.MinContext > 0 ||
+		options.MaxWarnings != nil ||
+		options.MaxRecommendations != nil ||
+		options.RequireLoaded ||
+		options.RequireProbeOK ||
+		options.RequireStructuredProbe
+}
+
+func loadLatestBenchmarkRuntimeAudit(ctx context.Context, configPath string, serverName string) (*llmcheck.AuditRecord, error) {
+	store, err := openAuditStore(configPath)
+	if err != nil {
+		return nil, err
+	}
+	items, err := store.ListScratch(ctx, 100)
+	if err != nil {
+		return nil, err
+	}
+	records := doctorAuditRecordsFromScratch(items, serverName)
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return &records[0], nil
+}
+
+func runtimeAuditSummaryFromDoctorAudit(record llmcheck.AuditRecord) benchmarkusecase.RecordRuntimeAuditSummary {
+	summary := benchmarkusecase.RecordRuntimeAuditSummary{
+		ID:              record.ID,
+		ServerName:      record.ServerName,
+		URL:             record.URL,
+		API:             record.API,
+		Model:           record.Model,
+		MatchedModel:    record.MatchedModel,
+		Warnings:        len(record.Warnings),
+		Problems:        len(record.Problems),
+		Recommendations: len(record.Recommendations),
+		ProbeRequested:  record.Probe.Requested,
+		ProbeStructured: record.Probe.Structured,
+		ProbeOK:         record.Probe.OK,
+		CreatedAt:       record.CreatedAt,
+	}
+	if record.Runtime.ModelFound {
+		summary.RuntimeLoaded = record.Runtime.Loaded
+		summary.RuntimeContext = record.Runtime.ContextLength
+		summary.RuntimeMaxContext = record.Runtime.MaxContextLength
+		summary.RuntimeQuantization = record.Runtime.MatchedModel.Quantization
+	}
+	return summary
+}
+
+func intPtrFromFlag(value int) *int {
+	if value < 0 {
+		return nil
+	}
+	return &value
+}
+
+func resolveBenchmarkCases(ids []string, files []string) ([]benchmarkusecase.Case, error) {
+	loaded := []benchmarkusecase.Case{}
+	for _, path := range files {
+		items, err := benchmarkusecase.LoadCaseFile(path)
+		if err != nil {
+			return nil, err
+		}
+		loaded = append(loaded, items...)
+	}
+	if len(ids) == 0 {
+		if len(loaded) > 0 {
+			return loaded, nil
+		}
+		return nil, nil
 	}
 
-	profiles := make([]benchmarkusecase.Profile, 0, len(names))
+	available := append(benchmarkusecase.BuiltinCases(), loaded...)
+	return benchmarkusecase.SelectCases(available, ids)
+}
+
+func resolveBenchmarkProfiles(base config.FeaturesConfig, names []string, routingCandidates []string) ([]benchmarkusecase.Profile, error) {
+	if len(names) == 0 {
+		if len(routingCandidates) == 0 {
+			names = []string{"legacy", "current"}
+		} else {
+			names = []string{"current"}
+		}
+	}
+
+	featureProfiles := make([]benchmarkusecase.Profile, 0, len(names))
 	for _, name := range names {
 		profile, err := resolveBenchmarkProfile(base, name)
 		if err != nil {
 			return nil, err
 		}
-		profiles = append(profiles, profile)
+		featureProfiles = append(featureProfiles, profile)
+	}
+	if len(routingCandidates) == 0 {
+		return featureProfiles, nil
+	}
+
+	profiles := make([]benchmarkusecase.Profile, 0, len(featureProfiles)*len(routingCandidates))
+	for _, featureProfile := range featureProfiles {
+		for _, candidate := range routingCandidates {
+			routingName, routingProfile, model, err := parseRoutingCandidate(candidate)
+			if err != nil {
+				return nil, err
+			}
+			profile := featureProfile
+			profile.Name = featureProfile.Name + "@" + routingName
+			profile.Description = strings.TrimSpace(featureProfile.Description + " / routing profile " + routingProfile)
+			profile.RoutingProfile = routingProfile
+			profile.Model = model
+			profiles = append(profiles, profile)
+		}
 	}
 	return profiles, nil
 }
@@ -145,16 +564,49 @@ func resolveBenchmarkProfile(base config.FeaturesConfig, name string) (benchmark
 	}
 }
 
+func parseRoutingCandidate(value string) (name string, routingProfile string, model string, err error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", "", "", fmt.Errorf("routing candidate が空です")
+	}
+	if strings.Contains(value, "=") {
+		parts := strings.SplitN(value, "=", 2)
+		name = strings.TrimSpace(parts[0])
+		value = strings.TrimSpace(parts[1])
+	}
+	parts := strings.SplitN(value, ":", 2)
+	routingProfile = strings.TrimSpace(parts[0])
+	if len(parts) == 2 {
+		model = strings.TrimSpace(parts[1])
+	}
+	if routingProfile == "" {
+		return "", "", "", fmt.Errorf("routing candidate %q に routing profile がありません", value)
+	}
+	if name == "" {
+		name = routingProfile
+	}
+	return name, routingProfile, model, nil
+}
+
 func renderBenchmarkTable(report benchmarkusecase.Report) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Prompt: %s\n", report.Prompt))
-	sb.WriteString(fmt.Sprintf("Runs per profile: %d\n\n", report.Runs))
-	sb.WriteString("Profile       Success  Avg Time  Avg Events  Avg Attempt  Verify Fails  Features\n")
+	if len(report.Cases) == 1 && report.Cases[0].ID == "prompt" {
+		sb.WriteString(fmt.Sprintf("Prompt: %s\n", report.Prompt))
+	} else {
+		sb.WriteString("Cases:\n")
+		for _, item := range report.Cases {
+			sb.WriteString(fmt.Sprintf("  - %s  %s\n", item.ID, fallbackBenchmarkString(item.Name, item.Description)))
+		}
+	}
+	sb.WriteString(fmt.Sprintf("Runs per case/profile: %d\n\n", report.Runs))
+	sb.WriteString("Profile       Success  Eval Pass  Avg Time  Avg Events  Avg Attempt  Verify Fails  Features\n")
 	for _, result := range report.Results {
 		sb.WriteString(fmt.Sprintf(
-			"%-12s  %d/%-4d  %-8s  %-10.1f %-12.1f %-13d %s\n",
+			"%-12s  %d/%-4d  %d/%-7d %-8s  %-10.1f %-12.1f %-13d %s\n",
 			result.Profile.Name,
 			result.Summary.Successes,
+			result.Summary.Runs,
+			result.Summary.EvaluationPasses,
 			result.Summary.Runs,
 			result.Summary.AvgDuration.Round(time.Millisecond),
 			result.Summary.AvgEvents,
@@ -164,9 +616,11 @@ func renderBenchmarkTable(report benchmarkusecase.Report) string {
 		))
 		for _, run := range result.Runs {
 			sb.WriteString(fmt.Sprintf(
-				"  run %-6d %s  %s  phase=%s  attempt=%d  tools=%d  artifacts=%d\n",
+				"  %s run %-3d %s eval=%s  %s  phase=%s  attempt=%d  tools=%d  artifacts=%d\n",
+				fallbackBenchmarkString(run.CaseID, "prompt"),
 				run.Index,
 				run.Status,
+				formatBenchmarkBool(run.Evaluation.Passed),
 				run.Duration.Round(time.Millisecond),
 				run.Phase,
 				run.Attempt,
@@ -177,6 +631,240 @@ func renderBenchmarkTable(report benchmarkusecase.Report) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+func renderBenchmarkCases(cases []benchmarkusecase.Case) string {
+	if len(cases) == 0 {
+		cases = benchmarkusecase.BuiltinCases()
+	}
+	var sb strings.Builder
+	sb.WriteString("Benchmark cases\n")
+	for _, item := range cases {
+		sb.WriteString(fmt.Sprintf("- %s", item.ID))
+		if item.Name != "" {
+			sb.WriteString("  " + item.Name)
+		}
+		if item.Description != "" {
+			sb.WriteString("\n  " + item.Description)
+		}
+		if len(item.Tags) > 0 {
+			sb.WriteString("\n  tags: " + strings.Join(item.Tags, ","))
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func renderBenchmarkRecordReport(report benchmarkusecase.RecordReport) string {
+	var sb strings.Builder
+	sb.WriteString("Benchmark record report\n")
+	sb.WriteString(fmt.Sprintf("  records: %d\n", report.Records))
+	if len(report.Inputs) > 0 {
+		sb.WriteString("  inputs: " + strings.Join(report.Inputs, ", ") + "\n")
+	}
+	if report.BaselineProfile != "" {
+		sb.WriteString("  baseline: " + report.BaselineProfile + "\n")
+	}
+	if report.RuntimeAudit != nil {
+		audit := report.RuntimeAudit
+		sb.WriteString(fmt.Sprintf(
+			"  runtime: server=%s model=%s context=%d/%d quant=%s warnings=%d recommendations=%d\n",
+			fallbackBenchmarkString(audit.ServerName, "-"),
+			fallbackBenchmarkString(audit.MatchedModel, audit.Model),
+			audit.RuntimeContext,
+			audit.RuntimeMaxContext,
+			fallbackBenchmarkString(audit.RuntimeQuantization, "-"),
+			audit.Warnings,
+			audit.Recommendations,
+		))
+	}
+	sb.WriteString("\n")
+	sb.WriteString("Profile       Case             Runs  Pass Rate  Success  Avg Time  Avg Tools  Avg LLM  Fallbacks  Verify Fails  Preflight        Delta        Models\n")
+	for _, group := range report.Groups {
+		delta := "-"
+		if group.BaselineDelta != nil {
+			delta = fmt.Sprintf("pass %s, verify %+d", formatSignedRate(group.BaselineDelta.PassRate), group.BaselineDelta.VerificationFailures)
+		}
+		preflight := "-"
+		if group.PreflightDoctor {
+			preflight = fmt.Sprintf("ctx=%d warn=%d rec=%d", group.PreflightRuntimeContextLength, group.PreflightDoctorWarnings, group.PreflightDoctorRecommendations)
+		}
+		sb.WriteString(fmt.Sprintf(
+			"%-12s  %-15s  %-4d  %-9s  %-7s  %-8s  %-9.1f  %-7.1f  %-9d  %-12d  %-16s %-12s %s\n",
+			group.ProfileName,
+			fallbackBenchmarkString(group.CaseID, "-"),
+			group.Runs,
+			formatRate(group.PassRate),
+			formatRate(group.SuccessRate),
+			(time.Duration(group.AvgDurationMS) * time.Millisecond).Round(time.Millisecond),
+			group.AvgToolCalls,
+			group.AvgModelCalls,
+			group.ModelFallbacks,
+			group.VerificationFailures,
+			preflight,
+			delta,
+			recordModelSummary(group),
+		))
+	}
+	if len(report.FailedThresholds) > 0 {
+		sb.WriteString("\nThreshold failures\n")
+		for _, failure := range report.FailedThresholds {
+			sb.WriteString(fmt.Sprintf("  - %s/%s %s got=%s want>=%s\n", failure.ProfileName, failure.CaseID, failure.Metric, formatRate(failure.Got), formatRate(failure.Want)))
+		}
+	}
+	if len(report.RuntimeGateFailures) > 0 {
+		sb.WriteString("\nRuntime gate failures\n")
+		for _, failure := range report.RuntimeGateFailures {
+			sb.WriteString(fmt.Sprintf("  - %s got=%s want=%s\n", failure.Metric, fallbackBenchmarkString(failure.Got, "-"), fallbackBenchmarkString(failure.Want, "-")))
+		}
+	}
+	if len(report.Regressions) > 0 {
+		sb.WriteString("\nRegressions\n")
+		for _, regression := range report.Regressions {
+			sb.WriteString(fmt.Sprintf("  - %s/%s %s %s\n", regression.ProfileName, regression.CaseID, regression.Metric, regression.Detail))
+		}
+	}
+	return sb.String()
+}
+
+func recordModelSummary(group benchmarkusecase.RecordGroupSummary) string {
+	parts := []string{}
+	if len(group.ModelServers) > 0 {
+		parts = append(parts, "servers="+strings.Join(group.ModelServers, "|"))
+	}
+	if len(group.ModelNames) > 0 {
+		parts = append(parts, "models="+strings.Join(group.ModelNames, "|"))
+	}
+	if len(group.ModelAPIs) > 0 {
+		parts = append(parts, "apis="+strings.Join(group.ModelAPIs, "|"))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderBenchmarkRecordReportCSV(report benchmarkusecase.RecordReport) (string, error) {
+	var sb strings.Builder
+	writer := csv.NewWriter(&sb)
+	if err := writer.Write([]string{
+		"profile",
+		"routing_profile",
+		"model",
+		"case_id",
+		"case_name",
+		"runs",
+		"passes",
+		"pass_rate",
+		"success_rate",
+		"avg_duration_ms",
+		"avg_events",
+		"avg_tool_calls",
+		"avg_model_calls",
+		"avg_model_duration_ms",
+		"model_fallbacks",
+		"model_servers",
+		"model_names",
+		"model_apis",
+		"model_profiles",
+		"failed_events",
+		"verification_failures",
+		"baseline_pass_rate_delta",
+		"baseline_verification_failures_delta",
+		"preflight_doctor",
+		"preflight_doctor_server",
+		"preflight_doctor_model",
+		"preflight_doctor_warnings",
+		"preflight_doctor_recommendations",
+		"preflight_runtime_context_length",
+		"preflight_runtime_quantization",
+		"runtime_audit_server",
+		"runtime_audit_model",
+		"runtime_audit_context",
+		"runtime_audit_quantization",
+		"runtime_audit_warnings",
+		"runtime_audit_recommendations",
+		"failed_expectations",
+	}); err != nil {
+		return "", err
+	}
+	for _, group := range report.Groups {
+		passRateDelta := ""
+		verifyDelta := ""
+		if group.BaselineDelta != nil {
+			passRateDelta = fmt.Sprintf("%.6f", group.BaselineDelta.PassRate)
+			verifyDelta = fmt.Sprint(group.BaselineDelta.VerificationFailures)
+		}
+		runtimeServer := ""
+		runtimeModel := ""
+		runtimeContext := ""
+		runtimeQuantization := ""
+		runtimeWarnings := ""
+		runtimeRecommendations := ""
+		if report.RuntimeAudit != nil {
+			runtimeServer = report.RuntimeAudit.ServerName
+			runtimeModel = fallbackBenchmarkString(report.RuntimeAudit.MatchedModel, report.RuntimeAudit.Model)
+			runtimeContext = fmt.Sprint(report.RuntimeAudit.RuntimeContext)
+			runtimeQuantization = report.RuntimeAudit.RuntimeQuantization
+			runtimeWarnings = fmt.Sprint(report.RuntimeAudit.Warnings)
+			runtimeRecommendations = fmt.Sprint(report.RuntimeAudit.Recommendations)
+		}
+		if err := writer.Write([]string{
+			group.ProfileName,
+			group.RoutingProfile,
+			group.Model,
+			group.CaseID,
+			group.CaseName,
+			fmt.Sprint(group.Runs),
+			fmt.Sprint(group.Passes),
+			fmt.Sprintf("%.6f", group.PassRate),
+			fmt.Sprintf("%.6f", group.SuccessRate),
+			fmt.Sprintf("%.1f", group.AvgDurationMS),
+			fmt.Sprintf("%.1f", group.AvgEvents),
+			fmt.Sprintf("%.1f", group.AvgToolCalls),
+			fmt.Sprintf("%.1f", group.AvgModelCalls),
+			fmt.Sprintf("%.1f", group.AvgModelDurationMS),
+			fmt.Sprint(group.ModelFallbacks),
+			strings.Join(group.ModelServers, "|"),
+			strings.Join(group.ModelNames, "|"),
+			strings.Join(group.ModelAPIs, "|"),
+			strings.Join(group.ModelProfiles, "|"),
+			fmt.Sprint(group.FailedEvents),
+			fmt.Sprint(group.VerificationFailures),
+			passRateDelta,
+			verifyDelta,
+			fmt.Sprint(group.PreflightDoctor),
+			group.PreflightDoctorServer,
+			group.PreflightDoctorModel,
+			fmt.Sprint(group.PreflightDoctorWarnings),
+			fmt.Sprint(group.PreflightDoctorRecommendations),
+			fmt.Sprint(group.PreflightRuntimeContextLength),
+			group.PreflightRuntimeQuantization,
+			runtimeServer,
+			runtimeModel,
+			runtimeContext,
+			runtimeQuantization,
+			runtimeWarnings,
+			runtimeRecommendations,
+			strings.Join(group.FailedExpectations, "|"),
+		}); err != nil {
+			return "", err
+		}
+	}
+	writer.Flush()
+	return sb.String(), writer.Error()
+}
+
+func writeBenchmarkFile(path string, write func(*os.File) error) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("benchmark output file の作成に失敗しました: %w", err)
+	}
+	defer file.Close()
+	if err := write(file); err != nil {
+		return err
+	}
+	return nil
 }
 
 func featureSummary(features config.FeaturesConfig) string {
@@ -197,4 +885,26 @@ func featureSummary(features config.FeaturesConfig) string {
 		return "(all off)"
 	}
 	return strings.Join(flags, ",")
+}
+
+func formatBenchmarkBool(value bool) string {
+	if value {
+		return "pass"
+	}
+	return "fail"
+}
+
+func formatRate(value float64) string {
+	return fmt.Sprintf("%.0f%%", value*100)
+}
+
+func formatSignedRate(value float64) string {
+	return fmt.Sprintf("%+.0f%%", value*100)
+}
+
+func fallbackBenchmarkString(value string, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
 }

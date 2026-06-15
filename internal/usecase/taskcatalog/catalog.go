@@ -1,7 +1,10 @@
 package taskcatalog
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,20 +44,26 @@ type taskEntry struct {
 }
 
 type mcpServerEntry struct {
-	ID           string            `toml:"id"`
-	Description  string            `toml:"description"`
-	Transport    string            `toml:"transport"`
-	Command      string            `toml:"command"`
-	Args         []string          `toml:"args"`
-	Cwd          string            `toml:"cwd"`
-	Env          map[string]string `toml:"env"`
-	Risk         string            `toml:"risk"`
-	AllowNetwork bool              `toml:"allow_network"`
-	Timeout      int               `toml:"timeout"`
-	ToolPrefix   string            `toml:"tool_prefix"`
-	ParallelSafe bool              `toml:"parallel_safe"`
-	IncludeTools []string          `toml:"include_tools"`
-	ExcludeTools []string          `toml:"exclude_tools"`
+	ID                   string            `toml:"id"`
+	Description          string            `toml:"description"`
+	Transport            string            `toml:"transport"`
+	Command              string            `toml:"command"`
+	Args                 []string          `toml:"args"`
+	Cwd                  string            `toml:"cwd"`
+	Roots                []string          `toml:"roots"`
+	Env                  map[string]string `toml:"env"`
+	Risk                 string            `toml:"risk"`
+	AllowNetwork         bool              `toml:"allow_network"`
+	Timeout              int               `toml:"timeout"`
+	ToolPrefix           string            `toml:"tool_prefix"`
+	Trust                string            `toml:"trust"`
+	TrustToolAnnotations bool              `toml:"trust_tool_annotations"`
+	ParallelSafe         bool              `toml:"parallel_safe"`
+	ReadOnlyTools        []string          `toml:"read_only_tools"`
+	MutatingTools        []string          `toml:"mutating_tools"`
+	ParallelSafeTools    []string          `toml:"parallel_safe_tools"`
+	IncludeTools         []string          `toml:"include_tools"`
+	ExcludeTools         []string          `toml:"exclude_tools"`
 }
 
 func New(workDir string) (*Catalog, error) {
@@ -73,6 +82,7 @@ func New(workDir string) (*Catalog, error) {
 		}
 	}
 
+	addAll(autoTasks(workDir))
 	if userPath, ok := defaultUserTasksPath(); ok {
 		items, err := loadFile(userPath, workDir)
 		if err != nil {
@@ -113,8 +123,11 @@ func loadFile(path string, baseDir string) ([]domain.TaskDefinition, error) {
 	}
 
 	var decoded tasksFile
-	if err := toml.Unmarshal(data, &decoded); err != nil {
+	if err := decodeTasksFile(data, &decoded); err != nil {
 		return nil, fmt.Errorf("task 設定のパースに失敗しました: %w", err)
+	}
+	if err := validateTasksFile(path, decoded); err != nil {
+		return nil, err
 	}
 
 	result := make([]domain.TaskDefinition, 0, len(decoded.Tasks))
@@ -162,23 +175,137 @@ func loadFile(path string, baseDir string) ([]domain.TaskDefinition, error) {
 			Description: entry.Description,
 			Kind:        domain.TaskSpecKindMCPServer,
 			MCPServer: &domain.MCPServerSpec{
-				Transport:    transport,
-				Command:      entry.Command,
-				Args:         append([]string(nil), entry.Args...),
-				Cwd:          cwd,
-				Env:          cloneEnv(entry.Env),
-				Risk:         normalizeRisk(entry.Risk),
-				AllowNetwork: entry.AllowNetwork,
-				Timeout:      entry.Timeout,
-				ToolPrefix:   toolPrefix,
-				ParallelSafe: entry.ParallelSafe,
-				IncludeTools: append([]string(nil), entry.IncludeTools...),
-				ExcludeTools: append([]string(nil), entry.ExcludeTools...),
+				Transport:            transport,
+				Command:              entry.Command,
+				Args:                 append([]string(nil), entry.Args...),
+				Cwd:                  cwd,
+				Env:                  cloneEnv(entry.Env),
+				Risk:                 normalizeRisk(entry.Risk),
+				AllowNetwork:         entry.AllowNetwork,
+				Timeout:              entry.Timeout,
+				ToolPrefix:           toolPrefix,
+				Roots:                resolveTaskPaths(baseDir, cwd, entry.Roots),
+				Trust:                normalizeTrust(entry.Trust),
+				TrustToolAnnotations: entry.TrustToolAnnotations || normalizeTrust(entry.Trust) == "trusted",
+				ParallelSafe:         entry.ParallelSafe,
+				ReadOnlyTools:        append([]string(nil), entry.ReadOnlyTools...),
+				MutatingTools:        append([]string(nil), entry.MutatingTools...),
+				ParallelSafeTools:    append([]string(nil), entry.ParallelSafeTools...),
+				IncludeTools:         append([]string(nil), entry.IncludeTools...),
+				ExcludeTools:         append([]string(nil), entry.ExcludeTools...),
 			},
 			Source: path,
 		})
 	}
 	return result, nil
+}
+
+func decodeTasksFile(data []byte, decoded *tasksFile) error {
+	err := toml.NewDecoder(bytes.NewReader(data)).DisallowUnknownFields().Decode(decoded)
+	if err == nil {
+		return nil
+	}
+	var missing *toml.StrictMissingError
+	if errors.As(err, &missing) {
+		return fmt.Errorf("%w: %s", err, missing.String())
+	}
+	return err
+}
+
+func autoTasks(workDir string) []domain.TaskDefinition {
+	items := []domain.TaskDefinition{}
+	items = append(items, autoGoTasks(workDir)...)
+	items = append(items, autoPackageJSONTasks(workDir)...)
+	return items
+}
+
+func autoGoTasks(workDir string) []domain.TaskDefinition {
+	if _, err := os.Stat(filepath.Join(workDir, "go.mod")); err != nil {
+		return nil
+	}
+	return []domain.TaskDefinition{
+		{
+			ID:          "go:test",
+			Description: "Go の全テストを実行",
+			Kind:        domain.TaskSpecKindCommand,
+			Command: &domain.CommandTaskSpec{
+				Command:      "go",
+				Args:         []string{"test", "./..."},
+				Cwd:          workDir,
+				ReadPaths:    []string{workDir},
+				WritePaths:   []string{workDir},
+				Risk:         "medium",
+				AllowNetwork: false,
+				Timeout:      300,
+			},
+			Source: "auto:go.mod",
+		},
+		{
+			ID:          "go:build",
+			Description: "Go の全 package をビルド",
+			Kind:        domain.TaskSpecKindCommand,
+			Command: &domain.CommandTaskSpec{
+				Command:      "go",
+				Args:         []string{"build", "./..."},
+				Cwd:          workDir,
+				ReadPaths:    []string{workDir},
+				WritePaths:   []string{workDir},
+				Risk:         "medium",
+				AllowNetwork: false,
+				Timeout:      300,
+			},
+			Source: "auto:go.mod",
+		},
+	}
+}
+
+func autoPackageJSONTasks(workDir string) []domain.TaskDefinition {
+	data, err := os.ReadFile(filepath.Join(workDir, "package.json"))
+	if err != nil {
+		return nil
+	}
+	var decoded struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil
+	}
+	if len(decoded.Scripts) == 0 {
+		return nil
+	}
+	knownScripts := []struct {
+		Name        string
+		Description string
+		Risk        string
+	}{
+		{Name: "test", Description: "npm test script を実行", Risk: "medium"},
+		{Name: "build", Description: "npm build script を実行", Risk: "medium"},
+		{Name: "lint", Description: "npm lint script を実行", Risk: "low"},
+		{Name: "typecheck", Description: "npm typecheck script を実行", Risk: "low"},
+	}
+	items := []domain.TaskDefinition{}
+	for _, script := range knownScripts {
+		if _, ok := decoded.Scripts[script.Name]; !ok {
+			continue
+		}
+		items = append(items, domain.TaskDefinition{
+			ID:          "npm:" + script.Name,
+			Description: script.Description,
+			Kind:        domain.TaskSpecKindCommand,
+			Command: &domain.CommandTaskSpec{
+				Command:      "npm",
+				Args:         []string{"run", script.Name},
+				Cwd:          workDir,
+				ReadPaths:    []string{workDir},
+				WritePaths:   []string{workDir},
+				Risk:         script.Risk,
+				AllowNetwork: false,
+				Timeout:      300,
+			},
+			Source: "auto:package.json",
+		})
+	}
+	return items
 }
 
 func defaultUserTasksPath() (string, bool) {
@@ -198,6 +325,15 @@ func normalizeRisk(risk string) string {
 		return risk
 	default:
 		return "medium"
+	}
+}
+
+func normalizeTrust(trust string) string {
+	switch trust {
+	case "trusted":
+		return "trusted"
+	default:
+		return "untrusted"
 	}
 }
 
@@ -231,4 +367,165 @@ func resolveTaskPaths(baseDir string, cwd string, paths []string) []string {
 		resolved = append(resolved, filepath.Clean(item))
 	}
 	return resolved
+}
+
+func validateTasksFile(path string, decoded tasksFile) error {
+	seen := map[string]string{}
+	for idx, entry := range decoded.Tasks {
+		location := fmt.Sprintf("%s [[tasks]] #%d", path, idx+1)
+		if err := validateTaskEntry(location, entry); err != nil {
+			return err
+		}
+		if err := rememberTaskID(seen, location, entry.ID); err != nil {
+			return err
+		}
+	}
+	for idx, entry := range decoded.MCPServers {
+		location := fmt.Sprintf("%s [[mcpservers]] #%d", path, idx+1)
+		if err := validateMCPServerEntry(location, entry); err != nil {
+			return err
+		}
+		if err := rememberTaskID(seen, location, entry.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTaskEntry(location string, entry taskEntry) error {
+	if strings.TrimSpace(entry.ID) == "" {
+		return fmt.Errorf("%s: id が必要です", location)
+	}
+	if strings.TrimSpace(entry.Command) == "" {
+		return fmt.Errorf("%s id=%q: command が必要です", location, entry.ID)
+	}
+	if err := validateRisk(location, entry.ID, entry.Risk); err != nil {
+		return err
+	}
+	if entry.Timeout < 0 {
+		return fmt.Errorf("%s id=%q: timeout は 0 以上である必要があります", location, entry.ID)
+	}
+	if err := validatePathList(location, entry.ID, "read_paths", entry.ReadPaths); err != nil {
+		return err
+	}
+	if err := validatePathList(location, entry.ID, "write_paths", entry.WritePaths); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateMCPServerEntry(location string, entry mcpServerEntry) error {
+	if strings.TrimSpace(entry.ID) == "" {
+		return fmt.Errorf("%s: id が必要です", location)
+	}
+	transport := domain.MCPTransport(entry.Transport)
+	if transport == "" {
+		transport = domain.MCPTransportStdio
+	}
+	if transport != domain.MCPTransportStdio {
+		return fmt.Errorf("%s id=%q: transport=%q は未対応です。対応値: stdio", location, entry.ID, entry.Transport)
+	}
+	if strings.TrimSpace(entry.Command) == "" {
+		return fmt.Errorf("%s id=%q: command が必要です", location, entry.ID)
+	}
+	if err := validateRisk(location, entry.ID, entry.Risk); err != nil {
+		return err
+	}
+	if entry.Trust != "" && normalizeTrust(entry.Trust) != entry.Trust {
+		return fmt.Errorf("%s id=%q: trust=%q は不正です。対応値: untrusted, trusted", location, entry.ID, entry.Trust)
+	}
+	if entry.Timeout < 0 {
+		return fmt.Errorf("%s id=%q: timeout は 0 以上である必要があります", location, entry.ID)
+	}
+	if entry.ToolPrefix != "" && strings.TrimSpace(entry.ToolPrefix) == "" {
+		return fmt.Errorf("%s id=%q: tool_prefix が空白だけです", location, entry.ID)
+	}
+	if err := validatePathList(location, entry.ID, "roots", entry.Roots); err != nil {
+		return err
+	}
+	for key := range entry.Env {
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("%s id=%q: env の key が空です", location, entry.ID)
+		}
+	}
+	if err := validateStringList(location, entry.ID, "read_only_tools", entry.ReadOnlyTools); err != nil {
+		return err
+	}
+	if err := validateStringList(location, entry.ID, "mutating_tools", entry.MutatingTools); err != nil {
+		return err
+	}
+	if err := validateStringList(location, entry.ID, "parallel_safe_tools", entry.ParallelSafeTools); err != nil {
+		return err
+	}
+	if err := validateStringList(location, entry.ID, "include_tools", entry.IncludeTools); err != nil {
+		return err
+	}
+	if err := validateStringList(location, entry.ID, "exclude_tools", entry.ExcludeTools); err != nil {
+		return err
+	}
+	if value := firstOverlap(entry.ReadOnlyTools, entry.MutatingTools); value != "" {
+		return fmt.Errorf("%s id=%q: tool %q は read_only_tools と mutating_tools の両方に指定されています", location, entry.ID, value)
+	}
+	if value := firstOverlap(entry.IncludeTools, entry.ExcludeTools); value != "" {
+		return fmt.Errorf("%s id=%q: tool %q は include_tools と exclude_tools の両方に指定されています", location, entry.ID, value)
+	}
+	return nil
+}
+
+func rememberTaskID(seen map[string]string, location string, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	if previous, ok := seen[id]; ok {
+		return fmt.Errorf("%s: id=%q が重複しています。既存定義: %s", location, id, previous)
+	}
+	seen[id] = location
+	return nil
+}
+
+func validateRisk(location string, id string, risk string) error {
+	if risk == "" || normalizeRisk(risk) == risk {
+		return nil
+	}
+	return fmt.Errorf("%s id=%q: risk=%q は不正です。対応値: low, medium, high", location, id, risk)
+}
+
+func validatePathList(location string, id string, name string, values []string) error {
+	for idx, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s id=%q: %s[%d] が空です", location, id, name, idx)
+		}
+	}
+	return nil
+}
+
+func validateStringList(location string, id string, name string, values []string) error {
+	for idx, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s id=%q: %s[%d] が空です", location, id, name, idx)
+		}
+	}
+	return nil
+}
+
+func firstOverlap(left []string, right []string) string {
+	seen := map[string]struct{}{}
+	for _, value := range left {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		seen[value] = struct{}{}
+	}
+	for _, value := range right {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			return value
+		}
+	}
+	return ""
 }

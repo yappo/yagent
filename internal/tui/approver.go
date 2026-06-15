@@ -14,19 +14,26 @@ type permissionRequestMsg struct {
 	response chan domain.PermissionDecision
 }
 
-type ApproverBridge struct {
+type toolEventMsg struct {
+	event domain.ToolEvent
+}
+
+type RuntimeBridge struct {
 	program *tea.Program
 }
 
-func NewApproverBridge() *ApproverBridge {
-	return &ApproverBridge{}
+var _ domain.Approver = (*RuntimeBridge)(nil)
+var _ domain.ToolObserver = (*RuntimeBridge)(nil)
+
+func NewRuntimeBridge() *RuntimeBridge {
+	return &RuntimeBridge{}
 }
 
-func (b *ApproverBridge) Attach(program *tea.Program) {
+func (b *RuntimeBridge) Attach(program *tea.Program) {
 	b.program = program
 }
 
-func (b *ApproverBridge) Approve(ctx context.Context, request domain.PermissionRequest) (domain.PermissionDecision, error) {
+func (b *RuntimeBridge) Approve(ctx context.Context, request domain.PermissionRequest) (domain.PermissionDecision, error) {
 	if b.program == nil {
 		return domain.PermissionDeny, fmt.Errorf("permission bridge is not attached")
 	}
@@ -42,5 +49,11 @@ func (b *ApproverBridge) Approve(ctx context.Context, request domain.PermissionR
 		return domain.PermissionDeny, ctx.Err()
 	case decision := <-response:
 		return decision, nil
+	}
+}
+
+func (b *RuntimeBridge) OnToolEvent(_ context.Context, event domain.ToolEvent) {
+	if b.program != nil {
+		b.program.Send(toolEventMsg{event: event})
 	}
 }

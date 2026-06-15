@@ -24,10 +24,19 @@ type PermissionRequest struct {
 	Risk         string
 	Scope        string
 	Summary      string
+	PreviewKind  string
+	Preview      string
+	ChangeFiles  int
+	Additions    int
+	Deletions    int
 	SideEffects  []string
 	AgentID      string
 	Purpose      string
 	Task         string
+	RunID        string
+	RootRunID    string
+	Phase        RunPhase
+	Attempt      int
 }
 
 type Approver interface {

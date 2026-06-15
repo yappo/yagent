@@ -91,12 +91,13 @@ type VerificationRecord struct {
 type VerificationResult = VerificationRecord
 
 type WorkspacePathState struct {
-	Path        string    `json:"path"`
-	Exists      bool      `json:"exists"`
-	IsDir       bool      `json:"is_dir"`
-	Size        int64     `json:"size"`
-	ModTimeUnix int64     `json:"mod_time_unix"`
-	ObservedAt  time.Time `json:"observed_at"`
+	Path          string    `json:"path"`
+	Exists        bool      `json:"exists"`
+	IsDir         bool      `json:"is_dir"`
+	Size          int64     `json:"size"`
+	ModTimeUnix   int64     `json:"mod_time_unix"`
+	ContentSHA256 string    `json:"content_sha256,omitempty"`
+	ObservedAt    time.Time `json:"observed_at"`
 }
 
 type WorkspaceSnapshot struct {
@@ -114,10 +115,12 @@ type WorkspaceFact struct {
 }
 
 type ObservationSummary struct {
-	ObservationID string    `json:"observation_id"`
-	ToolName      string    `json:"tool_name"`
-	Summary       string    `json:"summary"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ObservationID   string    `json:"observation_id"`
+	ToolName        string    `json:"tool_name"`
+	Summary         string    `json:"summary"`
+	ReadSet         []string  `json:"read_set,omitempty"`
+	IntegritySHA256 string    `json:"integrity_sha256,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type WorkspaceMemory struct {
@@ -140,6 +143,7 @@ type ObservationRecord struct {
 	ReadSet          []string             `json:"read_set,omitempty"`
 	PathStates       []WorkspacePathState `json:"path_states,omitempty"`
 	SnapshotRevision int64                `json:"snapshot_revision"`
+	IntegritySHA256  string               `json:"integrity_sha256,omitempty"`
 	Reusable         bool                 `json:"reusable"`
 	Stale            bool                 `json:"stale"`
 	CreatedAt        time.Time            `json:"created_at"`
@@ -184,6 +188,69 @@ type ToolExecutionRecord struct {
 	MutationFingerprint string               `json:"mutation_fingerprint,omitempty"`
 	CreatedAt           time.Time            `json:"created_at"`
 	UpdatedAt           time.Time            `json:"updated_at"`
+}
+
+type ModelInvocationSettings struct {
+	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
+	Temperature       *float64 `json:"temperature,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	TopK              int      `json:"top_k,omitempty"`
+	MinP              *float64 `json:"min_p,omitempty"`
+	PresencePenalty   *float64 `json:"presence_penalty,omitempty"`
+	RepetitionPenalty *float64 `json:"repetition_penalty,omitempty"`
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`
+	TextVerbosity     string   `json:"text_verbosity,omitempty"`
+	ParallelToolCalls *bool    `json:"parallel_tool_calls,omitempty"`
+	Store             *bool    `json:"store,omitempty"`
+}
+
+type ModelInvocationRecord struct {
+	ID                 string                  `json:"id"`
+	RunID              string                  `json:"run_id,omitempty"`
+	RootRunID          string                  `json:"root_run_id,omitempty"`
+	AgentID            string                  `json:"agent_id,omitempty"`
+	Phase              RunPhase                `json:"phase,omitempty"`
+	Attempt            int                     `json:"attempt,omitempty"`
+	ProfileName        string                  `json:"profile_name,omitempty"`
+	ServerName         string                  `json:"server_name,omitempty"`
+	Fallback           bool                    `json:"fallback,omitempty"`
+	FallbackFromServer string                  `json:"fallback_from_server,omitempty"`
+	URL                string                  `json:"url,omitempty"`
+	API                string                  `json:"api,omitempty"`
+	Model              string                  `json:"model,omitempty"`
+	ResponseFormat     string                  `json:"response_format,omitempty"`
+	Messages           int                     `json:"messages"`
+	Tools              int                     `json:"tools"`
+	Settings           ModelInvocationSettings `json:"settings,omitempty"`
+	DurationMS         int64                   `json:"duration_ms"`
+	Success            bool                    `json:"success"`
+	FinishReason       string                  `json:"finish_reason,omitempty"`
+	Error              string                  `json:"error,omitempty"`
+	CreatedAt          time.Time               `json:"created_at"`
+}
+
+type ConversationTurnRecord struct {
+	ID                       string              `json:"id"`
+	RunID                    string              `json:"run_id,omitempty"`
+	RootRunID                string              `json:"root_run_id,omitempty"`
+	Profile                  string              `json:"profile,omitempty"`
+	Status                   RunStatus           `json:"status"`
+	CurrentPhase             RunPhase            `json:"current_phase,omitempty"`
+	Attempt                  int                 `json:"attempt,omitempty"`
+	UserGoal                 string              `json:"user_goal,omitempty"`
+	RequestMessages          []Message           `json:"request_messages,omitempty"`
+	ContextMessages          []Message           `json:"context_messages,omitempty"`
+	OutputMessage            Message             `json:"output_message,omitempty"`
+	Error                    string              `json:"error,omitempty"`
+	EventCount               int                 `json:"event_count"`
+	ToolCallCount            int                 `json:"tool_call_count"`
+	ToolFailureCount         int                 `json:"tool_failure_count"`
+	ModelCallCount           int                 `json:"model_call_count"`
+	CacheHitCount            int                 `json:"cache_hit_count"`
+	VerificationFailureCount int                 `json:"verification_failure_count"`
+	ArtifactRefs             []ArtifactReference `json:"artifact_refs,omitempty"`
+	StartedAt                time.Time           `json:"started_at"`
+	CompletedAt              time.Time           `json:"completed_at"`
 }
 
 type WorkUnit struct {
@@ -263,6 +330,11 @@ type RuntimeStateStore interface {
 	SaveWorkspaceSnapshot(context.Context, *WorkspaceSnapshot) error
 	SaveScratch(context.Context, ScratchRecord) error
 	ListScratch(context.Context, int) ([]ScratchRecord, error)
+}
+
+type ConversationStore interface {
+	SaveConversationTurn(context.Context, ConversationTurnRecord) error
+	ListConversationTurns(context.Context, int) ([]ConversationTurnRecord, error)
 }
 
 type ContextEngine interface {

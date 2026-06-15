@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -281,6 +283,77 @@ func TestRunTurnCanDisablePhaseHarness(t *testing.T) {
 	}
 }
 
+func TestRunTurnPersistsConversationTurn(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "conversation done"},
+				}},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{
+			MaxParallelAgents:   1,
+			MaxHandoffDepth:     1,
+			DisablePhaseHarness: true,
+			RunStore:            store,
+			ConversationStore:   store,
+		},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "remember this turn"}},
+		Profile:  "fast",
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	turns, err := store.ListConversationTurns(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListConversationTurns returned error: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("expected one conversation turn, got %+v", turns)
+	}
+	turn := turns[0]
+	if turn.RunID != result.Run.ID || turn.Profile != "fast" || turn.Status != domain.RunStatusCompleted {
+		t.Fatalf("unexpected conversation metadata: %+v", turn)
+	}
+	if len(turn.RequestMessages) != 1 || turn.RequestMessages[0].Content != "remember this turn" {
+		t.Fatalf("unexpected request messages: %+v", turn.RequestMessages)
+	}
+	if turn.OutputMessage.Content != "conversation done" {
+		t.Fatalf("unexpected output message: %+v", turn.OutputMessage)
+	}
+	if turn.EventCount == 0 || turn.ModelCallCount == 0 {
+		t.Fatalf("expected event/model counts, got %+v", turn)
+	}
+}
+
+func TestParseVerificationPrefersStructuredJSON(t *testing.T) {
+	result := parseVerification(`{"status":"fail","summary":"missing regression coverage","repair_brief":"add a focused test"}`, "reviewer", 2)
+	if result.SourceAgent != "reviewer" || result.Attempt != 2 {
+		t.Fatalf("unexpected result metadata: %+v", result)
+	}
+	if result.Status != "fail" {
+		t.Fatalf("expected fail status, got %+v", result)
+	}
+	if result.Summary != "missing regression coverage" {
+		t.Fatalf("unexpected summary: %q", result.Summary)
+	}
+	if result.RepairBrief != "add a focused test" {
+		t.Fatalf("unexpected repair brief: %q", result.RepairBrief)
+	}
+}
+
 func TestRunTurnPersistsTypedArtifacts(t *testing.T) {
 	service := New(
 		&fakeModelClient{
@@ -504,6 +577,66 @@ func TestRunTurnUsesConfigDefaultModelWhenRequestAndAgentAreEmpty(t *testing.T) 
 	}
 }
 
+func TestRunTurnStreamsModelDeltasAsTransientEvents(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "hello"},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				if !request.Stream {
+					t.Fatalf("expected stream request")
+				}
+				if request.StreamHandler == nil {
+					t.Fatalf("expected stream handler")
+				}
+				request.StreamHandler(domain.ModelStreamEvent{
+					Type:         "content_delta",
+					ContentDelta: "hel",
+					RawEventType: "chat.completion.chunk",
+				})
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, DefaultModel: "gpt-5"},
+	)
+	events, cancel := service.SubscribeEvents()
+	defer cancel()
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+		Stream:   true,
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+
+	select {
+	case event := <-events:
+		if event.Type != "agent_started" {
+			t.Fatalf("expected agent start before delta, got %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for agent start event")
+	}
+	select {
+	case event := <-events:
+		if event.Type != "llm_delta" || event.Detail != "hel" || event.Metrics["raw_event_type"] != "chat.completion.chunk" {
+			t.Fatalf("unexpected stream event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stream event")
+	}
+	if hasEventType(result.Events, "llm_delta") {
+		t.Fatalf("stream deltas should not be persisted in turn events: %+v", result.Events)
+	}
+}
+
 func TestRunTurnPrefersRequestModelOverConfigDefault(t *testing.T) {
 	var gotModel string
 	service := New(
@@ -686,6 +819,63 @@ func TestRunAgentEmitsFailedEventOnDepthLimit(t *testing.T) {
 	}
 }
 
+func TestRunAgentEmitsModelInvocationMetrics(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"coder": {{
+					Message:      domain.Message{Role: domain.RoleAssistant, Content: "done"},
+					FinishReason: "stop",
+					Invocation: domain.ModelInvocationMetadata{
+						ServerName:         "openai",
+						Fallback:           true,
+						FallbackFromServer: "local",
+						API:                "responses",
+						Model:              "gpt-5.5",
+						ProfileName:        "strong",
+						DurationMS:         1234,
+					},
+				}},
+			},
+		},
+		&fakeToolExecutor{defs: map[string][]domain.ToolDefinition{
+			"coder": {{Name: "fs_read"}},
+		}},
+		fakeCatalog{agents: map[string]domain.AgentSpec{}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 1},
+	)
+
+	result, err := service.runAgent(context.Background(), domain.AgentInvocation{
+		RunID:     "coder-1",
+		RootRunID: "root-1",
+		Agent:     domain.AgentSpec{ID: "coder", RoutingProfile: "strong"},
+		Phase:     domain.RunPhaseExecute,
+		Attempt:   2,
+	}, 0)
+	if err != nil {
+		t.Fatalf("runAgent returned error: %v", err)
+	}
+	var llmEvent domain.ExecutionEvent
+	for _, event := range result.Events {
+		if event.Type == "llm_called" {
+			llmEvent = event
+			break
+		}
+	}
+	if llmEvent.Type == "" {
+		t.Fatalf("expected llm_called event, got %+v", result.Events)
+	}
+	if llmEvent.Metrics["server_name"] != "openai" || llmEvent.Metrics["api"] != "responses" || llmEvent.Metrics["model"] != "gpt-5.5" || llmEvent.Metrics["profile_name"] != "strong" {
+		t.Fatalf("unexpected llm_called model metrics: %+v", llmEvent.Metrics)
+	}
+	if llmEvent.Metrics["fallback"] != true || llmEvent.Metrics["fallback_from_server"] != "local" || llmEvent.Metrics["duration_ms"] != int64(1234) {
+		t.Fatalf("unexpected llm_called metrics: %+v", llmEvent.Metrics)
+	}
+	if visibleTools, ok := llmEvent.Metrics["visible_tools"].(int); !ok || visibleTools <= 0 {
+		t.Fatalf("expected visible tool count, got %+v", llmEvent.Metrics)
+	}
+}
+
 func TestRunAgentRequestsContinuationAtMaxTurns(t *testing.T) {
 	approver := &fakeApprover{decision: domain.PermissionAllowOnce}
 	service := New(
@@ -715,6 +905,63 @@ func TestRunAgentRequestsContinuationAtMaxTurns(t *testing.T) {
 	}
 	if len(approver.requests) != 1 || approver.requests[0].ToolName != "agent_turn_limit" {
 		t.Fatalf("expected continuation approval request, got %+v", approver.requests)
+	}
+}
+
+func TestRunAgentContinuationPolicyAllowSkipsApproval(t *testing.T) {
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "fs_list", Arguments: map[string]any{"path": "cmd"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
+				},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 1},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, ContinuationPolicy: "allow"},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if result.Message.Content != "done" {
+		t.Fatalf("unexpected result: %q", result.Message.Content)
+	}
+}
+
+func TestRunAgentContinuationPolicyDenySkipsApproval(t *testing.T) {
+	approver := &fakeApprover{decision: domain.PermissionAllowOnce}
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"manager": {
+					{Message: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "fs_list", Arguments: map[string]any{"path": "cmd"}}}}},
+					{Message: domain.Message{Role: domain.RoleAssistant, Content: "done"}},
+				},
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 1},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2, ContinuationPolicy: "deny", Approver: approver},
+	)
+
+	_, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	if err == nil {
+		t.Fatalf("expected continuation denial to fail")
+	}
+	if len(approver.requests) != 0 {
+		t.Fatalf("expected deny policy to skip approval request, got %+v", approver.requests)
 	}
 }
 
@@ -800,6 +1047,7 @@ func TestToolExecutionDoesNotUseDeadlineContext(t *testing.T) {
 
 func TestRunTurnPlannerReceivesAgentInventory(t *testing.T) {
 	var plannerInstruction string
+	var plannerFormat *domain.ResponseFormat
 	service := New(
 		&fakeModelClient{
 			responses: map[string][]domain.ModelResponse{
@@ -855,6 +1103,7 @@ func TestRunTurnPlannerReceivesAgentInventory(t *testing.T) {
 			inspect: func(request domain.ModelRequest) {
 				if request.Agent.ID == "planner" {
 					plannerInstruction = request.Instructions
+					plannerFormat = request.ResponseFormat
 				}
 			},
 		},
@@ -878,6 +1127,104 @@ func TestRunTurnPlannerReceivesAgentInventory(t *testing.T) {
 	}
 	if !strings.Contains(plannerInstruction, "repo-analyst") {
 		t.Fatalf("expected planner instruction to mention user-defined agent, got %q", plannerInstruction)
+	}
+	if plannerFormat == nil || plannerFormat.Type != "json_schema" || plannerFormat.Name != "execution_plan" || !plannerFormat.Strict {
+		t.Fatalf("expected planner structured output format, got %+v", plannerFormat)
+	}
+}
+
+func TestRunTurnFinalizerUsesStructuredResponse(t *testing.T) {
+	var finalizerFormat *domain.ResponseFormat
+	service := New(
+		&fakeModelClient{
+			responses: map[string][]domain.ModelResponse{
+				"planner": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "version": "v1",
+  "mode": "full",
+  "task_kind": "mutate",
+  "summary": "Use coder and finalizer.",
+  "plan": null,
+  "preparation": [],
+  "primary": {
+    "agent_id": "coder",
+    "reason": "Make the change."
+  },
+  "verify": [],
+  "recovery": null,
+  "finalize": {
+    "agent_id": "manager",
+    "reason": "Summarize the result."
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Execute primary task",
+      "phase": "execute",
+      "agent_id": "coder"
+    },
+    {
+      "id": "step-2",
+      "title": "Summarize the completed work",
+      "phase": "finalize",
+      "agent_id": "manager"
+    }
+  ],
+  "required_capabilities": [],
+  "source": "planner",
+  "fallback_reason": ""
+}`},
+				}},
+				"coder": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: "implementation complete"},
+				}},
+				"manager": {{
+					Message: domain.Message{Role: domain.RoleAssistant, Content: `{
+  "response": "Implemented the requested change.",
+  "summary": "Change completed.",
+  "verification_summary": "Verification was not run.",
+  "remaining_risks": ["tests not run"],
+  "next_steps": ["run go test ./..."]
+}`},
+				}},
+			},
+			inspect: func(request domain.ModelRequest) {
+				if request.Agent.ID == "manager" && request.Phase == domain.RunPhaseFinalize {
+					finalizerFormat = request.ResponseFormat
+				}
+			},
+		},
+		&fakeToolExecutor{},
+		fakeCatalog{agents: map[string]domain.AgentSpec{
+			"manager": {ID: "manager", Mode: domain.AgentModeManager, MaxTurns: 4},
+			"planner": {ID: "planner", Mode: domain.AgentModeTool, ReadOnly: true, MaxTurns: 4},
+			"coder":   {ID: "coder", Mode: domain.AgentModeHandoff, MaxTurns: 4},
+		}},
+		Config{MaxParallelAgents: 1, MaxHandoffDepth: 2},
+	)
+
+	result, err := service.RunTurn(context.Background(), domain.TurnRequest{
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "make a small change"}},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+	if finalizerFormat == nil || finalizerFormat.Type != "json_schema" || finalizerFormat.Name != "final_response" || !finalizerFormat.Strict {
+		t.Fatalf("expected final response format, got %+v", finalizerFormat)
+	}
+	if result.Message.Content != "Implemented the requested change." {
+		t.Fatalf("expected normalized final response content, got %q", result.Message.Content)
+	}
+	finalArtifact := result.Run.Artifacts[len(result.Run.Artifacts)-1]
+	var payload domain.FinalResponseArtifactPayload
+	if err := json.Unmarshal(finalArtifact.Payload, &payload); err != nil {
+		t.Fatalf("expected final response payload: %v", err)
+	}
+	if len(payload.RemainingRisks) != 1 || payload.RemainingRisks[0] != "tests not run" {
+		t.Fatalf("expected structured remaining risks, got %+v", payload)
+	}
+	if len(payload.NextSteps) != 1 || payload.NextSteps[0] != "run go test ./..." {
+		t.Fatalf("expected structured next steps, got %+v", payload)
 	}
 }
 
@@ -1506,6 +1853,57 @@ func TestRunTurnSuppressesDuplicateToolCalls(t *testing.T) {
 	}
 }
 
+func TestDescribeToolRuntimeNormalizesIdentityDefaults(t *testing.T) {
+	service := &Service{}
+	def := domain.ToolDefinition{
+		Name: "fs_list",
+		Semantics: domain.ToolSemantics{
+			Class:           domain.ToolClassObserve,
+			ReusePolicy:     domain.ToolReuseOnSuccess,
+			DuplicatePolicy: domain.ToolDuplicateSuppressSemantic,
+			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
+			SideEffectClass: domain.SideEffectNone,
+			Source:          "fs",
+			ReadPathArgs:    []string{"path"},
+			IdentityArgs:    []string{"path", "depth", "include_hidden", "limit_entries"},
+			IdentityDefaults: map[string]any{
+				"depth":          0,
+				"include_hidden": false,
+				"limit_entries":  80,
+			},
+		},
+	}
+
+	implicit := service.describeToolRuntime(context.Background(), domain.AgentSpec{ID: "manager"}, executableCall{
+		call:       domain.ToolCall{Name: "fs_list", Arguments: map[string]any{"path": "."}},
+		definition: def,
+	})
+	explicit := service.describeToolRuntime(context.Background(), domain.AgentSpec{ID: "manager"}, executableCall{
+		call: domain.ToolCall{Name: "fs_list", Arguments: map[string]any{
+			"path":           ".",
+			"depth":          0,
+			"include_hidden": false,
+			"limit_entries":  80,
+		}},
+		definition: def,
+	})
+	deeper := service.describeToolRuntime(context.Background(), domain.AgentSpec{ID: "manager"}, executableCall{
+		call: domain.ToolCall{Name: "fs_list", Arguments: map[string]any{
+			"path":          ".",
+			"depth":         1,
+			"limit_entries": 80,
+		}},
+		definition: def,
+	})
+
+	if implicit.semanticKey != explicit.semanticKey {
+		t.Fatalf("expected implicit and explicit defaults to share semantic key: %q != %q", implicit.semanticKey, explicit.semanticKey)
+	}
+	if implicit.semanticKey == deeper.semanticKey {
+		t.Fatalf("expected changed depth to change semantic key: %q", implicit.semanticKey)
+	}
+}
+
 func TestRunTurnReusesCachedObservationsAcrossTurns(t *testing.T) {
 	store, err := state.NewFileStore(t.TempDir())
 	if err != nil {
@@ -1640,6 +2038,204 @@ func TestRunVerifyPhaseRunsIndependentReviewersInParallel(t *testing.T) {
 		if strings.HasPrefix(unit.ID, "verify:") && unit.Status != "done" {
 			t.Fatalf("expected verify work unit to be done, got %+v", unit)
 		}
+	}
+}
+
+func TestMutationFingerprintIncludesContentState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(path, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	service := New(nil, nil, nil, Config{})
+	firstStates := service.capturePathStates(context.Background(), []string{path})
+	first := mutationFingerprint([]string{path}, firstStates)
+	if len(firstStates) != 1 || firstStates[0].ContentSHA256 == "" {
+		t.Fatalf("expected content hash in path state, got %+v", firstStates)
+	}
+
+	if err := os.WriteFile(path, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secondStates := service.capturePathStates(context.Background(), []string{path})
+	second := mutationFingerprint([]string{path}, secondStates)
+	if first == second {
+		t.Fatalf("expected fingerprint to change when same-size content changes: %s", first)
+	}
+}
+
+func TestExecuteToolCallEmitsMutationFingerprint(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.txt")
+
+	service := New(
+		nil,
+		&fakeToolExecutor{
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+					return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: err.Error()}
+				}
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "ok"}
+			},
+		},
+		nil,
+		Config{RuntimeStore: store},
+	)
+	invocation := domain.AgentInvocation{
+		RunID:     "run-1",
+		RootRunID: "run-1",
+		Agent:     domain.AgentSpec{ID: "coder"},
+		Phase:     domain.RunPhaseExecute,
+	}
+	item := executableCall{
+		call: domain.ToolCall{
+			ID:        "call-1",
+			Name:      "fs_write",
+			Arguments: map[string]any{"path": path, "content": "new", "overwrite": true},
+		},
+		definition: domain.ToolDefinition{
+			Name:             "fs_write",
+			MutatesWorkspace: true,
+			Semantics: domain.ToolSemantics{
+				Class:           domain.ToolClassMutate,
+				ReusePolicy:     domain.ToolReuseNever,
+				DuplicatePolicy: domain.ToolDuplicateAllow,
+				Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+				SideEffectClass: domain.SideEffectWorkspace,
+				Source:          "fs",
+				WritePathArgs:   []string{"path"},
+			},
+		},
+	}
+
+	_, events := service.executeToolCall(context.Background(), invocation, item)
+	if len(events) != 1 {
+		t.Fatalf("expected one event, got %+v", events)
+	}
+	fingerprint, _ := events[0].Metrics["mutation_fingerprint"].(string)
+	if fingerprint == "" {
+		t.Fatalf("expected mutation fingerprint in event metrics, got %+v", events[0].Metrics)
+	}
+	mutations, err := store.ListMutations(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 1 || mutations[0].MutationFingerprint != fingerprint {
+		t.Fatalf("expected stored mutation fingerprint %q, got %+v", fingerprint, mutations)
+	}
+}
+
+func TestExecuteToolCallAnnotatesCallWithRunContext(t *testing.T) {
+	var seen domain.ToolCall
+	service := New(
+		nil,
+		&fakeToolExecutor{
+			exec: func(_ context.Context, _ domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+				seen = call
+				return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: "ok"}
+			},
+		},
+		nil,
+		Config{},
+	)
+	invocation := domain.AgentInvocation{
+		RunID:     "run-1",
+		RootRunID: "root-1",
+		Agent:     domain.AgentSpec{ID: "coder"},
+		Phase:     domain.RunPhaseExecute,
+		Attempt:   3,
+	}
+
+	service.executeToolCall(context.Background(), invocation, executableCall{
+		call: domain.ToolCall{ID: "call-1", Name: "fs_stat", Arguments: map[string]any{"path": "/tmp/a.txt"}},
+		definition: domain.ToolDefinition{
+			Name: "fs_stat",
+			Semantics: domain.ToolSemantics{
+				Class:           domain.ToolClassObserve,
+				ReusePolicy:     domain.ToolReuseNever,
+				DuplicatePolicy: domain.ToolDuplicateAllow,
+				Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessNone},
+				SideEffectClass: domain.SideEffectNone,
+			},
+		},
+	})
+
+	if seen.RunID != "run-1" || seen.RootRunID != "root-1" || seen.Phase != domain.RunPhaseExecute || seen.Attempt != 3 {
+		t.Fatalf("expected call runtime context, got %+v", seen)
+	}
+}
+
+func TestNewEventSeparatesRawDetailAndDisplay(t *testing.T) {
+	service := New(nil, nil, nil, Config{})
+	event := service.newEvent("run-1", "", "coder", "tool_failed", domain.RunPhaseExecute, 1, "failed", "first line\nsecond line", "", nil, 3)
+
+	if event.Detail != "first line\nsecond line" {
+		t.Fatalf("expected raw detail to remain intact, got %q", event.Detail)
+	}
+	if event.Display != "first line (+1 lines)" {
+		t.Fatalf("expected compact display detail, got %q", event.Display)
+	}
+}
+
+func TestBuildPermissionAuditArtifactFromScratch(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := domain.PermissionDecisionRecord{
+		RunID:        "run-1",
+		RootRunID:    "root-1",
+		Phase:        domain.RunPhaseExecute,
+		AgentID:      "coder",
+		ToolName:     "fs_write",
+		Operation:    "ファイル書き込み",
+		Resource:     "/tmp/a.txt",
+		Action:       "write",
+		ResourceKind: "file",
+		Risk:         "high",
+		Scope:        "/tmp/a.txt",
+		PreviewKind:  "diff",
+		PreviewLines: 3,
+		ChangeFiles:  1,
+		Additions:    1,
+		Deletions:    1,
+		Decision:     domain.PermissionAllowOnce,
+		CreatedAt:    time.Now(),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveScratch(context.Background(), domain.ScratchRecord{
+		ID:        "permission-1",
+		Kind:      "permission_decision",
+		SessionID: "root-1",
+		Payload:   payload,
+		CreatedAt: record.CreatedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(nil, nil, nil, Config{RuntimeStore: store})
+	run := &domain.RunState{ID: "run-1", RootRunID: "root-1"}
+
+	artifact := service.buildPermissionAuditArtifact(context.Background(), run, domain.RunPhaseFinalize)
+	if artifact.ID == "" || artifact.Kind != "permission_audit" {
+		t.Fatalf("expected permission audit artifact, got %+v", artifact)
+	}
+	var auditPayload domain.PermissionAuditArtifactPayload
+	if err := json.Unmarshal(artifact.Payload, &auditPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(auditPayload.Records) != 1 || auditPayload.Records[0].Decision != domain.PermissionAllowOnce || auditPayload.Records[0].ChangeFiles != 1 || auditPayload.Records[0].Additions != 1 || auditPayload.Records[0].Deletions != 1 {
+		t.Fatalf("unexpected audit payload: %+v", auditPayload)
+	}
+	if !strings.Contains(artifact.Text, "fs_write") || !strings.Contains(artifact.Text, "/tmp/a.txt") || !strings.Contains(artifact.Text, "changes=files=1 +1 -1") {
+		t.Fatalf("expected readable audit content, got %q", artifact.Text)
 	}
 }
 
