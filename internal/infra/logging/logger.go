@@ -48,6 +48,7 @@ func (l *Logger) Append(_ context.Context, event domain.ExecutionEvent) error {
 		"attempt":       event.Attempt,
 		"status":        event.Status,
 		"detail":        event.Detail,
+		"display":       event.Display,
 		"artifact_ref":  event.ArtifactRef,
 		"metrics":       event.Metrics,
 		"context_count": event.ContextCount,

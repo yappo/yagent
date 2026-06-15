@@ -3,6 +3,7 @@ package contextengine
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +165,204 @@ func TestBuildScopesArtifactsAndObservationsByRole(t *testing.T) {
 	}
 	if !foundFinal {
 		t.Fatalf("finalizer packet should include final response artifacts: %+v", finalizer.Artifacts)
+	}
+}
+
+func TestBuildRanksArtifactsAndObservationsByRelevance(t *testing.T) {
+	now := time.Now()
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        8,
+		MaxArtifacts:             8,
+		MaxRelevantFiles:         8,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, stubMemoryStore{memory: &domain.RepoMemory{
+		ReusableObservations: []domain.ObservationSummary{
+			{ObservationID: "obs-unrelated", ToolName: "fs_read", Summary: "package cache notes", UpdatedAt: now},
+			{ObservationID: "obs-readme", ToolName: "fs_read", Summary: "README.md documents permission audit export", UpdatedAt: now.Add(-time.Hour)},
+		},
+	}}, nil, 8)
+
+	run := &domain.RunState{
+		UserGoal: "Update README.md for audit export.",
+		Artifacts: []domain.RunArtifact{
+			{ID: "a-unrelated", Name: "Cache notes", Kind: "evidence_bundle", Summary: "package cache", CreatedAt: now},
+			{ID: "a-readme", Name: "README audit evidence", Kind: "evidence_bundle", Summary: "README.md audit export details", CreatedAt: now.Add(-time.Hour)},
+		},
+	}
+
+	ctx := engine.Build(run, domain.AgentSpec{ID: "coder"}, domain.RunPhaseExecute, []domain.Message{{Role: domain.RoleUser, Content: "Please update README.md audit docs"}}, nil)
+	if len(ctx.Artifacts) < 2 || ctx.Artifacts[0].ID != "a-readme" {
+		t.Fatalf("expected README artifact first, got %+v", ctx.Artifacts)
+	}
+	if len(ctx.Observations) < 2 || ctx.Observations[0].ID != "obs-readme" {
+		t.Fatalf("expected README observation first, got %+v", ctx.Observations)
+	}
+}
+
+func TestBuildRanksObservationsByReadSetPathMatch(t *testing.T) {
+	now := time.Now()
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        8,
+		MaxArtifacts:             8,
+		MaxRelevantFiles:         8,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, stubMemoryStore{memory: &domain.RepoMemory{
+		ReusableObservations: []domain.ObservationSummary{
+			{ObservationID: "obs-same-dir", ToolName: "fs_read", Summary: "permission card model notes", ReadSet: []string{"internal/tui/permissions.go"}, UpdatedAt: now},
+			{ObservationID: "obs-exact", ToolName: "fs_read", Summary: "older permission card notes", ReadSet: []string{"internal/tui/model.go"}, UpdatedAt: now.Add(-time.Hour)},
+		},
+	}}, nil, 8)
+	run := &domain.RunState{UserGoal: "Fix permission card in internal/tui/model.go"}
+
+	ctx := engine.Build(run, domain.AgentSpec{ID: "coder"}, domain.RunPhaseExecute, []domain.Message{{Role: domain.RoleUser, Content: "Please inspect internal/tui/model.go"}}, nil)
+	if len(ctx.Observations) < 2 || ctx.Observations[0].ID != "obs-exact" {
+		t.Fatalf("expected exact read-set path observation first, got %+v", ctx.Observations)
+	}
+}
+
+func TestBuildRanksTesterTaskObservationsAheadOfEquivalentFileNotes(t *testing.T) {
+	now := time.Now()
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        8,
+		MaxArtifacts:             8,
+		MaxRelevantFiles:         8,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, stubMemoryStore{memory: &domain.RepoMemory{
+		ReusableObservations: []domain.ObservationSummary{
+			{ObservationID: "obs-file", ToolName: "fs_read", Summary: "verify regression", UpdatedAt: now},
+			{ObservationID: "obs-task", ToolName: "task_run", Summary: "verify regression", UpdatedAt: now.Add(-time.Hour)},
+		},
+	}}, nil, 8)
+	run := &domain.RunState{UserGoal: "Verify regression status"}
+
+	ctx := engine.Build(run, domain.AgentSpec{ID: "tester"}, domain.RunPhaseVerify, []domain.Message{{Role: domain.RoleUser, Content: "verify regression"}}, nil)
+	if len(ctx.Observations) < 2 || ctx.Observations[0].ID != "obs-task" {
+		t.Fatalf("expected tester packet to prefer task observation, got %+v", ctx.Observations)
+	}
+}
+
+func TestBuildUsesFreshRuntimeObservations(t *testing.T) {
+	store, err := state.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore returned error: %v", err)
+	}
+	snapshot := &domain.WorkspaceSnapshot{
+		Revision: 1,
+		Paths: map[string]domain.WorkspacePathState{
+			"README.md": {
+				Path:          "README.md",
+				Exists:        true,
+				Size:          10,
+				ModTimeUnix:   100,
+				ContentSHA256: "fresh",
+			},
+			"old.txt": {
+				Path:        "old.txt",
+				Exists:      true,
+				Size:        20,
+				ModTimeUnix: 200,
+			},
+		},
+		UpdatedAt: time.Now(),
+	}
+	if err := store.SaveWorkspaceSnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("SaveWorkspaceSnapshot returned error: %v", err)
+	}
+	if err := store.SaveObservation(context.Background(), domain.ObservationRecord{
+		ID:         "obs-fresh",
+		ToolName:   "fs_read",
+		Summary:    "README.md fresh observation",
+		ReadSet:    []string{"README.md"},
+		PathStates: []domain.WorkspacePathState{snapshot.Paths["README.md"]},
+		Reusable:   true,
+	}); err != nil {
+		t.Fatalf("SaveObservation fresh returned error: %v", err)
+	}
+	staleState := snapshot.Paths["old.txt"]
+	staleState.Size = 999
+	if err := store.SaveObservation(context.Background(), domain.ObservationRecord{
+		ID:         "obs-stale",
+		ToolName:   "fs_read",
+		Summary:    "old.txt stale observation",
+		ReadSet:    []string{"old.txt"},
+		PathStates: []domain.WorkspacePathState{staleState},
+		Reusable:   true,
+	}); err != nil {
+		t.Fatalf("SaveObservation stale returned error: %v", err)
+	}
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        4,
+		MaxArtifacts:             4,
+		MaxRelevantFiles:         4,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, store, store, 8)
+
+	ctx := engine.Build(&domain.RunState{ID: "run-1", RootRunID: "run-1", UserGoal: "Update README.md"}, domain.AgentSpec{ID: "coder"}, domain.RunPhaseExecute, []domain.Message{{Role: domain.RoleUser, Content: "check README.md and old.txt"}}, nil)
+	if len(ctx.Observations) != 1 || ctx.Observations[0].ID != "obs-fresh" {
+		t.Fatalf("expected only fresh runtime observation, got %+v", ctx.Observations)
+	}
+	if len(ctx.Observations[0].ReadSet) != 1 || ctx.Observations[0].ReadSet[0] != "README.md" {
+		t.Fatalf("expected read set on fresh observation, got %+v", ctx.Observations[0])
+	}
+}
+
+func TestBuildAppliesAgentPacketBudget(t *testing.T) {
+	now := time.Now()
+	engine := New(config.ContextConfig{
+		MaxRecentMessages:        8,
+		MaxArtifacts:             8,
+		MaxRelevantFiles:         8,
+		CompactAfterTurns:        99,
+		CompactAfterToolCalls:    99,
+		CompactAfterEstTokens:    99999,
+		CompactAfterVerifyCycles: 99,
+	}, stubMemoryStore{memory: &domain.RepoMemory{
+		StableFacts: []domain.WorkspaceFact{
+			{ID: "fact-1", Summary: strings.Repeat("stable fact ", 20)},
+			{ID: "fact-2", Summary: strings.Repeat("secondary fact ", 20)},
+		},
+		ReusableObservations: []domain.ObservationSummary{
+			{ObservationID: "obs-1", ToolName: "fs_read", Summary: strings.Repeat("README observation ", 20), UpdatedAt: now},
+			{ObservationID: "obs-2", ToolName: "fs_read", Summary: strings.Repeat("audit observation ", 20), UpdatedAt: now.Add(-time.Minute)},
+		},
+	}}, nil, 8)
+	run := &domain.RunState{
+		UserGoal: "Update README audit docs.",
+		Artifacts: []domain.RunArtifact{
+			{ID: "a1", Name: strings.Repeat("README audit artifact ", 15), Kind: "evidence_bundle", Summary: "README", CreatedAt: now},
+			{ID: "a2", Name: strings.Repeat("secondary audit artifact ", 15), Kind: "evidence_bundle", Summary: "audit", CreatedAt: now.Add(-time.Minute)},
+		},
+	}
+	messages := []domain.Message{
+		{Role: domain.RoleUser, Content: strings.Repeat("message one README audit ", 40)},
+		{Role: domain.RoleAssistant, Content: strings.Repeat("message two README audit ", 40)},
+		{Role: domain.RoleUser, Content: strings.Repeat("message three README audit ", 40)},
+	}
+
+	ctx := engine.Build(run, domain.AgentSpec{ID: "coder", TokenBudget: 180}, domain.RunPhaseExecute, messages, nil)
+	if ctx.PacketBudgetTokens != 180 {
+		t.Fatalf("expected packet budget to be recorded, got %+v", ctx)
+	}
+	if ctx.PacketEstimatedTokens > ctx.PacketBudgetTokens {
+		t.Fatalf("expected packet estimate <= budget, got estimate=%d budget=%d", ctx.PacketEstimatedTokens, ctx.PacketBudgetTokens)
+	}
+	if len(ctx.RecentMessages) >= len(messages) {
+		t.Fatalf("expected recent messages to be trimmed by budget, got %d", len(ctx.RecentMessages))
+	}
+	if len(ctx.Artifacts) >= len(run.Artifacts) && len(ctx.Observations) >= 2 && len(ctx.StableFacts) >= 2 {
+		t.Fatalf("expected optional context to be trimmed by budget, got artifacts=%+v observations=%+v facts=%+v", ctx.Artifacts, ctx.Observations, ctx.StableFacts)
 	}
 }
 

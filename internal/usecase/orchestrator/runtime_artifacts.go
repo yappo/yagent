@@ -172,6 +172,44 @@ func (s *Service) buildChangeSetArtifact(ctx context.Context, run *domain.RunSta
 	})
 }
 
+func (s *Service) buildPermissionAuditArtifact(ctx context.Context, run *domain.RunState, phase domain.RunPhase) domain.RunArtifact {
+	if run == nil || s.config.RuntimeStore == nil {
+		return domain.RunArtifact{}
+	}
+	items, err := s.config.RuntimeStore.ListScratch(ctx, 512)
+	if err != nil {
+		return domain.RunArtifact{}
+	}
+	sessionID := fallbackString(run.RootRunID, run.ID)
+	records := make([]domain.PermissionDecisionRecord, 0)
+	for _, item := range items {
+		if item.Kind != "permission_decision" || item.SessionID != sessionID {
+			continue
+		}
+		var record domain.PermissionDecisionRecord
+		if err := json.Unmarshal(item.Payload, &record); err != nil {
+			continue
+		}
+		records = append(records, record)
+	}
+	if len(records) == 0 {
+		return domain.RunArtifact{}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].CreatedAt.Before(records[j].CreatedAt)
+	})
+	return newPermissionAuditArtifact(run, phase, domain.PermissionAuditArtifactPayload{
+		SessionID: sessionID,
+		Records:   records,
+	})
+}
+
+func (s *Service) appendPermissionAuditArtifact(ctx context.Context, run *domain.RunState, phase domain.RunPhase) {
+	if artifact := s.buildPermissionAuditArtifact(ctx, run, phase); artifact.ID != "" {
+		run.Artifacts = append(run.Artifacts, artifact)
+	}
+}
+
 func (s *Service) buildTestReportArtifact(run *domain.RunState, phase domain.RunPhase, attempt int, status string, results []domain.VerificationResult) domain.RunArtifact {
 	if run == nil || len(results) == 0 {
 		return domain.RunArtifact{}

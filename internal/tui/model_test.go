@@ -99,6 +99,23 @@ type stubMemoryStore struct {
 	memory *domain.RepoMemory
 }
 
+type stubRunStore struct {
+	runs   map[string]*domain.RunState
+	latest string
+}
+
+func (s stubRunStore) SaveRun(context.Context, *domain.RunState) error {
+	return nil
+}
+
+func (s stubRunStore) LoadRun(_ context.Context, id string) (*domain.RunState, error) {
+	return s.runs[id], nil
+}
+
+func (s stubRunStore) LoadLatestRun(ctx context.Context) (*domain.RunState, error) {
+	return s.LoadRun(ctx, s.latest)
+}
+
 func (s stubMemoryStore) LoadMemory(context.Context) (*domain.RepoMemory, error) {
 	if s.memory == nil {
 		return &domain.RepoMemory{}, nil
@@ -205,6 +222,229 @@ func TestPermissionRequestsQueueInsteadOfOverwriting(t *testing.T) {
 	}
 }
 
+func TestPermissionRequestsAggregateMatchingActiveRequest(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+	request := domain.PermissionRequest{
+		ToolName:     "fs_read",
+		Operation:    "ファイル読み取り",
+		Resource:     "/tmp/a.txt",
+		Action:       "read",
+		ResourceKind: "file",
+		Risk:         "medium",
+		Scope:        "/tmp/a.txt",
+		SideEffects:  []string{"llm_disclosure"},
+		AgentID:      "coder",
+	}
+	secondRequest := request
+	secondRequest.AgentID = "reviewer"
+
+	modelValue, _ := m.Update(permissionRequestMsg{request: request, response: first})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{request: secondRequest, response: second})
+	next = modelValue.(model)
+
+	if next.permission == nil || next.permission.batchSize() != 2 || len(next.permissionQueue) != 0 {
+		t.Fatalf("expected matching permission to aggregate into active state, active=%+v queue=%+v", next.permission, next.permissionQueue)
+	}
+	if next.pendingApprovalCount() != 2 {
+		t.Fatalf("expected pending count to include aggregated request, got %d", next.pendingApprovalCount())
+	}
+	card := next.renderPermissionCard()
+	for _, want := range []string{"same-kind requests: 2", "resources: /tmp/a.txt", "requesters: coder (subagent), reviewer (subagent)"} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("expected %q in permission card, got %q", want, card)
+		}
+	}
+
+	next.resolvePermission(domain.PermissionAllowOnce)
+	if next.permission != nil || len(next.permissionQueue) != 0 {
+		t.Fatalf("expected aggregated permission to resolve completely, active=%+v queue=%+v", next.permission, next.permissionQueue)
+	}
+	if got := <-first; got != domain.PermissionAllowOnce {
+		t.Fatalf("expected first allow once decision, got %s", got)
+	}
+	if got := <-second; got != domain.PermissionAllowOnce {
+		t.Fatalf("expected second allow once decision, got %s", got)
+	}
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "同種許可 (2件)") || !strings.Contains(output, "同種 request 2件") {
+		t.Fatalf("expected grouped resolution in chat log, got %q", output)
+	}
+}
+
+func TestPermissionRequestsAggregateMatchingQueuedRequest(t *testing.T) {
+	m := newTestModel(t)
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+	third := make(chan domain.PermissionDecision, 1)
+	activeRequest := domain.PermissionRequest{
+		ToolName:     "task_run",
+		Operation:    "task 実行",
+		Resource:     "go:test",
+		Action:       "execute",
+		ResourceKind: "task",
+		Risk:         "high",
+		Scope:        "go:test",
+	}
+	queuedRequest := domain.PermissionRequest{
+		ToolName:     "fs_read",
+		Operation:    "ファイル読み取り",
+		Resource:     "/tmp/a.txt",
+		Action:       "read",
+		ResourceKind: "file",
+		Risk:         "medium",
+		Scope:        "/tmp/a.txt",
+		SideEffects:  []string{"llm_disclosure"},
+	}
+
+	modelValue, _ := m.Update(permissionRequestMsg{request: activeRequest, response: first})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{request: queuedRequest, response: second})
+	next = modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{request: queuedRequest, response: third})
+	next = modelValue.(model)
+
+	if len(next.permissionQueue) != 1 || next.permissionQueue[0].batchSize() != 2 {
+		t.Fatalf("expected matching queued permissions to aggregate, queue=%+v", next.permissionQueue)
+	}
+	if next.queuedPermissionCount() != 2 || next.pendingApprovalCount() != 3 {
+		t.Fatalf("unexpected pending counts: queue=%d total=%d", next.queuedPermissionCount(), next.pendingApprovalCount())
+	}
+	if approvals := strings.Join(next.listApprovals(), "\n"); !strings.Contains(approvals, "same_kind=2") {
+		t.Fatalf("expected grouped queued approval in list, got %q", approvals)
+	}
+
+	next.resolvePermission(domain.PermissionDeny)
+	if got := <-first; got != domain.PermissionDeny {
+		t.Fatalf("expected active deny decision, got %s", got)
+	}
+	if next.permission == nil || next.permission.batchSize() != 2 {
+		t.Fatalf("expected queued group to become active, got %+v", next.permission)
+	}
+	next.resolvePermission(domain.PermissionAllowOnce)
+	if got := <-second; got != domain.PermissionAllowOnce {
+		t.Fatalf("expected second allow once decision, got %s", got)
+	}
+	if got := <-third; got != domain.PermissionAllowOnce {
+		t.Fatalf("expected third allow once decision, got %s", got)
+	}
+}
+
+func TestSessionPermissionApprovalAutoApprovesQueuedMatchingRequests(t *testing.T) {
+	m := newTestModel(t)
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+	request := domain.PermissionRequest{
+		ToolName:     "fs_read",
+		Operation:    "ファイル読み取り",
+		Resource:     "/tmp/a.txt",
+		Action:       "read",
+		ResourceKind: "file",
+		Risk:         "medium",
+		Scope:        "/tmp/a.txt",
+	}
+
+	modelValue, _ := m.Update(permissionRequestMsg{request: request, response: first})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{request: request, response: second})
+	next = modelValue.(model)
+
+	next.resolvePermission(domain.PermissionAllowSession)
+
+	if next.permission != nil || len(next.permissionQueue) != 0 {
+		t.Fatalf("expected queued matching permission to auto-resolve, got active=%+v queue=%+v", next.permission, next.permissionQueue)
+	}
+	if got := <-first; got != domain.PermissionAllowSession {
+		t.Fatalf("expected first allow session decision, got %s", got)
+	}
+	if got := <-second; got != domain.PermissionAllowSession {
+		t.Fatalf("expected second allow session decision, got %s", got)
+	}
+}
+
+func TestPermissionCtrlABatchAllowsActiveAndQueuedRequests(t *testing.T) {
+	m := newTestModel(t)
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+
+	modelValue, _ := m.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:  "fs_write",
+			Operation: "ファイル書き込み",
+			Resource:  "/tmp/one",
+		},
+		response: first,
+	})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:  "patch_apply",
+			Operation: "patch 適用",
+			Resource:  "/tmp/two",
+		},
+		response: second,
+	})
+	next = modelValue.(model)
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl})
+	next = modelValue.(model)
+
+	if next.permission != nil || len(next.permissionQueue) != 0 {
+		t.Fatalf("expected all permissions resolved, got active=%+v queue=%+v", next.permission, next.permissionQueue)
+	}
+	if got := <-first; got != domain.PermissionAllowOnce {
+		t.Fatalf("expected first allow once decision, got %s", got)
+	}
+	if got := <-second; got != domain.PermissionAllowOnce {
+		t.Fatalf("expected second allow once decision, got %s", got)
+	}
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "一括許可 (2件)") {
+		t.Fatalf("expected batch label in chat log, got %q", output)
+	}
+}
+
+func TestPermissionCtrlDBatchDeniesActiveAndQueuedRequests(t *testing.T) {
+	m := newTestModel(t)
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+
+	modelValue, _ := m.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:  "task_run",
+			Operation: "task 実行",
+			Resource:  "go:test",
+		},
+		response: first,
+	})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:  "fs_write",
+			Operation: "ファイル書き込み",
+			Resource:  "/tmp/two",
+		},
+		response: second,
+	})
+	next = modelValue.(model)
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	next = modelValue.(model)
+
+	if next.permission != nil || len(next.permissionQueue) != 0 {
+		t.Fatalf("expected all permissions resolved, got active=%+v queue=%+v", next.permission, next.permissionQueue)
+	}
+	if got := <-first; got != domain.PermissionDeny {
+		t.Fatalf("expected first deny decision, got %s", got)
+	}
+	if got := <-second; got != domain.PermissionDeny {
+		t.Fatalf("expected second deny decision, got %s", got)
+	}
+}
+
 func TestPermissionCardShowsRequester(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 100
@@ -221,6 +461,32 @@ func TestPermissionCardShowsRequester(t *testing.T) {
 	card := m.renderPermissionCard()
 	if !strings.Contains(card, "requester: researcher (subagent)") {
 		t.Fatalf("expected requester in permission card, got %q", card)
+	}
+}
+
+func TestPermissionCardShowsPreview(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 100
+	m.permission = &permissionState{
+		request: domain.PermissionRequest{
+			ToolName:    "fs_write",
+			Operation:   "ファイル書き込み",
+			Resource:    "/tmp/a.txt",
+			PreviewKind: "diff",
+			Preview:     "/tmp/a.txt\n- old\n+ new",
+			ChangeFiles: 1,
+			Additions:   1,
+			Deletions:   1,
+		},
+		response: make(chan domain.PermissionDecision, 1),
+	}
+
+	card := m.renderPermissionCard()
+	if !strings.Contains(card, "diff:") || !strings.Contains(card, "- old") || !strings.Contains(card, "+ new") {
+		t.Fatalf("expected preview in permission card, got %q", card)
+	}
+	if !strings.Contains(card, "changes: files=1 +1 -1") {
+		t.Fatalf("expected change stats in permission card, got %q", card)
 	}
 }
 
@@ -312,12 +578,63 @@ func TestToolEventShowsActiveToolCard(t *testing.T) {
 	}})
 
 	next := modelValue.(model)
-	if next.activeTool == nil {
+	if !next.hasActiveTools() {
 		t.Fatalf("active tool was not set")
 	}
 	card := next.renderToolCard()
 	if !strings.Contains(card, "fs_read") || !strings.Contains(card, "/tmp/a.txt") || !strings.Contains(card, "limit_bytes=100") {
 		t.Fatalf("unexpected tool card: %q", card)
+	}
+}
+
+func TestToolEventTracksMultipleActiveTools(t *testing.T) {
+	m := newTestModel(t)
+	modelValue, _ := m.Update(toolEventMsg{event: domain.ToolEvent{
+		Phase: "start",
+		Call: domain.ToolCall{
+			ID:   "call-1",
+			Name: "fs_read",
+			Arguments: map[string]any{
+				"path": "/tmp/a.txt",
+			},
+		},
+	}})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(toolEventMsg{event: domain.ToolEvent{
+		Phase: "start",
+		Call: domain.ToolCall{
+			ID:   "call-2",
+			Name: "task_run",
+			Arguments: map[string]any{
+				"task_id": "go:test",
+			},
+		},
+	}})
+	next = modelValue.(model)
+
+	card := next.renderToolCard()
+	if !strings.Contains(card, "Tool Use (2 active)") || !strings.Contains(card, "fs_read") || !strings.Contains(card, "task_run") {
+		t.Fatalf("expected both active tools in card, got %q", card)
+	}
+
+	modelValue, _ = next.Update(toolEventMsg{event: domain.ToolEvent{
+		Phase: "finish",
+		Call: domain.ToolCall{
+			ID:   "call-1",
+			Name: "fs_read",
+			Arguments: map[string]any{
+				"path": "/tmp/a.txt",
+			},
+		},
+		Result: domain.ToolResult{Name: "fs_read", Success: true, Output: "ok"},
+	}})
+	next = modelValue.(model)
+	card = next.renderToolCard()
+	if strings.Contains(card, "fs_read") || !strings.Contains(card, "task_run") || !strings.Contains(card, "Tool Use (1 active)") {
+		t.Fatalf("expected finished tool to be removed from active card, got %q", card)
+	}
+	if len(next.toolLogs) != 1 || !strings.Contains(next.toolLogs[0].title, "fs_read") {
+		t.Fatalf("expected finished tool log, got %+v", next.toolLogs)
 	}
 }
 
@@ -577,6 +894,38 @@ func TestTabCompletesFirstCommandCandidate(t *testing.T) {
 	}
 }
 
+func TestProfileCompletionCandidates(t *testing.T) {
+	m := newModelWithStoresAndProfiles(stubOrchestrator{}, t.TempDir(), "qwen", nil, nil, nil, nil, nil, nil, []string{"strong", "fast"})
+	m.textarea.SetValue("/profile f")
+
+	candidates := m.activeSlashCompletion().candidates
+	if len(candidates) != 1 || candidates[0].value != "fast" {
+		t.Fatalf("unexpected profile candidates: %+v", candidates)
+	}
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	next := modelValue.(model)
+	if next.textarea.Value() != "/profile fast" {
+		t.Fatalf("expected /profile fast, got %q", next.textarea.Value())
+	}
+}
+
+func TestThemeCompletionCandidates(t *testing.T) {
+	m := newTestModel(t)
+	m.textarea.SetValue("/theme c")
+
+	candidates := m.activeSlashCompletion().candidates
+	if len(candidates) != 1 || candidates[0].value != "contrast" {
+		t.Fatalf("unexpected theme candidates: %+v", candidates)
+	}
+
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	next := modelValue.(model)
+	if next.textarea.Value() != "/theme contrast" {
+		t.Fatalf("expected /theme contrast, got %q", next.textarea.Value())
+	}
+}
+
 func TestTabDoesNothingWithoutCandidate(t *testing.T) {
 	m := newTestModel(t)
 	m.textarea.SetValue("/x")
@@ -748,6 +1097,102 @@ func TestPatternPermissionApprovalAutoApprovesMatchingRequest(t *testing.T) {
 	}
 	if got := <-followup; got != domain.PermissionAllowSession {
 		t.Fatalf("expected automatic session approval, got %s", got)
+	}
+}
+
+func TestPatternPermissionApprovalAutoApprovesQueuedMatchingRequest(t *testing.T) {
+	m := newTestModel(t)
+	first := make(chan domain.PermissionDecision, 1)
+	second := make(chan domain.PermissionDecision, 1)
+
+	modelValue, _ := m.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:     "fs_read",
+			Operation:    "ファイル読み取り",
+			Resource:     "/tmp/example.txt",
+			Action:       "read",
+			ResourceKind: "file",
+			Risk:         "medium",
+		},
+		response: first,
+	})
+	next := modelValue.(model)
+	modelValue, _ = next.Update(permissionRequestMsg{
+		request: domain.PermissionRequest{
+			ToolName:     "fs_read",
+			Operation:    "ファイル読み取り",
+			Resource:     "/tmp/another.txt",
+			Action:       "read",
+			ResourceKind: "file",
+			Risk:         "medium",
+		},
+		response: second,
+	})
+	next = modelValue.(model)
+	next.permission.patternMode = true
+	next.permission.patternInput = "*.txt"
+
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	next = modelValue.(model)
+
+	if next.permission != nil || len(next.permissionQueue) != 0 {
+		t.Fatalf("expected queued pattern permission to auto-resolve, got active=%+v queue=%+v", next.permission, next.permissionQueue)
+	}
+	if got := <-first; got != domain.PermissionAllowSession {
+		t.Fatalf("expected first allow session decision, got %s", got)
+	}
+	if got := <-second; got != domain.PermissionAllowSession {
+		t.Fatalf("expected second allow session decision, got %s", got)
+	}
+}
+
+func TestListApprovalsShowsApprovalScopes(t *testing.T) {
+	m := newTestModel(t)
+	request := domain.PermissionRequest{
+		ToolName:     "fs_write",
+		Operation:    "ファイル書き込み",
+		Resource:     "/tmp/a.txt",
+		Action:       "write",
+		ResourceKind: "file",
+		Scope:        "/tmp/a.txt",
+		Risk:         "high",
+		SideEffects:  []string{"filesystem_write"},
+		AgentID:      "coder",
+	}
+	m.sessionApprovals[approvalKey(request)] = true
+	m.patternApprovals = append(m.patternApprovals, patternApproval{
+		toolName:     "fs_read",
+		action:       "read",
+		resourceKind: "file",
+		risk:         "medium",
+		pattern:      "*.go",
+	})
+	m.permission = &permissionState{request: request, response: make(chan domain.PermissionDecision, 1)}
+	m.permissionQueue = append(m.permissionQueue, permissionState{
+		request: domain.PermissionRequest{
+			ToolName:     "fs_remove",
+			Operation:    "ファイル削除",
+			Resource:     "/tmp/b.txt",
+			Action:       "remove",
+			ResourceKind: "file",
+			Scope:        "/tmp/b.txt",
+			Risk:         "high",
+		},
+		response: make(chan domain.PermissionDecision, 1),
+	})
+
+	rendered := strings.Join(m.listApprovals(), "\n")
+	for _, want := range []string{
+		"session approval: tool=fs_write action=write kind=file scope=/tmp/a.txt risk=high",
+		"pattern approval: tool=fs_read action=read kind=file risk=medium pattern=*.go",
+		"pending approval: ファイル書き込み (/tmp/a.txt)",
+		"requester=coder (subagent)",
+		"effects=filesystem_write",
+		"queued approval 1: ファイル削除 (/tmp/b.txt)",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected %q in approvals list, got %q", want, rendered)
+		}
 	}
 }
 
@@ -1036,6 +1481,217 @@ func TestStatusAndChatShowMetrics(t *testing.T) {
 	}
 }
 
+func TestRunGraphShowsFailureDetail(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 140
+	m.height = 24
+	m.statusViewport.SetWidth(58)
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:        "run-1",
+		AgentID:      "coder",
+		Type:         "tool_failed",
+		Phase:        domain.RunPhaseExecute,
+		Attempt:      2,
+		Status:       "failed",
+		Detail:       "fs_read: permission denied\nfull path: /tmp/secret.txt",
+		ArtifactRef:  "artifact-1",
+		ContextCount: 7,
+		Metrics: map[string]any{
+			"semantic_key": "fs_read:key",
+			"duration_ms":  int64(42),
+		},
+		Timestamp: time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC),
+	})
+
+	rendered := m.renderStatus()
+	for _, want := range []string{
+		"Failure detail",
+		"tool_failed",
+		"agent=coder",
+		"artifact=artifact-1",
+		"ctx=7",
+		"fs_read: permission denied",
+		"full path: /tmp/secret.txt",
+		"duration_ms=42",
+		"semantic_key=fs_read:key",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected %q in failure detail, got %q", want, rendered)
+		}
+	}
+}
+
+func TestRunGraphFailureDetailSelectionKeys(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 140
+	m.height = 24
+	m.statusViewport.SetWidth(58)
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-old",
+		AgentID:   "coder",
+		Type:      "agent_failed",
+		Status:    "failed",
+		Detail:    "old failure",
+		Timestamp: time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC),
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-new",
+		AgentID:   "reviewer",
+		Type:      "tool_failed",
+		Status:    "failed",
+		Detail:    "new failure",
+		Timestamp: time.Date(2026, 6, 13, 12, 1, 0, 0, time.UTC),
+	})
+
+	if !strings.Contains(m.renderStatus(), "new failure") {
+		t.Fatalf("expected newest failure selected, got %q", m.renderStatus())
+	}
+	modelValue, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModCtrl})
+	next := modelValue.(model)
+	if !strings.Contains(next.renderStatus(), "old failure") {
+		t.Fatalf("expected older failure after ctrl+up, got %q", next.renderStatus())
+	}
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: tea.KeyDown, Mod: tea.ModCtrl})
+	next = modelValue.(model)
+	if !strings.Contains(next.renderStatus(), "new failure") {
+		t.Fatalf("expected newer failure after ctrl+down, got %q", next.renderStatus())
+	}
+	modelValue, _ = next.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	next = modelValue.(model)
+	if strings.Contains(next.renderStatus(), "Failure detail") {
+		t.Fatalf("expected failure detail to close on esc, got %q", next.renderStatus())
+	}
+}
+
+func TestFailuresSlashCommandOpensRunGraphDetail(t *testing.T) {
+	m := newTestModel(t)
+	m.activePanel = sidePanelPlan
+	m.status.showFailureDetail = false
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "run-1",
+		AgentID:   "coder",
+		Type:      "agent_failed",
+		Status:    "failed",
+		Detail:    "build failed",
+		Timestamp: time.Now(),
+	})
+	m.status.showFailureDetail = false
+
+	modelValue, _ := handleSlashCommand(m, "/failures")
+	next := modelValue.(model)
+	if next.activePanel != sidePanelRunGraph || !next.status.showFailureDetail {
+		t.Fatalf("expected /failures to open run graph detail, panel=%s show=%t", next.activePanel, next.status.showFailureDetail)
+	}
+	if !strings.Contains(next.renderStatus(), "build failed") {
+		t.Fatalf("expected failure detail in run graph, got %q", next.renderStatus())
+	}
+}
+
+func TestStatusFilterSlashCommandFiltersRunGraph(t *testing.T) {
+	m := newTestModel(t)
+	now := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "root",
+		AgentID:   "manager",
+		Type:      "agent_started",
+		Timestamp: now,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "coder",
+		ParentRunID: "root",
+		AgentID:     "coder",
+		Type:        "agent_started",
+		Detail:      "editing files",
+		Timestamp:   now,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:       "reviewer",
+		ParentRunID: "root",
+		AgentID:     "reviewer",
+		Type:        "agent_started",
+		Detail:      "reviewing patch",
+		Timestamp:   now,
+	})
+
+	modelValue, _ := handleSlashCommand(m, "/status-filter review")
+	next := modelValue.(model)
+	rendered := next.renderStatus()
+	if !strings.Contains(rendered, "Reviewer") || strings.Contains(rendered, "Coder") {
+		t.Fatalf("expected filter to keep reviewer branch only, got %q", rendered)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/status-filter clear")
+	next = modelValue.(model)
+	rendered = next.renderStatus()
+	if !strings.Contains(rendered, "Reviewer") || !strings.Contains(rendered, "Coder") {
+		t.Fatalf("expected filter clear to restore all branches, got %q", rendered)
+	}
+}
+
+func TestStatusFoldSlashCommandHidesCompletedLeafNodes(t *testing.T) {
+	m := newTestModel(t)
+	now := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "done-run",
+		AgentID:   "coder",
+		Type:      "agent_completed",
+		Timestamp: now,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "failed-run",
+		AgentID:   "reviewer",
+		Type:      "agent_failed",
+		Detail:    "tests failed",
+		Timestamp: now,
+	})
+
+	modelValue, _ := handleSlashCommand(m, "/status-fold on")
+	next := modelValue.(model)
+	rendered := next.renderStatus()
+	if strings.Contains(rendered, "Coder") || !strings.Contains(rendered, "Reviewer") {
+		t.Fatalf("expected completed node folded while failed node remains, got %q", rendered)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/status-fold off")
+	next = modelValue.(model)
+	rendered = next.renderStatus()
+	if !strings.Contains(rendered, "Coder") || !strings.Contains(rendered, "Reviewer") {
+		t.Fatalf("expected fold off to restore completed node, got %q", rendered)
+	}
+}
+
+func TestStatusSearchSlashCommandShowsMatchesAndFiltersRecent(t *testing.T) {
+	m := newTestModel(t)
+	m.statusViewport.SetWidth(100)
+	now := time.Now()
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "first",
+		AgentID:   "coder",
+		Type:      "tool_called",
+		Timestamp: now,
+	})
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "second",
+		AgentID:   "tester",
+		Type:      "tool_failed",
+		Detail:    "needle-alpha permission denied",
+		Metrics:   map[string]any{"exit_code": 1},
+		Timestamp: now.Add(time.Second),
+	})
+
+	modelValue, _ := handleSlashCommand(m, "/status-search needle-alpha")
+	next := modelValue.(model)
+	rendered := next.renderStatus()
+	for _, want := range []string{"Search", "needle-alpha permission denied", "matches="} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected %q in status search view, got %q", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "tool  coder") {
+		t.Fatalf("expected search to filter recent events, got %q", rendered)
+	}
+}
+
 func TestWideLayoutGivesStatusPaneMoreWidth(t *testing.T) {
 	chatWidth, statusWidth, stacked := layoutWidths(140)
 	if stacked {
@@ -1303,9 +1959,16 @@ func TestSubmitPromptKeepsManualAtReferenceUnchanged(t *testing.T) {
 	}
 }
 
-func TestSubmitPromptPassesDefaultModelToTurnRequest(t *testing.T) {
+func TestSubmitPromptUsesExplicitModelAndProfileSelection(t *testing.T) {
 	runner := &recordingOrchestrator{}
-	m := newModel(runner, t.TempDir(), "gpt-5", nil, nil, nil, nil)
+	m := newModelWithStoresAndProfiles(runner, t.TempDir(), "Qwen/Qwen3.6-35B-A3B", nil, nil, nil, nil, nil, nil, []string{"strong", "fast"})
+
+	modelValue, _ := handleSlashCommand(m, "/profile strong")
+	m = modelValue.(model)
+	modelValue, _ = handleSlashCommand(m, "/model gpt-5.5")
+	m = modelValue.(model)
+	modelValue, _ = handleSlashCommand(m, "/stream on")
+	m = modelValue.(model)
 
 	modelValue, cmd := submitPrompt(m, "hello")
 	if cmd == nil {
@@ -1324,10 +1987,214 @@ func TestSubmitPromptPassesDefaultModelToTurnRequest(t *testing.T) {
 	if _, ok := batch[0]().(chatMessage); !ok {
 		t.Fatalf("expected first batch command to return chatMessage")
 	}
-	if runner.last.Model != "gpt-5" {
-		t.Fatalf("expected default model to be passed, got %q", runner.last.Model)
+	if runner.last.Model != "gpt-5.5" || runner.last.Profile != "strong" {
+		t.Fatalf("expected selected model/profile, got %+v", runner.last)
+	}
+	if !runner.last.Stream {
+		t.Fatalf("expected streaming flag to be sent")
 	}
 }
+
+func TestSubmitPromptDoesNotSendDefaultModelOverride(t *testing.T) {
+	runner := &recordingOrchestrator{}
+	m := newModel(runner, t.TempDir(), "Qwen/Qwen3.6-35B-A3B", nil, nil, nil, nil)
+
+	_, cmd := submitPrompt(m, "hello")
+	if cmd == nil {
+		t.Fatal("expected command")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok || len(batch) == 0 {
+		t.Fatalf("expected batch command, got %T", msg)
+	}
+	_ = batch[0]()
+	if runner.last.Model != "" || runner.last.Profile != "" {
+		t.Fatalf("expected routing defaults to resolve model/profile, got %+v", runner.last)
+	}
+}
+
+func TestModelAndProfileSlashCommands(t *testing.T) {
+	m := newModelWithStoresAndProfiles(stubOrchestrator{}, t.TempDir(), "qwen", nil, nil, nil, nil, nil, nil, []string{"strong", "fast", "fast"})
+
+	modelValue, _ := handleSlashCommand(m, "/profile")
+	next := modelValue.(model)
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "routing profile: (default)") || !strings.Contains(output, "available: fast, strong") {
+		t.Fatalf("expected profile status and sorted candidates, got %q", output)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/profile fast")
+	next = modelValue.(model)
+	if next.selectedProfile != "fast" {
+		t.Fatalf("expected selected profile fast, got %q", next.selectedProfile)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/profile missing")
+	next = modelValue.(model)
+	if next.selectedProfile != "fast" {
+		t.Fatalf("expected unknown profile to leave selection unchanged, got %q", next.selectedProfile)
+	}
+	output = flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "unknown routing profile: missing") {
+		t.Fatalf("expected unknown profile warning, got %q", output)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/model Qwen/custom")
+	next = modelValue.(model)
+	if next.modelOverride != "Qwen/custom" {
+		t.Fatalf("expected model override, got %q", next.modelOverride)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/model clear")
+	next = modelValue.(model)
+	if next.modelOverride != "" {
+		t.Fatalf("expected model override cleared, got %q", next.modelOverride)
+	}
+}
+
+func TestThemeSlashCommandAndHeader(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 80
+
+	modelValue, _ := handleSlashCommand(m, "/theme")
+	next := modelValue.(model)
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "TUI theme: default") || !strings.Contains(output, "available: default, contrast, mono") {
+		t.Fatalf("expected theme status and candidates, got %q", output)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/theme contrast")
+	next = modelValue.(model)
+	if next.selectedTheme != "contrast" {
+		t.Fatalf("expected contrast theme, got %q", next.selectedTheme)
+	}
+	if header := next.cachedHeaderView(); !strings.Contains(header, "theme=contrast") || !strings.Contains(header, "/theme") {
+		t.Fatalf("expected theme in header, got %q", header)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/theme missing")
+	next = modelValue.(model)
+	if next.selectedTheme != "contrast" {
+		t.Fatalf("expected unknown theme to leave selection unchanged, got %q", next.selectedTheme)
+	}
+	output = flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "unknown TUI theme: missing") {
+		t.Fatalf("expected unknown theme warning, got %q", output)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/theme clear")
+	next = modelValue.(model)
+	if next.selectedTheme != defaultThemeName {
+		t.Fatalf("expected theme reset to default, got %q", next.selectedTheme)
+	}
+}
+
+func TestThemeSwitchInvalidatesRenderedLogCache(t *testing.T) {
+	m := newTestModel(t)
+	m.viewport.SetWidth(40)
+	m.appendChatBlock("## Cached heading")
+	_ = m.renderLog()
+	if len(m.chatBlocks) != 1 || m.chatBlocks[0].rendered == "" {
+		t.Fatal("expected rendered chat block cache")
+	}
+
+	modelValue, _ := handleSlashCommand(m, "/theme mono")
+	next := modelValue.(model)
+	if next.selectedTheme != "mono" {
+		t.Fatalf("expected mono theme, got %q", next.selectedTheme)
+	}
+	if next.chatBlocks[0].rendered != "" || next.chatBlocks[0].cachedWidth != 0 {
+		t.Fatalf("expected existing chat block cache invalidated, got width=%d rendered=%q", next.chatBlocks[0].cachedWidth, next.chatBlocks[0].rendered)
+	}
+	if !next.logDirty || !next.logRender.dirty {
+		t.Fatal("expected log render state to be dirty after theme switch")
+	}
+	if !next.headerCache.dirty || !next.mainPanelsCache.dirty {
+		t.Fatal("expected visible chrome caches to be dirty after theme switch")
+	}
+}
+
+func TestStreamSlashCommandAndDeltaBlock(t *testing.T) {
+	m := newModel(stubOrchestrator{}, t.TempDir(), "qwen", nil, nil, nil, nil)
+
+	modelValue, _ := handleSlashCommand(m, "/stream on")
+	next := modelValue.(model)
+	if !next.streaming {
+		t.Fatal("expected streaming enabled")
+	}
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "streaming: on") {
+		t.Fatalf("expected streaming status, got %q", output)
+	}
+
+	modelValue, _ = next.Update(statusEventMsg{event: domain.ExecutionEvent{Type: "llm_delta", Detail: "hel"}})
+	next = modelValue.(model)
+	modelValue, _ = next.Update(statusEventMsg{event: domain.ExecutionEvent{Type: "llm_delta", Detail: "lo"}})
+	next = modelValue.(model)
+	output = flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "hello") {
+		t.Fatalf("expected streaming content, got %q", output)
+	}
+
+	modelValue, _ = next.Update(chatMessage{content: "hello!"})
+	next = modelValue.(model)
+	output = flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "hello!") || strings.Contains(output, "hello\n") {
+		t.Fatalf("expected final content to replace streaming block, got %q", output)
+	}
+}
+
+func TestResumeSlashCommandLoadsSelectedRun(t *testing.T) {
+	store := stubRunStore{
+		runs: map[string]*domain.RunState{
+			"run-a": {
+				ID:           "run-a",
+				CurrentPhase: domain.RunPhaseExecute,
+				Status:       domain.RunStatusRunning,
+				Attempt:      2,
+				Profile:      "fast",
+				Messages: []domain.Message{
+					{Role: domain.RoleUser, Content: "continue this"},
+				},
+			},
+			"run-b": {
+				ID:           "run-b",
+				CurrentPhase: domain.RunPhaseFinalize,
+				Status:       domain.RunStatusCompleted,
+				Attempt:      1,
+				Messages: []domain.Message{
+					{Role: domain.RoleAssistant, Content: "latest result"},
+				},
+			},
+		},
+		latest: "run-b",
+	}
+	m := newModelWithStoresAndProfiles(stubOrchestrator{}, t.TempDir(), "qwen", nil, nil, nil, nil, store, nil, []string{"fast"})
+
+	modelValue, _ := handleSlashCommand(m, "/resume run-a")
+	next := modelValue.(model)
+	if next.lastRun == nil || next.lastRun.ID != "run-a" {
+		t.Fatalf("expected run-a to be loaded, got %+v", next.lastRun)
+	}
+	if len(next.messages) != 1 || next.messages[0].Content != "continue this" {
+		t.Fatalf("expected run messages to be restored, got %+v", next.messages)
+	}
+	if next.selectedProfile != "fast" {
+		t.Fatalf("expected run profile to be restored, got %q", next.selectedProfile)
+	}
+	output := flattenChatBlocks(next.chatBlocks)
+	if !strings.Contains(output, "Resumed run run-a") || !strings.Contains(output, "phase=execute status=running attempt=2") {
+		t.Fatalf("expected resume summary in output, got %q", output)
+	}
+
+	modelValue, _ = handleSlashCommand(next, "/resume")
+	next = modelValue.(model)
+	if next.lastRun == nil || next.lastRun.ID != "run-b" {
+		t.Fatalf("expected latest run-b to be loaded, got %+v", next.lastRun)
+	}
+}
+
 func TestHandleSlashCommandListsAgents(t *testing.T) {
 	m := newModel(
 		stubOrchestrator{},
@@ -1580,6 +2447,28 @@ func TestApplyStatusEventSummarizesJSONDetail(t *testing.T) {
 	}
 }
 
+func TestApplyStatusEventUsesDisplayWithoutLosingRawFailureDetail(t *testing.T) {
+	m := newTestModel(t)
+	m.statusViewport.SetWidth(100)
+	m.applyStatusEvent(domain.ExecutionEvent{
+		RunID:     "root",
+		AgentID:   "coder",
+		Type:      "tool_failed",
+		Status:    "failed",
+		Detail:    "raw failure line one\nraw failure line two",
+		Display:   "compact failure",
+		Timestamp: time.Now(),
+	})
+
+	if got := m.status.nodes["root"].Detail; got != "compact failure" {
+		t.Fatalf("expected node detail to use display, got %q", got)
+	}
+	rendered := m.renderStatus()
+	if !strings.Contains(rendered, "compact failure") || !strings.Contains(rendered, "raw failure line one") {
+		t.Fatalf("expected compact tree and raw failure detail, got %q", rendered)
+	}
+}
+
 func TestRenderLogReusesCachedBlockWithoutWidthChange(t *testing.T) {
 	m := newTestModel(t)
 	m.viewport.SetWidth(20)
@@ -1613,6 +2502,43 @@ func TestRenderLogRebuildsCacheWhenWidthChanges(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "aaaaa\naaaaa\naa") {
 		t.Fatalf("expected wrapped output after width change, got %q", rendered)
+	}
+}
+
+func TestRenderLogRendersBasicMarkdown(t *testing.T) {
+	m := newTestModel(t)
+	m.viewport.SetWidth(80)
+	m.appendOutputBlock(assistantOutputLabel, strings.Join([]string{
+		"# Result",
+		"- **bold** item",
+		"1) `code` item",
+		"> quoted text",
+	}, "\n"))
+
+	rendered := m.renderLog()
+	for _, want := range []string{
+		"Result",
+		"• bold item",
+		"1. code item",
+		"│ quoted text",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected markdown render to contain %q, got %q", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "# Result") || strings.Contains(rendered, "**bold**") || strings.Contains(rendered, "`code`") {
+		t.Fatalf("expected markdown markers to be rendered away, got %q", rendered)
+	}
+}
+
+func TestRenderLogKeepsCodeFenceContentLiteral(t *testing.T) {
+	m := newTestModel(t)
+	m.viewport.SetWidth(80)
+	m.appendOutputBlock(assistantOutputLabel, "```go\nfmt.Println(`hi`)\n```")
+
+	rendered := m.renderLog()
+	if !strings.Contains(rendered, "code: go") || !strings.Contains(rendered, "fmt.Println(`hi`)") {
+		t.Fatalf("expected code fence label and literal code, got %q", rendered)
 	}
 }
 

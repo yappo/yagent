@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -111,7 +113,9 @@ func (b *MCPBindings) CallTool(ctx context.Context, taskID string, toolName stri
 
 func (b *MCPBindings) storeTools(task domain.TaskDefinition, descriptors []domain.MCPToolDescriptor) {
 	bound := make([]domain.BoundMCPTool, 0, len(descriptors))
+	roots := mcpRuntimeRoots(task)
 	for _, tool := range descriptors {
+		safety := resolveMCPToolSafety(task.MCPServer, tool)
 		bound = append(bound, domain.BoundMCPTool{
 			TaskID:         task.ID,
 			ToolName:       tool.Name,
@@ -119,14 +123,129 @@ func (b *MCPBindings) storeTools(task domain.TaskDefinition, descriptors []domai
 			QualifiedName:  QualifiedToolName(task.ID, prefixForTask(task), tool.Name),
 			Description:    tool.Description,
 			InputSchema:    compactSchema(tool.InputSchema),
-			ReadOnly:       tool.ReadOnly,
-			ParallelSafe:   task.MCPServer.ParallelSafe && tool.ParallelSafe,
+			ReadOnly:       safety.readOnly,
+			ParallelSafe:   safety.parallelSafe,
+			Risk:           safety.risk,
+			AllowNetwork:   safety.allowNetwork,
+			Roots:          append([]string(nil), roots...),
+			TrustBoundary:  safety.trustBoundary,
+			SafetySource:   safety.source,
 		})
 	}
 
 	b.mu.Lock()
 	b.tools[task.ID] = bound
 	b.mu.Unlock()
+}
+
+func mcpRuntimeRoots(task domain.TaskDefinition) []string {
+	if task.MCPServer == nil {
+		return nil
+	}
+	roots := append([]string(nil), task.MCPServer.Roots...)
+	if len(roots) == 0 && task.MCPServer.Cwd != "" {
+		roots = append(roots, task.MCPServer.Cwd)
+	}
+	return compactBindingPaths(roots)
+}
+
+func compactBindingPaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	seen := map[string]struct{}{}
+	for _, item := range paths {
+		item = filepath.Clean(strings.TrimSpace(item))
+		if item == "" || item == "." {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	slices.Sort(out)
+	return out
+}
+
+type mcpToolSafety struct {
+	readOnly      bool
+	parallelSafe  bool
+	risk          string
+	allowNetwork  bool
+	trustBoundary string
+	source        string
+}
+
+func resolveMCPToolSafety(spec *domain.MCPServerSpec, descriptor domain.MCPToolDescriptor) mcpToolSafety {
+	if spec == nil {
+		return mcpToolSafety{risk: "high", trustBoundary: "untrusted", source: "default"}
+	}
+	trustBoundary := spec.Trust
+	if trustBoundary == "" {
+		trustBoundary = "untrusted"
+	}
+	readOnly := false
+	source := "default"
+	switch {
+	case matchesToolPattern(spec.MutatingTools, descriptor.Name):
+		readOnly = false
+		source = "task_mutating_tools"
+	case matchesToolPattern(spec.ReadOnlyTools, descriptor.Name):
+		readOnly = true
+		source = "task_read_only_tools"
+	case spec.TrustToolAnnotations && descriptor.ReadOnly:
+		readOnly = true
+		source = "trusted_mcp_annotations"
+	}
+
+	parallelSafe := false
+	switch {
+	case matchesToolPattern(spec.ParallelSafeTools, descriptor.Name):
+		parallelSafe = true
+	case spec.TrustToolAnnotations && spec.ParallelSafe && descriptor.ParallelSafe:
+		parallelSafe = true
+	}
+
+	risk := spec.Risk
+	if risk == "" {
+		risk = "medium"
+	}
+	if !readOnly {
+		risk = "high"
+	}
+	if spec.AllowNetwork {
+		risk = "high"
+	}
+	return mcpToolSafety{
+		readOnly:      readOnly,
+		parallelSafe:  parallelSafe,
+		risk:          risk,
+		allowNetwork:  spec.AllowNetwork,
+		trustBoundary: trustBoundary,
+		source:        source,
+	}
+}
+
+func matchesToolPattern(patterns []string, toolName string) bool {
+	for _, patternValue := range patterns {
+		patternValue = strings.TrimSpace(patternValue)
+		if patternValue == "" {
+			continue
+		}
+		if patternValue == toolName {
+			return true
+		}
+		if matched, err := path.Match(patternValue, toolName); err == nil && matched {
+			return true
+		}
+		if strings.HasSuffix(patternValue, "*") && strings.HasPrefix(toolName, strings.TrimSuffix(patternValue, "*")) {
+			return true
+		}
+	}
+	return false
 }
 
 func prefixForTask(task domain.TaskDefinition) string {

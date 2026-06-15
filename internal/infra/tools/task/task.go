@@ -191,6 +191,12 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		AllowNetwork      bool     `json:"allow_network"`
 		BindRequired      bool     `json:"bind_required"`
 		Bound             bool     `json:"bound"`
+		Trust             string   `json:"trust,omitempty"`
+		TrustAnnotations  bool     `json:"trust_tool_annotations,omitempty"`
+		Roots             []string `json:"roots,omitempty"`
+		ReadOnlyTools     []string `json:"read_only_tools,omitempty"`
+		MutatingTools     []string `json:"mutating_tools,omitempty"`
+		ParallelSafeTools []string `json:"parallel_safe_tools,omitempty"`
 		UsageHint         string   `json:"usage_hint,omitempty"`
 		BindHint          string   `json:"bind_hint,omitempty"`
 		ExposedToolPrefix string   `json:"exposed_tool_prefix,omitempty"`
@@ -233,6 +239,12 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 				info.Cwd = item.MCPServer.Cwd
 				info.Risk = item.MCPServer.Risk
 				info.AllowNetwork = item.MCPServer.AllowNetwork
+				info.Roots = append([]string(nil), item.MCPServer.Roots...)
+				info.Trust = item.MCPServer.Trust
+				info.TrustAnnotations = item.MCPServer.TrustToolAnnotations
+				info.ReadOnlyTools = append([]string(nil), item.MCPServer.ReadOnlyTools...)
+				info.MutatingTools = append([]string(nil), item.MCPServer.MutatingTools...)
+				info.ParallelSafeTools = append([]string(nil), item.MCPServer.ParallelSafeTools...)
 			}
 		}
 		result = append(result, info)
@@ -243,17 +255,19 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
 	taskID, ok := call.Arguments["task_id"].(string)
 	if !ok || taskID == "" {
-		return failure(call, "task_id パラメータが必要です")
+		return failure(call, "missing_task_id", "task_id パラメータが必要です", nil)
 	}
 	taskDef, ok := t.catalog.Get(ctx, taskID)
 	if !ok {
-		return failure(call, fmt.Sprintf("登録されていない task_id です: %s", taskID))
+		return taskFailure(call, "unknown_task", fmt.Sprintf("登録されていない task_id です: %s", taskID), taskID, nil)
 	}
 	if taskDef.Kind != domain.TaskSpecKindCommand || taskDef.Command == nil {
-		return failure(call, fmt.Sprintf("task_run では command task だけ実行できます: %s", taskID))
+		return taskFailure(call, "invalid_task_kind", fmt.Sprintf("task_run では command task だけ実行できます: %s", taskID), taskID, map[string]any{
+			"kind": string(taskDef.Kind),
+		})
 	}
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
-		return failure(call, err.Error())
+		return taskFailure(call, "authorization_failed", err.Error(), taskID, nil)
 	}
 
 	timeout := time.Duration(taskDef.Command.Timeout) * time.Second
@@ -269,7 +283,9 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return failure(call, fmt.Sprintf("task failed: %v\n%s", err, stderr.String()))
+		return taskFailure(call, "task_failed", "task failed: "+err.Error(), taskID, map[string]any{
+			"stderr": stderr.String(),
+		})
 	}
 	output := stdout.String()
 	if stderr.Len() > 0 {
@@ -289,17 +305,19 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
 	taskID, ok := call.Arguments["task_id"].(string)
 	if !ok || taskID == "" {
-		return failure(call, "task_id パラメータが必要です")
+		return failure(call, "missing_task_id", "task_id パラメータが必要です", nil)
 	}
 	taskDef, ok := t.catalog.Get(ctx, taskID)
 	if !ok {
-		return failure(call, fmt.Sprintf("登録されていない task_id です: %s", taskID))
+		return taskFailure(call, "unknown_task", fmt.Sprintf("登録されていない task_id です: %s", taskID), taskID, nil)
 	}
 	if taskDef.Kind != domain.TaskSpecKindMCPServer {
-		return failure(call, fmt.Sprintf("task_bind では MCP server task だけ bind できます: %s", taskID))
+		return taskFailure(call, "invalid_task_kind", fmt.Sprintf("task_bind では MCP server task だけ bind できます: %s", taskID), taskID, map[string]any{
+			"kind": string(taskDef.Kind),
+		})
 	}
 	if err := authorize(ctx, t.engine, t.approver, call, taskDef); err != nil {
-		return failure(call, err.Error())
+		return taskFailure(call, "authorization_failed", err.Error(), taskID, nil)
 	}
 
 	bindCtx := ctx
@@ -311,7 +329,7 @@ func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 
 	tools, err := t.bindings.Bind(bindCtx, taskDef)
 	if err != nil {
-		return failure(call, err.Error())
+		return taskFailure(call, "bind_failed", err.Error(), taskID, nil)
 	}
 	exposedToolNames := boundToolNamesForTask(t.bindings, taskDef.ID)
 	result := map[string]any{
@@ -334,12 +352,12 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 	if engine == nil || approver == nil {
 		return nil
 	}
-	decision, request, err := engine.Evaluate(ctx, call)
+	policyCall := callWithTaskPolicyMetadata(call, taskDef)
+	decision, request, err := engine.Evaluate(ctx, policyCall)
 	if err != nil {
 		return err
 	}
-	request.AgentID = execctx.AgentID(ctx)
-	request.Purpose = execctx.Purpose(ctx)
+	execctx.FillPermissionRequest(ctx, &request)
 	var (
 		allowNetwork bool
 		command      string
@@ -379,6 +397,27 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 		return fmt.Errorf("ユーザーによってキャンセルされました")
 	}
 	return nil
+}
+
+func callWithTaskPolicyMetadata(call domain.ToolCall, taskDef domain.TaskDefinition) domain.ToolCall {
+	args := make(map[string]any, len(call.Arguments)+2)
+	for key, value := range call.Arguments {
+		args[key] = value
+	}
+	switch taskDef.Kind {
+	case domain.TaskSpecKindCommand:
+		if taskDef.Command != nil {
+			args["_policy_risk"] = taskDef.Command.Risk
+			args["_policy_allow_network"] = taskDef.Command.AllowNetwork
+		}
+	case domain.TaskSpecKindMCPServer:
+		if taskDef.MCPServer != nil {
+			args["_policy_risk"] = taskDef.MCPServer.Risk
+			args["_policy_allow_network"] = taskDef.MCPServer.AllowNetwork
+		}
+	}
+	call.Arguments = args
+	return call
 }
 
 func inferCommandAccess(taskDef domain.TaskDefinition) ([]string, []string) {
@@ -421,7 +460,7 @@ func mcpTaskScope(taskID string) string {
 func marshalSuccess(call domain.ToolCall, value any) domain.ToolResult {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return failure(call, err.Error())
+		return failure(call, "marshal_failed", err.Error(), nil)
 	}
 	return success(call, string(data))
 }
@@ -430,8 +469,55 @@ func success(call domain.ToolCall, output string) domain.ToolResult {
 	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: output}
 }
 
-func failure(call domain.ToolCall, output string) domain.ToolResult {
-	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: " + output}
+type taskErrorOutput struct {
+	OK    bool          `json:"ok"`
+	Error taskErrorBody `json:"error"`
+}
+
+type taskErrorBody struct {
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Tool    string         `json:"tool"`
+	TaskID  string         `json:"task_id,omitempty"`
+	Details map[string]any `json:"details,omitempty"`
+}
+
+func taskFailure(call domain.ToolCall, code string, message string, taskID string, details map[string]any) domain.ToolResult {
+	if details == nil {
+		details = map[string]any{}
+	}
+	if taskID != "" {
+		details["task_id"] = taskID
+	}
+	return failure(call, code, message, details)
+}
+
+func failure(call domain.ToolCall, code string, message string, details map[string]any) domain.ToolResult {
+	taskID := ""
+	if details != nil {
+		if value, ok := details["task_id"].(string); ok {
+			taskID = value
+			delete(details, "task_id")
+		}
+		if len(details) == 0 {
+			details = nil
+		}
+	}
+	payload := taskErrorOutput{
+		OK: false,
+		Error: taskErrorBody{
+			Code:    code,
+			Message: message,
+			Tool:    call.Name,
+			TaskID:  taskID,
+			Details: details,
+		},
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: " + message}
+	}
+	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: string(data)}
 }
 
 func toolNames(items []domain.MCPToolDescriptor) []string {

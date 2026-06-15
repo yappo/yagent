@@ -8,6 +8,11 @@ import (
 )
 
 func (s *Service) executeToolCall(ctx context.Context, invocation domain.AgentInvocation, item executableCall) (domain.Message, []domain.ExecutionEvent) {
+	item.call.RunID = invocation.RunID
+	item.call.RootRunID = invocation.RootRunID
+	item.call.Phase = invocation.Phase
+	item.call.Attempt = invocation.Attempt
+
 	spec := s.prepareToolRuntimeSpec(ctx, invocation.Agent, item)
 	if cached, ok := s.lookupReusableExecution(ctx, invocation, spec); ok {
 		return toolMessage(item.call, cached.Output), []domain.ExecutionEvent{
@@ -28,9 +33,21 @@ func (s *Service) executeToolCall(ctx context.Context, invocation domain.AgentIn
 		detail = item.call.Name + ": " + result.Output
 	}
 
-	s.recordToolExecution(ctx, invocation, spec, result)
+	record := s.recordToolExecution(ctx, invocation, spec, result)
+	metrics := map[string]any{"semantic_key": spec.semanticKey}
+	if record != nil {
+		if record.MutationID != "" {
+			metrics["mutation_id"] = record.MutationID
+		}
+		if record.MutationFingerprint != "" {
+			metrics["mutation_fingerprint"] = record.MutationFingerprint
+		}
+		if record.WorkspaceRevision > 0 {
+			metrics["workspace_revision"] = record.WorkspaceRevision
+		}
+	}
 	return toolMessage(item.call, result.Output), []domain.ExecutionEvent{
-		s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, eventType, invocation.Phase, invocation.Attempt, status, detail, "", map[string]any{"semantic_key": spec.semanticKey}, countContextItems(invocation.Messages, invocation.Context)),
+		s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, eventType, invocation.Phase, invocation.Attempt, status, detail, "", metrics, countContextItems(invocation.Messages, invocation.Context)),
 	}
 }
 
@@ -48,9 +65,9 @@ func (s *Service) lookupReusableExecution(ctx context.Context, invocation domain
 	return record, true
 }
 
-func (s *Service) recordToolExecution(ctx context.Context, invocation domain.AgentInvocation, spec toolRuntimeSpec, result domain.ToolResult) {
+func (s *Service) recordToolExecution(ctx context.Context, invocation domain.AgentInvocation, spec toolRuntimeSpec, result domain.ToolResult) *domain.ToolExecutionRecord {
 	if s.config.RuntimeStore == nil {
-		return
+		return nil
 	}
 
 	outputArtifactID := nextExecutionID("artifact", spec.semanticKey)
@@ -129,6 +146,7 @@ func (s *Service) recordToolExecution(ctx context.Context, invocation domain.Age
 		s.recordReadSnapshot(ctx, spec.pathStates)
 	}
 	_ = s.config.RuntimeStore.SaveExecution(ctx, execution)
+	return &execution
 }
 
 func (s *Service) workspaceRevision(ctx context.Context) int64 {
@@ -181,7 +199,7 @@ func (s *Service) applyMutationSnapshot(ctx context.Context, invocation domain.A
 		ExecutionID:         executionID,
 		ToolName:            spec.call.Name,
 		WriteSet:            spec.writeSet,
-		MutationFingerprint: writeSetFingerprint(spec.writeSet),
+		MutationFingerprint: mutationFingerprint(spec.writeSet, states),
 		BeforeRevision:      before,
 		AfterRevision:       snapshot.Revision,
 		CreatedAt:           time.Now(),

@@ -44,6 +44,87 @@ func TestRuntimeSchedulerSerializesWriteConflicts(t *testing.T) {
 	}
 }
 
+func TestRuntimeSchedulerParallelizesScopedProcessAndExternalSideEffects(t *testing.T) {
+	scheduler := newRuntimeScheduler(4)
+	items := []scheduleSpec{
+		{
+			ID:              "task-go-test",
+			ReadSet:         []string{"go.mod"},
+			WriteSet:        []string{".yagent/task/go-test"},
+			Source:          "task:go:test",
+			SourceLimit:     1,
+			SideEffectClass: domain.SideEffectProcess,
+		},
+		{
+			ID:              "mcp-docs-search",
+			ReadSet:         []string{"/docs"},
+			Source:          "mcp:docs",
+			SourceLimit:     2,
+			SideEffectClass: domain.SideEffectExternal,
+		},
+		{
+			ID:              "mcp-repo-search",
+			ReadSet:         []string{"/repo"},
+			Source:          "mcp:docs",
+			SourceLimit:     2,
+			SideEffectClass: domain.SideEffectExternal,
+		},
+	}
+
+	batch := scheduler.nextBatch(items, map[string]bool{})
+	if len(batch) != 3 {
+		t.Fatalf("expected scoped process/external side effects to parallelize, got %+v", batch)
+	}
+}
+
+func TestRuntimeSchedulerSerializesUnscopedProcessSideEffects(t *testing.T) {
+	scheduler := newRuntimeScheduler(4)
+	items := []scheduleSpec{
+		{
+			ID:              "task-unknown-a",
+			Source:          "task:a",
+			SourceLimit:     1,
+			SideEffectClass: domain.SideEffectProcess,
+		},
+		{
+			ID:              "task-unknown-b",
+			Source:          "task:b",
+			SourceLimit:     1,
+			SideEffectClass: domain.SideEffectProcess,
+		},
+	}
+
+	batch := scheduler.nextBatch(items, map[string]bool{})
+	if len(batch) != 1 {
+		t.Fatalf("expected unscoped process side effects to stay serial, got %+v", batch)
+	}
+}
+
+func TestRuntimeSchedulerRespectsSourceLimitForScopedExternalSideEffects(t *testing.T) {
+	scheduler := newRuntimeScheduler(4)
+	items := []scheduleSpec{
+		{
+			ID:              "mcp-write-a",
+			WriteSet:        []string{"mcp:docs:a"},
+			Source:          "mcp:docs",
+			SourceLimit:     1,
+			SideEffectClass: domain.SideEffectExternal,
+		},
+		{
+			ID:              "mcp-write-b",
+			WriteSet:        []string{"mcp:docs:b"},
+			Source:          "mcp:docs",
+			SourceLimit:     1,
+			SideEffectClass: domain.SideEffectExternal,
+		},
+	}
+
+	batch := scheduler.nextBatch(items, map[string]bool{})
+	if len(batch) != 1 {
+		t.Fatalf("expected source limit to cap scoped external side effects, got %+v", batch)
+	}
+}
+
 func TestRuntimeSchedulerRespectsDependenciesAndDuplicateKeys(t *testing.T) {
 	scheduler := newRuntimeScheduler(4)
 	items := []scheduleSpec{

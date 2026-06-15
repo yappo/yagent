@@ -276,20 +276,41 @@ func prettyJSON(value any) string {
 
 func plannerOutputContract() map[string]any {
 	return map[string]any{
-		"type":     "object",
-		"required": []string{"version", "mode", "task_kind", "summary", "primary", "steps"},
+		"type":   "json_schema",
+		"name":   "execution_plan",
+		"schema": executionPlanSchema(),
+		"strict": true,
 		"notes": []string{
 			"Return strict JSON only.",
 			"Use agent ids exactly as listed in the inventory.",
 			"Do not assign read-only agents as primary for mutate tasks.",
 			"Keep reasons short and concrete.",
+			"Use null for unused plan, recovery, or finalize assignments.",
+			"Use empty arrays for unused preparation, verify, steps, or required_capabilities.",
 		},
 	}
 }
 
 func verificationOutputContract() map[string]any {
 	return map[string]any{
-		"format": "Return lines in this exact format: VERIFICATION_STATUS: pass|fail, SUMMARY: <one sentence>, REPAIR_BRIEF: <short actionable brief>.",
+		"type":   "json_schema",
+		"name":   "verification_result",
+		"schema": verificationSchema(),
+		"strict": true,
+	}
+}
+
+func finalResponseOutputContract() map[string]any {
+	return map[string]any{
+		"type":   "json_schema",
+		"name":   "final_response",
+		"schema": finalResponseSchema(),
+		"strict": true,
+		"notes": []string{
+			"Return strict JSON only.",
+			"The response field must be the complete user-facing answer.",
+			"Use empty strings or empty arrays when a field does not apply.",
+		},
 	}
 }
 
@@ -297,6 +318,171 @@ func repairOutputContract() map[string]any {
 	return map[string]any{
 		"goal": "Provide the repaired implementation result or precise remediation steps.",
 	}
+}
+
+func executionPlanResponseFormat() *domain.ResponseFormat {
+	return &domain.ResponseFormat{
+		Type:   "json_schema",
+		Name:   "execution_plan",
+		Schema: executionPlanSchema(),
+		Strict: true,
+	}
+}
+
+func verificationResponseFormat() *domain.ResponseFormat {
+	return &domain.ResponseFormat{
+		Type:   "json_schema",
+		Name:   "verification_result",
+		Schema: verificationSchema(),
+		Strict: true,
+	}
+}
+
+func finalResponseResponseFormat() *domain.ResponseFormat {
+	return &domain.ResponseFormat{
+		Type:   "json_schema",
+		Name:   "final_response",
+		Schema: finalResponseSchema(),
+		Strict: true,
+	}
+}
+
+func executionPlanSchema() map[string]any {
+	assignment := plannedAssignmentSchema()
+	nullableAssignment := nullableObjectSchema(assignment)
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"version":               stringSchema("Execution plan schema version, usually v1."),
+			"mode":                  enumSchema([]string{"direct", "assisted", "full"}, "Execution mode selected for the request."),
+			"task_kind":             enumSchema([]string{"unknown", "casual", "question", "research", "docs", "review", "test", "mutate"}, "Classified task kind."),
+			"summary":               stringSchema("Short summary of the routing decision."),
+			"plan":                  nullableAssignment,
+			"preparation":           arraySchema(plannedAssignmentSchema(), "Read-only preparation assignments."),
+			"primary":               assignment,
+			"verify":                arraySchema(plannedAssignmentSchema(), "Independent verification assignments."),
+			"recovery":              nullableObjectSchema(plannedAssignmentSchema()),
+			"finalize":              nullableObjectSchema(plannedAssignmentSchema()),
+			"steps":                 arraySchema(plannedStepSchema(), "Ordered execution steps."),
+			"required_capabilities": arraySchema(map[string]any{"type": "string"}, "Capability groups required by this plan."),
+			"source":                stringSchema("Source of the plan, usually planner."),
+			"fallback_reason":       stringSchema("Fallback reason, or empty string when not a fallback."),
+		},
+		"required": []string{
+			"version",
+			"mode",
+			"task_kind",
+			"summary",
+			"plan",
+			"preparation",
+			"primary",
+			"verify",
+			"recovery",
+			"finalize",
+			"steps",
+			"required_capabilities",
+			"source",
+			"fallback_reason",
+		},
+		"additionalProperties": false,
+	}
+}
+
+func verificationSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"status":       enumSchema([]string{"pass", "fail"}, "Overall verification status."),
+			"summary":      stringSchema("One-sentence verification summary."),
+			"repair_brief": stringSchema("Short actionable repair brief, or none."),
+		},
+		"required":             []string{"status", "summary", "repair_brief"},
+		"additionalProperties": false,
+	}
+}
+
+func finalResponseSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"response":             stringSchema("Complete user-facing final answer."),
+			"summary":              stringSchema("One sentence summary of the outcome."),
+			"verification_summary": stringSchema("Verification status or empty string."),
+			"remaining_risks":      arraySchema(map[string]any{"type": "string"}, "Remaining risks, caveats, or blocked checks."),
+			"next_steps":           arraySchema(map[string]any{"type": "string"}, "Concrete follow-up steps, or empty array."),
+		},
+		"required": []string{
+			"response",
+			"summary",
+			"verification_summary",
+			"remaining_risks",
+			"next_steps",
+		},
+		"additionalProperties": false,
+	}
+}
+
+func plannedAssignmentSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"agent_id": stringSchema("Agent id from the inventory."),
+			"reason":   stringSchema("Short concrete reason for the assignment."),
+		},
+		"required":             []string{"agent_id", "reason"},
+		"additionalProperties": false,
+	}
+}
+
+func plannedStepSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"id":       stringSchema("Stable step id."),
+			"title":    stringSchema("Short step title."),
+			"phase":    enumSchema([]string{"intake", "plan", "execute", "verify", "recover", "finalize"}, "Execution phase."),
+			"agent_id": stringSchema("Assigned agent id, or empty string when unassigned."),
+		},
+		"required":             []string{"id", "title", "phase", "agent_id"},
+		"additionalProperties": false,
+	}
+}
+
+func nullableObjectSchema(schema map[string]any) map[string]any {
+	out := cloneSchemaMap(schema)
+	out["type"] = []string{"object", "null"}
+	return out
+}
+
+func arraySchema(items map[string]any, description string) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": description,
+		"items":       items,
+	}
+}
+
+func stringSchema(description string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description,
+	}
+}
+
+func enumSchema(values []string, description string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description,
+		"enum":        values,
+	}
+}
+
+func cloneSchemaMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func buildInvocationInstructions(base string, context domain.RunContext) string {
@@ -316,6 +502,12 @@ func buildInvocationInstructions(base string, context domain.RunContext) string 
 	}
 	if packetKind := strings.TrimSpace(context.PacketKind); packetKind != "" {
 		lines = append(lines, "- packet_kind: "+packetKind)
+	}
+	if context.PacketBudgetTokens > 0 {
+		lines = append(lines, fmt.Sprintf("- packet_budget_tokens: %d", context.PacketBudgetTokens))
+	}
+	if context.PacketEstimatedTokens > 0 {
+		lines = append(lines, fmt.Sprintf("- packet_estimated_tokens: %d", context.PacketEstimatedTokens))
 	}
 	if len(context.ScopedConstraints) > 0 {
 		lines = append(lines, "- scoped_constraints: "+strings.Join(context.ScopedConstraints, "; "))

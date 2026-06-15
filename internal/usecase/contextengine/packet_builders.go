@@ -87,7 +87,7 @@ func buildScopedPacket(base packetBase, role string, messageLimit int, allowedAr
 	ctx.PacketRole = role
 	ctx.PacketKind = role
 	ctx.RecentMessages = roleScopedMessages(base.messages, role, messageLimit)
-	relevantArtifacts := selectArtifactsByKind(base.run.Artifacts, allowedArtifacts)
+	relevantArtifacts := selectArtifactsByKind(base.run.Artifacts, allowedArtifacts, relevanceQuery(ctx, base.messages, role))
 	ctx.ArtifactRefs = artifactRefs(relevantArtifacts, 8)
 	ctx.Artifacts = artifactReferences(relevantArtifacts, 8)
 	ctx.ScopedConstraints = append(ctx.ScopedConstraints, constraints...)
@@ -103,12 +103,12 @@ func artifactKinds(values ...string) map[string]bool {
 	return out
 }
 
-func selectArtifactsByKind(artifacts []domain.RunArtifact, allowed map[string]bool) []domain.RunArtifact {
+func selectArtifactsByKind(artifacts []domain.RunArtifact, allowed map[string]bool, query map[string]int) []domain.RunArtifact {
 	if len(artifacts) == 0 {
 		return nil
 	}
 	if len(allowed) == 0 {
-		return lastArtifacts(artifacts, 8)
+		return rankArtifacts(lastArtifacts(artifacts, 8), query)
 	}
 	filtered := make([]domain.RunArtifact, 0, len(artifacts))
 	for _, artifact := range artifacts {
@@ -117,9 +117,9 @@ func selectArtifactsByKind(artifacts []domain.RunArtifact, allowed map[string]bo
 		}
 	}
 	if len(filtered) == 0 {
-		return lastArtifacts(artifacts, 8)
+		return rankArtifacts(lastArtifacts(artifacts, 8), query)
 	}
-	return filtered
+	return rankArtifacts(filtered, query)
 }
 
 func packetConstraints(run *domain.RunState, role string) []string {

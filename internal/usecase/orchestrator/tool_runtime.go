@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 
 	"yagent/internal/domain"
 )
+
+const maxPathStateHashBytes int64 = 16 * 1024 * 1024
 
 type toolRuntimeSpec struct {
 	call           domain.ToolCall
@@ -54,7 +57,7 @@ func (s *Service) describeToolRuntime(ctx context.Context, agent domain.AgentSpe
 	semantics := effectiveSemantics(item.definition)
 	hint := s.inferToolRuntime(ctx, agent, item.call, item.definition)
 	semantics = applyRuntimeHint(semantics, hint)
-	semanticArgs := semanticArguments(item.call.Arguments, semantics.IdentityArgs)
+	semanticArgs := semanticArguments(item.call.Arguments, semantics.IdentityArgs, semantics.IdentityDefaults)
 	readSet, writeSet := resolveAccessSets(item.call, item.definition, semantics, hint)
 	return toolRuntimeDescriptor{
 		normalizedArgs: normalizedArgs,
@@ -149,7 +152,7 @@ func resolveAccessSets(call domain.ToolCall, def domain.ToolDefinition, sem doma
 			writeSet = append(writeSet, firstPathArg(call.Arguments, "source_path"), firstPathArg(call.Arguments, "destination_path"))
 		case "search_text", "search_files":
 			readSet = append(readSet, firstPathArg(call.Arguments, "root"))
-		case "git_status", "git_diff", "git_log", "git_show":
+		case "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history":
 			readSet = append(readSet, firstPathArg(call.Arguments, "repo_path"))
 		case "task_run":
 			writeSet = append(writeSet, firstPathArg(call.Arguments, "task_id"))
@@ -241,7 +244,7 @@ func normalizeArguments(args map[string]any) string {
 	return string(data)
 }
 
-func semanticArguments(args map[string]any, keys []string) string {
+func semanticArguments(args map[string]any, keys []string, defaults map[string]any) string {
 	if keys == nil {
 		return normalizeArguments(args)
 	}
@@ -249,6 +252,12 @@ func semanticArguments(args map[string]any, keys []string) string {
 	for _, key := range keys {
 		if value, ok := args[key]; ok {
 			filtered[key] = value
+			continue
+		}
+		if defaults != nil {
+			if value, ok := defaults[key]; ok {
+				filtered[key] = value
+			}
 		}
 	}
 	return normalizeArguments(filtered)
@@ -321,6 +330,9 @@ func (s *Service) capturePathStates(_ context.Context, paths []string) []domain.
 			state.IsDir = info.IsDir()
 			state.Size = info.Size()
 			state.ModTimeUnix = info.ModTime().UnixNano()
+			if !info.IsDir() && info.Size() <= maxPathStateHashBytes {
+				state.ContentSHA256 = fileSHA256(path)
+			}
 		}
 		states = append(states, state)
 	}
@@ -343,8 +355,49 @@ func snapshotFromStates(states []domain.WorkspacePathState) *domain.WorkspaceSna
 	return snapshot
 }
 
-func writeSetFingerprint(paths []string) string {
-	sum := sha1.Sum([]byte(strings.Join(compactPaths(paths), "\n")))
+func mutationFingerprint(paths []string, states []domain.WorkspacePathState) string {
+	type fingerprintPathState struct {
+		Path          string `json:"path"`
+		Exists        bool   `json:"exists"`
+		IsDir         bool   `json:"is_dir"`
+		Size          int64  `json:"size,omitempty"`
+		ModTimeUnix   int64  `json:"mod_time_unix,omitempty"`
+		ContentSHA256 string `json:"content_sha256,omitempty"`
+	}
+
+	stateByPath := map[string]domain.WorkspacePathState{}
+	for _, state := range states {
+		stateByPath[state.Path] = state
+	}
+	items := make([]fingerprintPathState, 0, len(paths))
+	for _, path := range compactPaths(paths) {
+		state := stateByPath[path]
+		item := fingerprintPathState{
+			Path:          path,
+			Exists:        state.Exists,
+			IsDir:         state.IsDir,
+			Size:          state.Size,
+			ContentSHA256: state.ContentSHA256,
+		}
+		if item.ContentSHA256 == "" {
+			item.ModTimeUnix = state.ModTimeUnix
+		}
+		items = append(items, item)
+	}
+	data, err := json.Marshal(items)
+	if err != nil {
+		data = []byte(strings.Join(compactPaths(paths), "\n"))
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func fileSHA256(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 

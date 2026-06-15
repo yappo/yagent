@@ -22,12 +22,14 @@ type Config struct {
 	DisablePhaseHarness     bool
 	ForcePlanner            bool
 	ForceResearcher         bool
+	ContinuationPolicy      string
 	TraceSink               domain.TraceSink
 	Approver                domain.Approver
 	ContextEngine           domain.ContextEngine
 	RunStore                domain.RunStateStore
 	MemoryStore             domain.RepoMemoryStore
 	RuntimeStore            domain.RuntimeStateStore
+	ConversationStore       domain.ConversationStore
 }
 
 type Service struct {
@@ -92,8 +94,17 @@ func (s *Service) SetObserver(observer domain.ToolObserver) {
 	s.observer = observer
 }
 
-func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (domain.TurnResult, error) {
+func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (turnResult domain.TurnResult, turnErr error) {
+	startedAt := time.Now()
 	run := s.newRunState(request)
+	var output domain.Message
+	var allEvents []domain.ExecutionEvent
+	defer func() {
+		if output.Role == "" {
+			output = turnResult.Message
+		}
+		_ = s.recordConversationTurn(ctx, run, request, output, allEvents, turnErr, startedAt)
+	}()
 	if request.ResumeID != "" && s.config.RunStore != nil {
 		if restored, err := s.loadResumeState(ctx, request.ResumeID); err == nil && restored != nil {
 			run = restored
@@ -116,7 +127,6 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	run.Artifacts = append(run.Artifacts, newInventoryArtifact(run, domain.RunPhaseIntake, "planner", inventory))
 	_ = s.saveRun(ctx, run)
 
-	var allEvents []domain.ExecutionEvent
 	if s.config.DisablePhaseHarness {
 		run.ExecutionPlan = disabledHarnessExecutionPlan(prompt)
 		run.Plan = planNodesFromExecutionPlan(run.ExecutionPlan)
@@ -132,12 +142,15 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 			return domain.TurnResult{}, err
 		}
 		run.Status = domain.RunStatusCompleted
-		artifact := newFinalResponseArtifact(run, run.CurrentPhase, result.Message.AgentID, result.Message.Content)
+		s.appendPermissionAuditArtifact(ctx, run, run.CurrentPhase)
+		artifact := newFinalResponseArtifact(run, run.CurrentPhase, result.Message)
 		run.Artifacts = append(run.Artifacts, artifact)
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, result.Message.Content))
 		_ = s.rememberRun(ctx, run)
 		_ = s.saveRun(ctx, run)
-		return domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}, nil
+		output = result.Message
+		turnResult = domain.TurnResult{Message: result.Message, Events: allEvents, Run: run}
+		return turnResult, nil
 	}
 	if shouldBypassPlanner(prompt) {
 		run.ExecutionPlan = directConversationPlan(prompt)
@@ -154,12 +167,15 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 			return domain.TurnResult{}, err
 		}
 		run.Status = domain.RunStatusCompleted
-		artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
+		s.appendPermissionAuditArtifact(ctx, run, run.CurrentPhase)
+		artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message)
 		run.Artifacts = append(run.Artifacts, artifact)
 		run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
 		_ = s.rememberRun(ctx, run)
 		_ = s.saveRun(ctx, run)
-		return domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}, nil
+		output = final.Message
+		turnResult = domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}
+		return turnResult, nil
 	}
 
 	executionPlan, planEvents, err := s.runPlanPhase(ctx, run, request, inventory)
@@ -180,12 +196,15 @@ func (s *Service) RunTurn(ctx context.Context, request domain.TurnRequest) (doma
 	}
 
 	run.Status = domain.RunStatusCompleted
-	artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message.AgentID, final.Message.Content)
+	s.appendPermissionAuditArtifact(ctx, run, run.CurrentPhase)
+	artifact := newFinalResponseArtifact(run, run.CurrentPhase, final.Message)
 	run.Artifacts = append(run.Artifacts, artifact)
 	run.Checkpoints = append(run.Checkpoints, checkpoint(run, run.CurrentPhase, final.Message.Content))
 	_ = s.rememberRun(ctx, run)
 	_ = s.saveRun(ctx, run)
-	return domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}, nil
+	output = final.Message
+	turnResult = domain.TurnResult{Message: final.Message, Events: allEvents, Run: run}
+	return turnResult, nil
 }
 
 func (s *Service) withManagerDelegationBias(manager domain.AgentSpec, messages []domain.Message) domain.AgentSpec {
@@ -250,20 +269,25 @@ func (s *Service) runAgent(ctx context.Context, invocation domain.AgentInvocatio
 			tools := visibleTools(invocation.Agent, allTools, session)
 			llmCtx, cancel := context.WithTimeout(ctx, s.timeoutFor(invocation.Agent))
 			response, err := s.model.Generate(llmCtx, domain.ModelRequest{
-				Agent:        invocation.Agent,
-				Instructions: buildInvocationInstructions(invocation.Agent.Instruction, invocation.Context),
-				Messages:     messages,
-				Phase:        invocation.Phase,
-				Model:        s.modelName(invocation),
-				Stream:       invocation.Stream,
-				Tools:        tools,
+				RunID:          invocation.RunID,
+				RootRunID:      invocation.RootRunID,
+				Attempt:        invocation.Attempt,
+				Agent:          invocation.Agent,
+				Instructions:   buildInvocationInstructions(invocation.Agent.Instruction, invocation.Context),
+				Messages:       messages,
+				Phase:          invocation.Phase,
+				Model:          s.modelName(invocation),
+				Stream:         invocation.Stream,
+				StreamHandler:  s.modelStreamHandler(invocation, countContextItems(messages, invocation.Context)),
+				Tools:          tools,
+				ResponseFormat: invocation.ResponseFormat,
 			})
 			cancel()
 			if err != nil {
 				events = append(events, s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, "agent_failed", invocation.Phase, invocation.Attempt, "failed", err.Error(), "", nil, countContextItems(messages, invocation.Context)))
 				return domain.AgentResult{}, err
 			}
-			events = append(events, s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, "llm_called", invocation.Phase, invocation.Attempt, "running", response.FinishReason, "", map[string]any{"visible_tools": len(tools)}, countContextItems(messages, invocation.Context)))
+			events = append(events, s.newEvent(invocation.RunID, invocation.ParentRunID, invocation.Agent.ID, "llm_called", invocation.Phase, invocation.Attempt, "running", response.FinishReason, "", llmCallMetrics(len(tools), response.Invocation), countContextItems(messages, invocation.Context)))
 
 			if len(response.Message.ToolCalls) == 0 {
 				response.Message.AgentID = invocation.Agent.ID
@@ -1092,6 +1116,7 @@ func (s *Service) newEvent(runID, parentRunID, agentID, typ string, phase domain
 		Attempt:      attempt,
 		Status:       status,
 		Detail:       detail,
+		Display:      summarizeEventDisplay(typ, detail),
 		ArtifactRef:  artifactRef,
 		Metrics:      metrics,
 		Timestamp:    time.Now(),
@@ -1101,10 +1126,96 @@ func (s *Service) newEvent(runID, parentRunID, agentID, typ string, phase domain
 	return event
 }
 
+func summarizeEventDisplay(typ string, detail string) string {
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		return typ
+	}
+	lines := strings.Split(detail, "\n")
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		if line == "" {
+			continue
+		}
+		parts = append(parts, line)
+	}
+	if len(parts) == 0 {
+		return typ
+	}
+	display := parts[0]
+	if len(parts) > 1 {
+		display += fmt.Sprintf(" (+%d lines)", len(parts)-1)
+	}
+	if len(display) > 160 {
+		display = display[:157] + "..."
+	}
+	return display
+}
+
+func llmCallMetrics(visibleTools int, invocation domain.ModelInvocationMetadata) map[string]any {
+	metrics := map[string]any{"visible_tools": visibleTools}
+	if invocation.ServerName != "" {
+		metrics["server_name"] = invocation.ServerName
+	}
+	if invocation.API != "" {
+		metrics["api"] = invocation.API
+	}
+	if invocation.Model != "" {
+		metrics["model"] = invocation.Model
+	}
+	if invocation.ProfileName != "" {
+		metrics["profile_name"] = invocation.ProfileName
+	}
+	if invocation.Fallback {
+		metrics["fallback"] = true
+	}
+	if invocation.FallbackFromServer != "" {
+		metrics["fallback_from_server"] = invocation.FallbackFromServer
+	}
+	if invocation.DurationMS > 0 || invocation.ServerName != "" || invocation.API != "" || invocation.Model != "" || invocation.ProfileName != "" || invocation.Fallback {
+		metrics["duration_ms"] = invocation.DurationMS
+	}
+	return metrics
+}
+
+func (s *Service) modelStreamHandler(invocation domain.AgentInvocation, contextCount int) domain.ModelStreamHandler {
+	if !invocation.Stream || invocation.ResponseFormat != nil {
+		return nil
+	}
+	return func(streamEvent domain.ModelStreamEvent) {
+		if streamEvent.ContentDelta == "" {
+			return
+		}
+		metrics := map[string]any{}
+		if streamEvent.RawEventType != "" {
+			metrics["raw_event_type"] = streamEvent.RawEventType
+		}
+		s.broadcastTransient(domain.ExecutionEvent{
+			RunID:        invocation.RunID,
+			ParentRunID:  invocation.ParentRunID,
+			AgentID:      invocation.Agent.ID,
+			Type:         "llm_delta",
+			Phase:        invocation.Phase,
+			Attempt:      invocation.Attempt,
+			Status:       "running",
+			Detail:       streamEvent.ContentDelta,
+			Display:      streamEvent.ContentDelta,
+			Metrics:      metrics,
+			Timestamp:    time.Now(),
+			ContextCount: contextCount,
+		})
+	}
+}
+
 func (s *Service) broadcast(event domain.ExecutionEvent) {
 	if s.config.TraceSink != nil {
 		_ = s.config.TraceSink.Append(context.Background(), event)
 	}
+	s.broadcastTransient(event)
+}
+
+func (s *Service) broadcastTransient(event domain.ExecutionEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for ch := range s.listeners {
@@ -1234,6 +1345,12 @@ func blockedDelegationReason(current domain.AgentSpec, target domain.AgentSpec, 
 }
 
 func (s *Service) approveContinue(ctx context.Context, invocation domain.AgentInvocation, maxTurns int) bool {
+	switch s.config.ContinuationPolicy {
+	case "allow":
+		return true
+	case "deny":
+		return false
+	}
 	if s.config.Approver == nil {
 		return false
 	}

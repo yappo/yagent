@@ -2,6 +2,8 @@ package state
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,7 @@ func NewFileStore(root string) (*FileStore, error) {
 		store.artifactsDir(),
 		store.executionsDir(),
 		store.mutationsDir(),
+		store.conversationsDir(),
 		store.scratchDir(),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -55,6 +58,14 @@ func (s *FileStore) SaveRun(_ context.Context, run *domain.RunState) error {
 	defer s.mu.Unlock()
 
 	run.UpdatedAt = time.Now()
+	for _, artifact := range run.Artifacts {
+		if artifact.ID == "" {
+			continue
+		}
+		if err := domain.ValidateArtifactPayload(artifact); err != nil {
+			return err
+		}
+	}
 	if err := s.writeJSON(s.sessionPath(run.ID), run); err != nil {
 		return err
 	}
@@ -102,6 +113,11 @@ func (s *FileStore) LoadMemory(_ context.Context) (*domain.WorkspaceMemory, erro
 		}
 		return nil, err
 	}
+	if len(memory.ReusableObservations) > 0 {
+		if observations, err := s.readObservationRecords(); err == nil {
+			memory.ReusableObservations = validObservationSummaries(memory.ReusableObservations, observations)
+		}
+	}
 	return &memory, nil
 }
 
@@ -137,6 +153,9 @@ func (s *FileStore) SaveArtifact(_ context.Context, artifact domain.RunArtifact)
 	if artifact.ID == "" {
 		return fmt.Errorf("artifact id が必要です")
 	}
+	if err := domain.ValidateArtifactPayload(artifact); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writeJSON(s.artifactPath(artifact.ID), artifact)
@@ -151,6 +170,7 @@ func (s *FileStore) SaveObservation(ctx context.Context, observation domain.Obse
 		observation.CreatedAt = time.Now()
 	}
 	observation.UpdatedAt = time.Now()
+	observation.IntegritySHA256 = observationIntegritySHA256(observation)
 	if err := s.writeJSON(s.observationPath(observation.ID), observation); err != nil {
 		s.mu.Unlock()
 		return err
@@ -163,10 +183,12 @@ func (s *FileStore) SaveObservation(ctx context.Context, observation domain.Obse
 			return err
 		}
 		memory.ReusableObservations = appendOrReplaceObservation(memory.ReusableObservations, domain.ObservationSummary{
-			ObservationID: observation.ID,
-			ToolName:      observation.ToolName,
-			Summary:       observation.Summary,
-			UpdatedAt:     observation.UpdatedAt,
+			ObservationID:   observation.ID,
+			ToolName:        observation.ToolName,
+			Summary:         observation.Summary,
+			ReadSet:         append([]string(nil), observation.ReadSet...),
+			IntegritySHA256: observation.IntegritySHA256,
+			UpdatedAt:       observation.UpdatedAt,
 		})
 		return s.SaveMemory(ctx, memory)
 	}
@@ -369,6 +391,49 @@ func (s *FileStore) SaveScratch(_ context.Context, record domain.ScratchRecord) 
 	return s.writeJSON(s.scratchPath(record.ID), record)
 }
 
+func (s *FileStore) SaveConversationTurn(_ context.Context, record domain.ConversationTurnRecord) error {
+	if record.ID == "" {
+		return fmt.Errorf("conversation turn id が必要です")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if record.StartedAt.IsZero() {
+		record.StartedAt = time.Now()
+	}
+	if record.CompletedAt.IsZero() {
+		record.CompletedAt = time.Now()
+	}
+	return s.writeJSON(s.conversationPath(record.ID), record)
+}
+
+func (s *FileStore) ListConversationTurns(_ context.Context, limit int) ([]domain.ConversationTurnRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.conversationsDir())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.ConversationTurnRecord, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		var item domain.ConversationTurnRecord
+		if err := s.readJSON(filepath.Join(s.conversationsDir(), entry.Name()), &item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CompletedAt.After(items[j].CompletedAt)
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
 func (s *FileStore) ListScratch(_ context.Context, limit int) ([]domain.ScratchRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -544,6 +609,14 @@ func (s *FileStore) mutationPath(id string) string {
 	return filepath.Join(s.mutationsDir(), id+".json")
 }
 
+func (s *FileStore) conversationsDir() string {
+	return filepath.Join(s.root, "conversations")
+}
+
+func (s *FileStore) conversationPath(id string) string {
+	return filepath.Join(s.conversationsDir(), id+".json")
+}
+
 func (s *FileStore) scratchDir() string {
 	return filepath.Join(s.root, "scratch")
 }
@@ -572,6 +645,59 @@ func appendOrReplaceObservation(items []domain.ObservationSummary, summary domai
 		return items
 	}
 	return append(items, summary)
+}
+
+func validObservationSummaries(summaries []domain.ObservationSummary, records []domain.ObservationRecord) []domain.ObservationSummary {
+	if len(summaries) == 0 {
+		return nil
+	}
+	recordsByID := make(map[string]domain.ObservationRecord, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+	out := make([]domain.ObservationSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		record, ok := recordsByID[summary.ObservationID]
+		if !ok || record.Stale || !record.Reusable {
+			continue
+		}
+		recordHash := record.IntegritySHA256
+		if recordHash == "" {
+			recordHash = observationIntegritySHA256(record)
+		}
+		if summary.IntegritySHA256 == "" || summary.IntegritySHA256 != recordHash {
+			continue
+		}
+		out = append(out, summary)
+	}
+	return out
+}
+
+func observationIntegritySHA256(record domain.ObservationRecord) string {
+	readSet := append([]string(nil), record.ReadSet...)
+	sort.Strings(readSet)
+	pathStates := append([]domain.WorkspacePathState(nil), record.PathStates...)
+	sort.Slice(pathStates, func(i, j int) bool {
+		return pathStates[i].Path < pathStates[j].Path
+	})
+	payload := struct {
+		ID               string                      `json:"id"`
+		SessionID        string                      `json:"session_id,omitempty"`
+		ToolName         string                      `json:"tool_name"`
+		SemanticKey      string                      `json:"semantic_key"`
+		Summary          string                      `json:"summary,omitempty"`
+		OutputArtifactID string                      `json:"output_artifact_id,omitempty"`
+		ReadSet          []string                    `json:"read_set,omitempty"`
+		PathStates       []domain.WorkspacePathState `json:"path_states,omitempty"`
+		SnapshotRevision int64                       `json:"snapshot_revision"`
+		Reusable         bool                        `json:"reusable"`
+	}{record.ID, record.SessionID, record.ToolName, record.SemanticKey, record.Summary, record.OutputArtifactID, readSet, pathStates, record.SnapshotRevision, record.Reusable}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func observationStale(items []domain.ObservationRecord, observationID string) bool {

@@ -3,8 +3,8 @@ package fs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,6 +13,7 @@ import (
 
 	"yagent/internal/domain"
 	"yagent/internal/infra/policy"
+	"yagent/internal/infra/tools/diffpreview"
 	"yagent/internal/infra/tools/execctx"
 )
 
@@ -51,6 +52,15 @@ type moveTool struct {
 	engine   domain.PolicyEngine
 	approver domain.Approver
 }
+
+const (
+	defaultListDepth        = 0
+	defaultListLimitEntries = 80
+	maxListLimitEntries     = 500
+	maxListScanEntries      = 2000
+)
+
+var errListScanLimit = errors.New("fs_list scan limit reached")
 
 func NewReadTool(paths *policy.PathPolicy, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
 	return &readTool{paths: paths, engine: engine, approver: approver}
@@ -143,7 +153,7 @@ func (t *writeTool) Definition() domain.ToolDefinition {
 func (t *listTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
 		Name:             "fs_list",
-		Description:      "指定ディレクトリ配下のエントリ一覧を返します。",
+		Description:      "指定ディレクトリ配下のエントリ一覧を summary 付きの bounded JSON で返します。",
 		CapabilityGroup:  "fs_read",
 		Risk:             "medium",
 		RequiresApproval: true,
@@ -151,9 +161,9 @@ func (t *listTool) Definition() domain.ToolDefinition {
 			"type": "object",
 			"properties": map[string]any{
 				"path":           stringSchema("一覧するディレクトリパス"),
-				"depth":          numberSchema("再帰の深さ。0 は直下のみ"),
-				"include_hidden": boolSchema("ドットファイルを含める"),
-				"limit_entries":  numberSchema("最大件数"),
+				"depth":          numberSchema("再帰の深さ。0 は直下のみ。既定 0"),
+				"include_hidden": boolSchema("ドットファイルを含める。既定 false"),
+				"limit_entries":  numberSchema(fmt.Sprintf("返却する最大件数。既定 %d、最大 %d", defaultListLimitEntries, maxListLimitEntries)),
 			},
 			"required": []string{"path"},
 		},
@@ -161,13 +171,18 @@ func (t *listTool) Definition() domain.ToolDefinition {
 		Semantics: domain.ToolSemantics{
 			Class:           domain.ToolClassObserve,
 			ReusePolicy:     domain.ToolReuseOnSuccess,
-			DuplicatePolicy: domain.ToolDuplicateSuppressInflight,
+			DuplicatePolicy: domain.ToolDuplicateSuppressSemantic,
 			Freshness:       domain.ToolFreshnessPolicy{Strategy: domain.ToolFreshnessReadSet},
 			SideEffectClass: domain.SideEffectNone,
 			Source:          "fs",
 			ReadPathArgs:    []string{"path"},
 			IdentityArgs:    []string{"path", "depth", "include_hidden", "limit_entries"},
-			SourceLimit:     8,
+			IdentityDefaults: map[string]any{
+				"depth":          defaultListDepth,
+				"include_hidden": false,
+				"limit_entries":  defaultListLimitEntries,
+			},
+			SourceLimit: 8,
 		},
 	}
 }
@@ -311,23 +326,39 @@ func (t *writeTool) Execute(ctx context.Context, call domain.ToolCall) domain.To
 	if !ok {
 		return failure(call, "content パラメータが必要です")
 	}
-	if err := authorize(ctx, t.engine, t.approver, call); err != nil {
-		return failure(call, err.Error())
-	}
 
 	resolved, err := t.paths.ResolveWritableFile(path)
 	if err != nil {
 		return failure(call, err.Error())
 	}
 
-	_, statErr := os.Stat(resolved)
+	var before []byte
+	beforeExists := false
+	info, statErr := os.Stat(resolved)
 	create := boolArg(call.Arguments, "create", false)
 	overwrite := boolArg(call.Arguments, "overwrite", false)
 	if statErr == nil && !overwrite {
 		return failure(call, "既存ファイルを上書きするには overwrite=true が必要です")
 	}
+	if statErr == nil && info.IsDir() {
+		return failure(call, "ディレクトリは fs_write で上書きできません")
+	}
 	if os.IsNotExist(statErr) && !create {
 		return failure(call, "新規ファイルを作成するには create=true が必要です")
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return failure(call, statErr.Error())
+	}
+	if statErr == nil {
+		beforeExists = true
+		before, err = os.ReadFile(resolved)
+		if err != nil {
+			return failure(call, fmt.Sprintf("failed to read existing file %s: %v", resolved, err))
+		}
+	}
+
+	if err := authorizeWrite(ctx, t.engine, t.approver, call, resolved, before, beforeExists, content); err != nil {
+		return failure(call, err.Error())
 	}
 
 	if err := os.WriteFile(resolved, []byte(content), 0o644); err != nil {
@@ -350,17 +381,55 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		return failure(call, err.Error())
 	}
 
-	maxDepth := intArg(call.Arguments, "depth", 0)
-	limit := intArg(call.Arguments, "limit_entries", 200)
+	maxDepth := intArg(call.Arguments, "depth", defaultListDepth)
+	if maxDepth < 0 {
+		maxDepth = defaultListDepth
+	}
+	limit := intArg(call.Arguments, "limit_entries", defaultListLimitEntries)
+	if limit < 0 {
+		limit = defaultListLimitEntries
+	}
+	if limit > maxListLimitEntries {
+		limit = maxListLimitEntries
+	}
 	includeHidden := boolArg(call.Arguments, "include_hidden", false)
 
-	type entry struct {
+	type listEntry struct {
 		Path  string `json:"path"`
 		Type  string `json:"type"`
 		Size  int64  `json:"size,omitempty"`
 		Depth int    `json:"depth"`
 	}
-	results := make([]entry, 0, limit)
+	type listRequest struct {
+		Path          string `json:"path"`
+		Depth         int    `json:"depth"`
+		IncludeHidden bool   `json:"include_hidden"`
+		LimitEntries  int    `json:"limit_entries"`
+	}
+	type listSummary struct {
+		ReturnedEntries     int  `json:"returned_entries"`
+		MatchedEntries      int  `json:"matched_entries"`
+		OmittedEntries      int  `json:"omitted_entries"`
+		OmittedEntriesExact bool `json:"omitted_entries_exact"`
+		HiddenOmitted       int  `json:"hidden_omitted"`
+		ScannedEntries      int  `json:"scanned_entries"`
+		ScanLimit           int  `json:"scan_limit"`
+		ScanTruncated       bool `json:"scan_truncated"`
+		Truncated           bool `json:"truncated"`
+		Directories         int  `json:"directories"`
+		Files               int  `json:"files"`
+		Symlinks            int  `json:"symlinks"`
+		Other               int  `json:"other"`
+		MaxDepth            int  `json:"max_depth"`
+	}
+	type listResult struct {
+		Root    string      `json:"root"`
+		Request listRequest `json:"request"`
+		Summary listSummary `json:"summary"`
+		Entries []listEntry `json:"entries"`
+	}
+	results := make([]listEntry, 0, minListEntries(limit, defaultListLimitEntries))
+	summary := listSummary{MaxDepth: maxDepth, ScanLimit: maxListScanEntries, OmittedEntriesExact: true}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -379,7 +448,14 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 			}
 			return nil
 		}
+		if summary.ScannedEntries >= maxListScanEntries {
+			summary.ScanTruncated = true
+			summary.OmittedEntriesExact = false
+			return errListScanLimit
+		}
+		summary.ScannedEntries++
 		if !includeHidden && strings.HasPrefix(d.Name(), ".") {
+			summary.HiddenOmitted++
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -392,18 +468,52 @@ func (t *listTool) Execute(ctx context.Context, call domain.ToolCall) domain.Too
 		itemType := "file"
 		if d.IsDir() {
 			itemType = "directory"
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			itemType = "symlink"
+		} else if !info.Mode().IsRegular() {
+			itemType = "other"
 		}
-		results = append(results, entry{Path: path, Type: itemType, Size: info.Size(), Depth: depth})
-		if len(results) >= limit {
-			return io.EOF
+		summary.MatchedEntries++
+		switch itemType {
+		case "directory":
+			summary.Directories++
+		case "file":
+			summary.Files++
+		case "symlink":
+			summary.Symlinks++
+		default:
+			summary.Other++
+		}
+		if len(results) < limit {
+			rel := filepath.ToSlash(rel)
+			results = append(results, listEntry{Path: rel, Type: itemType, Size: info.Size(), Depth: depth})
 		}
 		return nil
 	})
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, errListScanLimit) {
 		return failure(call, err.Error())
 	}
 
-	return marshalSuccess(call, results)
+	summary.ReturnedEntries = len(results)
+	if summary.MatchedEntries > summary.ReturnedEntries {
+		summary.OmittedEntries = summary.MatchedEntries - summary.ReturnedEntries
+		summary.Truncated = true
+	}
+	if summary.ScanTruncated {
+		summary.Truncated = true
+	}
+
+	return marshalSuccess(call, listResult{
+		Root: root,
+		Request: listRequest{
+			Path:          path,
+			Depth:         maxDepth,
+			IncludeHidden: includeHidden,
+			LimitEntries:  limit,
+		},
+		Summary: summary,
+		Entries: results,
+	})
 }
 
 func (t *statTool) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
@@ -492,14 +602,44 @@ func authorize(ctx context.Context, engine domain.PolicyEngine, approver domain.
 	if err != nil {
 		return err
 	}
-	request.AgentID = execctx.AgentID(ctx)
-	request.Purpose = execctx.Purpose(ctx)
+	execctx.FillPermissionRequest(ctx, &request)
 	if decision == domain.PolicyAllow {
 		return nil
 	}
 	if decision == domain.PolicyDeny {
 		return fmt.Errorf("この操作は policy により拒否されました")
 	}
+	userDecision, err := approver.Approve(ctx, request)
+	if err != nil {
+		return err
+	}
+	if userDecision == domain.PermissionDeny {
+		return fmt.Errorf("ユーザーによってキャンセルされました")
+	}
+	return nil
+}
+
+func authorizeWrite(ctx context.Context, engine domain.PolicyEngine, approver domain.Approver, call domain.ToolCall, resolved string, before []byte, beforeExists bool, content string) error {
+	if engine == nil || approver == nil {
+		return nil
+	}
+	decision, request, err := engine.Evaluate(ctx, call)
+	if err != nil {
+		return err
+	}
+	execctx.FillPermissionRequest(ctx, &request)
+	if decision == domain.PolicyAllow {
+		return nil
+	}
+	if decision == domain.PolicyDeny {
+		return fmt.Errorf("この操作は policy により拒否されました")
+	}
+	request.PreviewKind = "diff"
+	request.Preview = diffpreview.TextChange(resolved, before, beforeExists, content)
+	stats := diffpreview.TextChangeStats(before, beforeExists, content)
+	request.ChangeFiles = stats.Files
+	request.Additions = stats.Additions
+	request.Deletions = stats.Deletions
 	userDecision, err := approver.Approve(ctx, request)
 	if err != nil {
 		return err
@@ -548,6 +688,13 @@ func boolArg(args map[string]any, key string, fallback bool) bool {
 		return fallback
 	}
 	return value
+}
+
+func minListEntries(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func success(call domain.ToolCall, output string) domain.ToolResult {

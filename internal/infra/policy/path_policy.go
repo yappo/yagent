@@ -12,9 +12,38 @@ import (
 type PathPolicy struct {
 	baseDir      string
 	allowedRoots []string
+	rules        []compiledPathRule
+}
+
+type PathDecision string
+
+const (
+	PathDecisionAllow PathDecision = "allow"
+	PathDecisionDeny  PathDecision = "deny"
+)
+
+type PathRule struct {
+	Decision PathDecision
+	Patterns []string
+}
+
+type compiledPathRule struct {
+	decision PathDecision
+	patterns []string
 }
 
 func NewPathPolicy(baseDir string, allowedRoots []string) *PathPolicy {
+	return NewPathPolicyWithRules(baseDir, allowedRoots, nil)
+}
+
+func NewPathPolicyWithRules(baseDir string, allowedRoots []string, rules []PathRule) *PathPolicy {
+	absBase := baseDir
+	if abs, err := filepath.Abs(baseDir); err == nil {
+		absBase = abs
+	}
+	if realBase, err := filepath.EvalSymlinks(absBase); err == nil {
+		absBase = realBase
+	}
 	roots := make([]string, 0, len(allowedRoots))
 	seen := map[string]struct{}{}
 	for _, root := range allowedRoots {
@@ -37,8 +66,9 @@ func NewPathPolicy(baseDir string, allowedRoots []string) *PathPolicy {
 	}
 
 	return &PathPolicy{
-		baseDir:      baseDir,
+		baseDir:      absBase,
 		allowedRoots: roots,
+		rules:        compilePathRules(absBase, rules),
 	}
 }
 
@@ -127,7 +157,11 @@ func (p *PathPolicy) ResolveWritableFile(path string) (string, error) {
 		return realPath, nil
 	}
 
-	return filepath.Join(realParent, filepath.Base(absPath)), nil
+	finalPath := filepath.Join(realParent, filepath.Base(absPath))
+	if err := p.ensureAllowed(finalPath); err != nil {
+		return "", err
+	}
+	return finalPath, nil
 }
 
 func (p *PathPolicy) ResolveMove(src, dst string) (string, string, error) {
@@ -209,12 +243,32 @@ func (p *PathPolicy) evalPath(path string) (string, error) {
 }
 
 func (p *PathPolicy) ensureAllowed(path string) error {
+	if p.matchesPathRule(path, PathDecisionDeny) {
+		return fmt.Errorf("path rule によりアクセスが拒否されました: %s", path)
+	}
 	for _, root := range p.allowedRoots {
 		if withinRoot(path, root) {
 			return nil
 		}
 	}
+	if p.matchesPathRule(path, PathDecisionAllow) {
+		return nil
+	}
 	return fmt.Errorf("アクセスが許可されていないパスです: %s", path)
+}
+
+func (p *PathPolicy) matchesPathRule(path string, decision PathDecision) bool {
+	for _, rule := range p.rules {
+		if rule.decision != decision {
+			continue
+		}
+		for _, pattern := range rule.patterns {
+			if matchPolicyPath(pattern, path) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *PathPolicy) relativeDepth(path string) int {
@@ -248,4 +302,93 @@ func withinRoot(path, root string) bool {
 
 func samePath(a, b string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func compilePathRules(baseDir string, rules []PathRule) []compiledPathRule {
+	compiled := make([]compiledPathRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Decision != PathDecisionAllow && rule.Decision != PathDecisionDeny {
+			continue
+		}
+		patterns := make([]string, 0, len(rule.Patterns))
+		for _, pattern := range rule.Patterns {
+			normalized := normalizePolicyPattern(baseDir, pattern)
+			if normalized == "" {
+				continue
+			}
+			patterns = append(patterns, normalized)
+		}
+		if len(patterns) == 0 {
+			continue
+		}
+		compiled = append(compiled, compiledPathRule{decision: rule.Decision, patterns: patterns})
+	}
+	return compiled
+}
+
+func normalizePolicyPattern(baseDir string, pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return ""
+	}
+	resolved := pattern
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(baseDir, resolved)
+	}
+	resolved = filepath.Clean(resolved)
+	if !hasPathGlob(resolved) {
+		if realPath, err := filepath.EvalSymlinks(resolved); err == nil {
+			return realPath
+		}
+		return resolved
+	}
+	return normalizeGlobPolicyPattern(resolved)
+}
+
+func matchPolicyPath(pattern string, target string) bool {
+	pattern = filepath.Clean(pattern)
+	target = filepath.Clean(target)
+	if !hasPathGlob(pattern) {
+		return withinRoot(target, pattern)
+	}
+	slashPattern := filepath.ToSlash(pattern)
+	slashTarget := filepath.ToSlash(target)
+	if matched, err := pathMatch(slashPattern, slashTarget); err == nil && matched {
+		return true
+	}
+	if strings.Contains(slashPattern, "/**/") {
+		withoutRecursive := strings.ReplaceAll(slashPattern, "/**/", "/")
+		if matched, err := pathMatch(withoutRecursive, slashTarget); err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPathGlob(pattern string) bool {
+	return strings.ContainsAny(pattern, "*?[")
+}
+
+func normalizeGlobPolicyPattern(pattern string) string {
+	index := strings.IndexAny(pattern, "*?[")
+	if index < 0 {
+		return pattern
+	}
+	separator := strings.LastIndex(pattern[:index], string(filepath.Separator))
+	if separator < 0 {
+		return pattern
+	}
+	prefix := pattern[:separator]
+	rest := pattern[separator:]
+	if prefix == "" {
+		prefix = string(filepath.Separator)
+	}
+	if realPrefix, err := filepath.EvalSymlinks(prefix); err == nil {
+		return filepath.Clean(realPrefix + rest)
+	}
+	return pattern
+}
+
+func pathMatch(pattern string, target string) (bool, error) {
+	return filepath.Match(filepath.FromSlash(pattern), filepath.FromSlash(target))
 }

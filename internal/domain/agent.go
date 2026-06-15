@@ -23,20 +23,24 @@ const (
 )
 
 type Message struct {
-	Role       Role
-	Content    string
-	ToolCalls  []ToolCall
-	ToolCallID string
-	AgentID    string
-	Metadata   map[string]string
+	Role       Role              `json:"role"`
+	Content    string            `json:"content,omitempty"`
+	ToolCalls  []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID string            `json:"tool_call_id,omitempty"`
+	AgentID    string            `json:"agent_id,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 type ToolCall struct {
-	ID                 string
-	Name               string
-	Arguments          map[string]any
-	RequestedByAgentID string
-	Purpose            string
+	ID                 string         `json:"id,omitempty"`
+	Name               string         `json:"name"`
+	Arguments          map[string]any `json:"arguments,omitempty"`
+	RequestedByAgentID string         `json:"requested_by_agent_id,omitempty"`
+	Purpose            string         `json:"purpose,omitempty"`
+	RunID              string         `json:"run_id,omitempty"`
+	RootRunID          string         `json:"root_run_id,omitempty"`
+	Phase              RunPhase       `json:"phase,omitempty"`
+	Attempt            int            `json:"attempt,omitempty"`
 }
 
 type ToolClass string
@@ -86,17 +90,18 @@ type ToolFreshnessPolicy struct {
 }
 
 type ToolSemantics struct {
-	Class           ToolClass           `json:"class"`
-	ReusePolicy     ToolReusePolicy     `json:"reuse_policy"`
-	DuplicatePolicy ToolDuplicatePolicy `json:"duplicate_policy"`
-	Freshness       ToolFreshnessPolicy `json:"freshness"`
-	SideEffectClass SideEffectClass     `json:"side_effect_class"`
-	Source          string              `json:"source,omitempty"`
-	ReadPathArgs    []string            `json:"read_path_args,omitempty"`
-	WritePathArgs   []string            `json:"write_path_args,omitempty"`
-	IdentityArgs    []string            `json:"identity_args,omitempty"`
-	SourceLimit     int                 `json:"source_limit,omitempty"`
-	Stateful        bool                `json:"stateful,omitempty"`
+	Class            ToolClass           `json:"class"`
+	ReusePolicy      ToolReusePolicy     `json:"reuse_policy"`
+	DuplicatePolicy  ToolDuplicatePolicy `json:"duplicate_policy"`
+	Freshness        ToolFreshnessPolicy `json:"freshness"`
+	SideEffectClass  SideEffectClass     `json:"side_effect_class"`
+	Source           string              `json:"source,omitempty"`
+	ReadPathArgs     []string            `json:"read_path_args,omitempty"`
+	WritePathArgs    []string            `json:"write_path_args,omitempty"`
+	IdentityArgs     []string            `json:"identity_args,omitempty"`
+	IdentityDefaults map[string]any      `json:"identity_defaults,omitempty"`
+	SourceLimit      int                 `json:"source_limit,omitempty"`
+	Stateful         bool                `json:"stateful,omitempty"`
 }
 
 type ToolDefinition struct {
@@ -163,44 +168,47 @@ type ToolState struct {
 }
 
 type RunContext struct {
-	UserGoal            string
-	CurrentPhase        RunPhase
-	TaskBrief           string
-	RecentMessages      []Message
-	PacketRole          string
-	PacketKind          string
-	Observations        []ObservationRecord
-	Artifacts           []ArtifactReference
-	KnownFailures       []string
-	ScopedConstraints   []string
-	StableFacts         []string
-	RelevantFiles       []string
-	ArtifactRefs        []string
-	Constraints         []string
-	UnresolvedTODOs     []string
-	RecentFailures      []string
-	VerificationNotes   []string
-	AvailableToolNames  []string
-	EnabledCapabilities []string
-	ToolState           ToolState
-	AgentInventory      []AgentInventoryEntry
-	ExpectedOutput      map[string]any
-	ResumeSource        string
+	UserGoal              string
+	CurrentPhase          RunPhase
+	TaskBrief             string
+	RecentMessages        []Message
+	PacketRole            string
+	PacketKind            string
+	PacketBudgetTokens    int
+	PacketEstimatedTokens int
+	Observations          []ObservationRecord
+	Artifacts             []ArtifactReference
+	KnownFailures         []string
+	ScopedConstraints     []string
+	StableFacts           []string
+	RelevantFiles         []string
+	ArtifactRefs          []string
+	Constraints           []string
+	UnresolvedTODOs       []string
+	RecentFailures        []string
+	VerificationNotes     []string
+	AvailableToolNames    []string
+	EnabledCapabilities   []string
+	ToolState             ToolState
+	AgentInventory        []AgentInventoryEntry
+	ExpectedOutput        map[string]any
+	ResumeSource          string
 }
 
 type ContextPack = RunContext
 
 type AgentInvocation struct {
-	RunID       string
-	ParentRunID string
-	Agent       AgentSpec
-	Messages    []Message
-	Context     RunContext
-	Phase       RunPhase
-	Attempt     int
-	RootRunID   string
-	Model       string
-	Stream      bool
+	RunID          string
+	ParentRunID    string
+	Agent          AgentSpec
+	Messages       []Message
+	Context        RunContext
+	Phase          RunPhase
+	Attempt        int
+	RootRunID      string
+	Model          string
+	Stream         bool
+	ResponseFormat *ResponseFormat
 }
 
 type AgentResult struct {
@@ -220,6 +228,7 @@ type ExecutionEvent struct {
 	Attempt      int
 	Status       string
 	Detail       string
+	Display      string
 	ArtifactRef  string
 	Metrics      map[string]any
 	Timestamp    time.Time
@@ -251,16 +260,62 @@ type Orchestrator interface {
 }
 
 type ModelRequest struct {
-	Agent        AgentSpec
-	Instructions string
-	Messages     []Message
-	Phase        RunPhase
-	Model        string
-	Stream       bool
-	Tools        []ToolDefinition
+	RunID          string
+	RootRunID      string
+	Attempt        int
+	Agent          AgentSpec
+	Instructions   string
+	Messages       []Message
+	Phase          RunPhase
+	Model          string
+	Stream         bool
+	StreamHandler  ModelStreamHandler
+	Tools          []ToolDefinition
+	ResponseFormat *ResponseFormat
+	Settings       ModelSettings
+}
+
+type ModelStreamHandler func(ModelStreamEvent)
+
+type ModelStreamEvent struct {
+	Type         string
+	ContentDelta string
+	RawEventType string
 }
 
 type ModelResponse struct {
 	Message      Message
 	FinishReason string
+	Invocation   ModelInvocationMetadata
+}
+
+type ModelInvocationMetadata struct {
+	ServerName         string
+	Fallback           bool
+	FallbackFromServer string
+	API                string
+	Model              string
+	ProfileName        string
+	DurationMS         int64
+}
+
+type ModelSettings struct {
+	MaxOutputTokens   int
+	Temperature       *float64
+	TopP              *float64
+	TopK              int
+	MinP              *float64
+	PresencePenalty   *float64
+	RepetitionPenalty *float64
+	ReasoningEffort   string
+	TextVerbosity     string
+	ParallelToolCalls *bool
+	Store             *bool
+}
+
+type ResponseFormat struct {
+	Type   string
+	Name   string
+	Schema map[string]any
+	Strict bool
 }

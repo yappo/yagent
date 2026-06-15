@@ -3,20 +3,37 @@ package policy
 import (
 	"context"
 	"fmt"
+	"path"
+	"path/filepath"
 	"strings"
 
 	"yagent/internal/domain"
 )
 
-type Engine struct{}
+type Engine struct {
+	rules []Rule
+}
 
-func NewEngine() *Engine {
-	return &Engine{}
+type Rule struct {
+	Decision     domain.PolicyDecision
+	Tool         string
+	Action       string
+	ResourceKind string
+	Risk         string
+	Resources    []string
+	Agent        string
+	SideEffects  []string
+}
+
+func NewEngine(rules ...Rule) *Engine {
+	return &Engine{rules: append([]Rule(nil), rules...)}
 }
 
 func (e *Engine) Evaluate(_ context.Context, call domain.ToolCall) (domain.PolicyDecision, domain.PermissionRequest, error) {
 	req := domain.PermissionRequest{
 		ToolName: call.Name,
+		AgentID:  call.RequestedByAgentID,
+		Purpose:  call.Purpose,
 	}
 
 	switch call.Name {
@@ -112,21 +129,29 @@ func (e *Engine) Evaluate(_ context.Context, call domain.ToolCall) (domain.Polic
 		req.Operation = "タスク実行"
 		req.Action = "execute"
 		req.ResourceKind = "task"
-		req.Risk = "high"
+		req.Risk = fallbackString(stringValue(call.Arguments["_policy_risk"]), "high")
 		req.Scope = stringValue(call.Arguments["task_id"])
 		req.Resource = req.Scope
 		req.SideEffects = []string{"process_spawn"}
+		if boolValue(call.Arguments["_policy_allow_network"]) {
+			req.SideEffects = append(req.SideEffects, "network_access")
+			req.Risk = "high"
+		}
 		req.Summary = "登録済みタスクを実行します"
 	case "task_bind":
 		req.Operation = "MCP server bind"
 		req.Action = "spawn"
 		req.ResourceKind = "mcp_server"
-		req.Risk = "high"
+		req.Risk = fallbackString(stringValue(call.Arguments["_policy_risk"]), "high")
 		req.Scope = stringValue(call.Arguments["task_id"])
 		req.Resource = req.Scope
 		req.SideEffects = []string{"process_spawn"}
+		if boolValue(call.Arguments["_policy_allow_network"]) {
+			req.SideEffects = append(req.SideEffects, "network_access")
+			req.Risk = "high"
+		}
 		req.Summary = "登録済み MCP server を起動して bind します"
-	case "git_status", "git_diff", "git_log", "git_show":
+	case "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history":
 		req.Operation = "Git 情報取得"
 		req.Action = "git_read"
 		req.ResourceKind = "repository"
@@ -141,11 +166,28 @@ func (e *Engine) Evaluate(_ context.Context, call domain.ToolCall) (domain.Polic
 		if strings.HasPrefix(call.Name, "mcp__") {
 			req.Operation = "MCP tool 実行"
 			req.Action = "mcp_call"
+			if boolValue(call.Arguments["_policy_read_only"]) {
+				req.Action = "mcp_read"
+			}
 			req.ResourceKind = "mcp_tool"
-			req.Risk = "high"
+			req.Risk = fallbackString(stringValue(call.Arguments["_policy_risk"]), "high")
+			taskID := stringValue(call.Arguments["_policy_task_id"])
+			serverToolName := fallbackString(stringValue(call.Arguments["_policy_server_tool_name"]), call.Name)
 			req.Scope = call.Name
-			req.Resource = call.Name
+			req.Resource = serverToolName
+			if taskID != "" {
+				req.Scope = taskID + ":" + serverToolName
+				req.Resource = req.Scope
+			}
 			req.SideEffects = []string{"llm_disclosure", "external_tool_call"}
+			if !boolValue(call.Arguments["_policy_read_only"]) {
+				req.SideEffects = append(req.SideEffects, "external_mutation")
+				req.Risk = "high"
+			}
+			if boolValue(call.Arguments["_policy_allow_network"]) {
+				req.SideEffects = append(req.SideEffects, "network_access")
+				req.Risk = "high"
+			}
 			req.Summary = "bind 済み MCP tool を実行します"
 			break
 		}
@@ -155,7 +197,104 @@ func (e *Engine) Evaluate(_ context.Context, call domain.ToolCall) (domain.Polic
 	if req.Scope == "" {
 		return domain.PolicyDeny, req, fmt.Errorf("permission scope を解決できませんでした")
 	}
+	if decision, ok := e.matchRule(req); ok {
+		return decision, req, nil
+	}
 	return domain.PolicyRequireApproval, req, nil
+}
+
+func (e *Engine) matchRule(request domain.PermissionRequest) (domain.PolicyDecision, bool) {
+	for _, rule := range e.rules {
+		if rule.matches(request) {
+			return rule.Decision, true
+		}
+	}
+	return "", false
+}
+
+func (r Rule) matches(request domain.PermissionRequest) bool {
+	if r.Decision == "" {
+		return false
+	}
+	if r.Tool != "" && !matchSelector(r.Tool, request.ToolName) {
+		return false
+	}
+	if r.Action != "" && !matchSelector(r.Action, request.Action) {
+		return false
+	}
+	if r.ResourceKind != "" && !matchSelector(r.ResourceKind, request.ResourceKind) {
+		return false
+	}
+	if r.Risk != "" && !matchSelector(r.Risk, request.Risk) {
+		return false
+	}
+	if r.Agent != "" && !matchSelector(r.Agent, request.AgentID) {
+		return false
+	}
+	if len(r.Resources) > 0 && !matchAnyResource(r.Resources, request.Resource) {
+		return false
+	}
+	if len(r.SideEffects) > 0 && !containsAll(request.SideEffects, r.SideEffects) {
+		return false
+	}
+	return true
+}
+
+func matchAnyResource(patterns []string, resource string) bool {
+	for _, patternValue := range patterns {
+		if matchResource(patternValue, resource) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchResource(patternValue string, resource string) bool {
+	patternValue = strings.TrimSpace(patternValue)
+	resource = strings.TrimSpace(resource)
+	if patternValue == "" || resource == "" {
+		return false
+	}
+	if patternValue == resource {
+		return true
+	}
+	cleanResource := filepath.ToSlash(filepath.Clean(resource))
+	cleanPattern := filepath.ToSlash(patternValue)
+	if matched, err := path.Match(cleanPattern, cleanResource); err == nil && matched {
+		return true
+	}
+	if base := path.Base(cleanResource); base != "." && base != "/" {
+		if matched, err := path.Match(cleanPattern, base); err == nil && matched {
+			return true
+		}
+	}
+	return strings.HasPrefix(resource, patternValue)
+}
+
+func matchSelector(patternValue string, value string) bool {
+	patternValue = strings.TrimSpace(patternValue)
+	value = strings.TrimSpace(value)
+	if patternValue == "" {
+		return true
+	}
+	if patternValue == value {
+		return true
+	}
+	matched, err := path.Match(patternValue, value)
+	return err == nil && matched
+}
+
+func containsAll(values []string, required []string) bool {
+	set := map[string]struct{}{}
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	for _, value := range required {
+		if _, ok := set[value]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func stringValue(v any) string {
@@ -166,4 +305,11 @@ func stringValue(v any) string {
 func boolValue(v any) bool {
 	b, _ := v.(bool)
 	return b
+}
+
+func fallbackString(value string, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
 }
