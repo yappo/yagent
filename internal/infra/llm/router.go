@@ -104,19 +104,21 @@ func (r *Router) Generate(ctx context.Context, request domain.ModelRequest) (dom
 	}
 	fallback, ok := r.clients[profile.FallbackServer]
 	if !ok {
-		return domain.ModelResponse{}, err
+		return response, err
 	}
 	fallbackTarget := r.servers[profile.FallbackServer]
 	if profile.FallbackModel != "" {
 		resolved.Model = profile.FallbackModel
 	}
-	return r.generateWithAudit(ctx, fallback, resolved, modelInvocationMeta{
+	fallbackResponse, fallbackErr := r.generateWithAudit(ctx, fallback, resolved, modelInvocationMeta{
 		profileName:        profileName,
 		serverName:         profile.FallbackServer,
 		server:             fallbackTarget,
 		fallback:           true,
 		fallbackFromServer: serverName,
 	})
+	fallbackResponse.Invocation.Attempts = append(response.Invocation.Attempts, fallbackResponse.Invocation.Attempts...)
+	return fallbackResponse, fallbackErr
 }
 
 type modelInvocationMeta struct {
@@ -131,13 +133,13 @@ func (r *Router) generateWithAudit(ctx context.Context, client *Client, request 
 	start := time.Now()
 	response, err := client.Generate(ctx, request)
 	duration := time.Since(start)
-	response.Invocation = modelInvocationMetadata(request, meta, duration)
+	response.Invocation = modelInvocationMetadata(request, meta, duration, response.Invocation.Usage, err)
 	r.saveModelInvocation(ctx, request, response, err, meta, duration, start)
 	return response, err
 }
 
-func modelInvocationMetadata(request domain.ModelRequest, meta modelInvocationMeta, duration time.Duration) domain.ModelInvocationMetadata {
-	return domain.ModelInvocationMetadata{
+func modelInvocationMetadata(request domain.ModelRequest, meta modelInvocationMeta, duration time.Duration, usage domain.ModelUsage, callErr error) domain.ModelInvocationMetadata {
+	attempt := domain.ModelInvocationAttempt{
 		ServerName:         meta.serverName,
 		Fallback:           meta.fallback,
 		FallbackFromServer: meta.fallbackFromServer,
@@ -145,6 +147,22 @@ func modelInvocationMetadata(request domain.ModelRequest, meta modelInvocationMe
 		Model:              request.Model,
 		ProfileName:        meta.profileName,
 		DurationMS:         duration.Milliseconds(),
+		Usage:              usage,
+		Success:            callErr == nil,
+	}
+	if callErr != nil {
+		attempt.Error = callErr.Error()
+	}
+	return domain.ModelInvocationMetadata{
+		ServerName:         attempt.ServerName,
+		Fallback:           attempt.Fallback,
+		FallbackFromServer: attempt.FallbackFromServer,
+		API:                attempt.API,
+		Model:              attempt.Model,
+		ProfileName:        attempt.ProfileName,
+		DurationMS:         attempt.DurationMS,
+		Usage:              attempt.Usage,
+		Attempts:           []domain.ModelInvocationAttempt{attempt},
 	}
 }
 
@@ -170,6 +188,7 @@ func (r *Router) saveModelInvocation(ctx context.Context, request domain.ModelRe
 		Messages:           len(request.Messages),
 		Tools:              len(request.Tools),
 		Settings:           modelInvocationSettings(request.Settings),
+		Usage:              response.Invocation.Usage,
 		DurationMS:         duration.Milliseconds(),
 		Success:            callErr == nil,
 		FinishReason:       response.FinishReason,

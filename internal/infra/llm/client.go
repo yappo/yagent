@@ -49,6 +49,7 @@ type chatRequestDTO struct {
 	Messages          []messageDTO           `json:"messages"`
 	Model             string                 `json:"model,omitempty"`
 	Stream            bool                   `json:"stream,omitempty"`
+	StreamOptions     *chatStreamOptionsDTO  `json:"stream_options,omitempty"`
 	Tools             []toolDefinitionDTO    `json:"tools,omitempty"`
 	ResponseFormat    *chatResponseFormatDTO `json:"response_format,omitempty"`
 	MaxTokens         int                    `json:"max_tokens,omitempty"`
@@ -61,6 +62,10 @@ type chatRequestDTO struct {
 	ReasoningEffort   string                 `json:"reasoning_effort,omitempty"`
 	ParallelToolCalls *bool                  `json:"parallel_tool_calls,omitempty"`
 	Store             *bool                  `json:"store,omitempty"`
+}
+
+type chatStreamOptionsDTO struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatResponseFormatDTO struct {
@@ -104,6 +109,19 @@ type chatResponseDTO struct {
 		Message      messageDTO `json:"message"`
 		FinishReason string     `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *chatUsageDTO `json:"usage,omitempty"`
+}
+
+type chatUsageDTO struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details,omitempty"`
 }
 
 type chatStreamChunkDTO struct {
@@ -111,6 +129,7 @@ type chatStreamChunkDTO struct {
 		Delta        chatStreamDeltaDTO `json:"delta"`
 		FinishReason string             `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *chatUsageDTO `json:"usage,omitempty"`
 }
 
 type chatStreamDeltaDTO struct {
@@ -185,13 +204,26 @@ type responsesFunctionCallOutputDTO struct {
 }
 
 type responsesResponseDTO struct {
-	ID     string            `json:"id"`
-	Status string            `json:"status"`
-	Output []json.RawMessage `json:"output"`
+	ID     string             `json:"id"`
+	Status string             `json:"status"`
+	Output []json.RawMessage  `json:"output"`
+	Usage  *responsesUsageDTO `json:"usage,omitempty"`
 	Error  *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error,omitempty"`
+}
+
+type responsesUsageDTO struct {
+	InputTokens        int `json:"input_tokens"`
+	OutputTokens       int `json:"output_tokens"`
+	TotalTokens        int `json:"total_tokens"`
+	InputTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details,omitempty"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details,omitempty"`
 }
 
 type responsesOutputItemDTO struct {
@@ -257,6 +289,7 @@ func (c *Client) generateChatCompletions(ctx context.Context, request domain.Mod
 	return domain.ModelResponse{
 		Message:      fromMessageDTO(decoded.Choices[0].Message),
 		FinishReason: decoded.Choices[0].FinishReason,
+		Invocation:   domain.ModelInvocationMetadata{Usage: fromChatUsage(decoded.Usage)},
 	}, nil
 }
 
@@ -275,6 +308,7 @@ func (c *Client) generateChatCompletionsStream(ctx context.Context, request doma
 	message := domain.Message{Role: domain.RoleAssistant}
 	var finishReason string
 	var toolCalls []streamToolCallState
+	var usage domain.ModelUsage
 	err = readSSE(resp.Body, func(data []byte) error {
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 			return nil
@@ -282,6 +316,9 @@ func (c *Client) generateChatCompletionsStream(ctx context.Context, request doma
 		var chunk chatStreamChunkDTO
 		if err := json.Unmarshal(data, &chunk); err != nil {
 			return fmt.Errorf("stream chunk のデコードに失敗しました: %w", err)
+		}
+		if chunk.Usage != nil {
+			usage = fromChatUsage(chunk.Usage)
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Role != "" {
@@ -316,7 +353,7 @@ func (c *Client) generateChatCompletionsStream(ctx context.Context, request doma
 		return domain.ModelResponse{}, err
 	}
 	message.ToolCalls = streamToolCalls(toolCalls)
-	return domain.ModelResponse{Message: message, FinishReason: finishReason}, nil
+	return domain.ModelResponse{Message: message, FinishReason: finishReason, Invocation: domain.ModelInvocationMetadata{Usage: usage}}, nil
 }
 
 func (c *Client) generateResponses(ctx context.Context, request domain.ModelRequest) (domain.ModelResponse, error) {
@@ -345,7 +382,7 @@ func (c *Client) generateResponses(ctx context.Context, request domain.ModelRequ
 		return domain.ModelResponse{}, fmt.Errorf("LLM サーバーから応答がありません")
 	}
 	message := fromResponsesOutput(decoded.Output)
-	return domain.ModelResponse{Message: message, FinishReason: decoded.Status}, nil
+	return domain.ModelResponse{Message: message, FinishReason: decoded.Status, Invocation: domain.ModelInvocationMetadata{Usage: fromResponsesUsage(decoded.Usage)}}, nil
 }
 
 func (c *Client) generateResponsesStream(ctx context.Context, request domain.ModelRequest) (domain.ModelResponse, error) {
@@ -364,6 +401,7 @@ func (c *Client) generateResponsesStream(ctx context.Context, request domain.Mod
 	output := []json.RawMessage{}
 	var content strings.Builder
 	finishReason := ""
+	var latestUsage domain.ModelUsage
 	err = readSSE(resp.Body, func(data []byte) error {
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 			return nil
@@ -374,6 +412,9 @@ func (c *Client) generateResponsesStream(ctx context.Context, request domain.Mod
 		}
 		if event.Error != nil {
 			return fmt.Errorf("Responses API stream error: %s", event.Error.Message)
+		}
+		if event.Response != nil && event.Response.Usage != nil {
+			latestUsage = fromResponsesUsage(event.Response.Usage)
 		}
 		switch event.Type {
 		case "response.output_text.delta":
@@ -410,19 +451,58 @@ func (c *Client) generateResponsesStream(ctx context.Context, request domain.Mod
 			return domain.ModelResponse{}, fmt.Errorf("Responses API error: %s", completed.Error.Message)
 		}
 		if len(completed.Output) > 0 {
-			return domain.ModelResponse{Message: fromResponsesOutput(completed.Output), FinishReason: completed.Status}, nil
+			return domain.ModelResponse{Message: fromResponsesOutput(completed.Output), FinishReason: completed.Status, Invocation: domain.ModelInvocationMetadata{Usage: latestUsage}}, nil
 		}
 		if completed.Status != "" {
 			finishReason = completed.Status
 		}
 	}
 	if len(output) > 0 {
-		return domain.ModelResponse{Message: fromResponsesOutput(output), FinishReason: finishReason}, nil
+		return domain.ModelResponse{Message: fromResponsesOutput(output), FinishReason: finishReason, Invocation: domain.ModelInvocationMetadata{Usage: latestUsage}}, nil
 	}
 	return domain.ModelResponse{
 		Message:      domain.Message{Role: domain.RoleAssistant, Content: content.String()},
 		FinishReason: finishReason,
+		Invocation:   domain.ModelInvocationMetadata{Usage: latestUsage},
 	}, nil
+}
+
+func fromChatUsage(usage *chatUsageDTO) domain.ModelUsage {
+	if usage == nil {
+		return domain.ModelUsage{}
+	}
+	result := domain.ModelUsage{
+		Available:    true,
+		InputTokens:  usage.PromptTokens,
+		OutputTokens: usage.CompletionTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	if usage.PromptTokensDetails != nil {
+		result.CachedInputTokens = usage.PromptTokensDetails.CachedTokens
+	}
+	if usage.CompletionTokensDetails != nil {
+		result.ReasoningTokens = usage.CompletionTokensDetails.ReasoningTokens
+	}
+	return result
+}
+
+func fromResponsesUsage(usage *responsesUsageDTO) domain.ModelUsage {
+	if usage == nil {
+		return domain.ModelUsage{}
+	}
+	result := domain.ModelUsage{
+		Available:    true,
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	if usage.InputTokensDetails != nil {
+		result.CachedInputTokens = usage.InputTokensDetails.CachedTokens
+	}
+	if usage.OutputTokensDetails != nil {
+		result.ReasoningTokens = usage.OutputTokensDetails.ReasoningTokens
+	}
+	return result
 }
 
 func (c *Client) post(ctx context.Context, path string, payload []byte) ([]byte, error) {
@@ -490,6 +570,9 @@ func toChatRequestDTO(request domain.ModelRequest) chatRequestDTO {
 		ReasoningEffort:   request.Settings.ReasoningEffort,
 		ParallelToolCalls: request.Settings.ParallelToolCalls,
 		Store:             request.Settings.Store,
+	}
+	if request.Stream {
+		dto.StreamOptions = &chatStreamOptionsDTO{IncludeUsage: true}
 	}
 
 	for _, message := range messages {

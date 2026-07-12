@@ -16,6 +16,9 @@ func TestRootCommandIncludesSetup(t *testing.T) {
 	if command == nil || command.Use != "setup" {
 		t.Fatalf("expected setup command, got %+v", command)
 	}
+	if command.Flags().Lookup("local-preset") == nil {
+		t.Fatal("expected setup --local-preset flag")
+	}
 }
 
 func TestRenderSetupResult(t *testing.T) {

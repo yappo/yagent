@@ -20,6 +20,7 @@ func AgentDSLJSONSchema() map[string]any {
 			"routing_profile":           stringSchema("Routing profile override for this agent."),
 			"timeout":                   durationSchema("LLM call timeout as a Go duration string such as 30s or 2m."),
 			"max_turns":                 nonNegativeIntegerSchema("Maximum continuation turns for this agent. Zero uses the orchestrator default."),
+			"max_tool_calls":            nonNegativeIntegerSchema("Maximum tool calls for this agent. Zero uses the orchestrator default, except tool-free planner contracts."),
 			"token_budget":              nonNegativeIntegerSchema("Approximate context packet token budget for this agent. Zero means unlimited."),
 			"tags":                      nonEmptyStringArraySchema("Human-oriented labels."),
 			"task_kinds":                enumArraySchema([]string{"unknown", "casual", "question", "research", "docs", "review", "test", "mutate"}, "Task kinds this agent is a good fit for."),

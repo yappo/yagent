@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"yagent/internal/config"
 	"yagent/internal/domain"
@@ -15,6 +16,7 @@ import (
 	"yagent/internal/infra/logging"
 	mcpstdio "yagent/internal/infra/mcp/stdio"
 	"yagent/internal/infra/policy"
+	"yagent/internal/infra/processisolation"
 	"yagent/internal/infra/state"
 	fstools "yagent/internal/infra/tools/fs"
 	gittools "yagent/internal/infra/tools/git"
@@ -36,6 +38,7 @@ type Container struct {
 	MCPBindings     domain.MCPConnectionManager
 	AgentCatalog    domain.AgentCatalog
 	RunStore        domain.RunStateStore
+	WorkflowStore   domain.DurableWorkflowStore
 	MemoryStore     domain.RepoMemoryStore
 	WorkingDir      string
 	DefaultModel    string
@@ -44,7 +47,9 @@ type Container struct {
 }
 
 type BuildOptions struct {
-	LogPath string
+	LogPath           string
+	WorkingDir        string
+	IsolatedWorkspace bool
 }
 
 func Build(configPath string, approver domain.Approver, options BuildOptions) (*Container, error) {
@@ -61,9 +66,9 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 		return nil, err
 	}
 
-	pwd, err := os.Getwd()
+	pwd, err := resolveWorkingDir(options.WorkingDir)
 	if err != nil {
-		return nil, fmt.Errorf("カレントディレクトリの取得に失敗しました: %w", err)
+		return nil, err
 	}
 
 	var logger *logging.Logger
@@ -78,22 +83,19 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 	allowPaths := append([]string{pwd}, cfg.File.AllowPaths...)
 	pathPolicy := policy.NewPathPolicyWithRules(pwd, allowPaths, pathRulesFromConfig(cfg.File))
 	policyEngine := policy.NewEngine(policyRulesFromConfig(cfg.Permission.Rules)...)
-	var runStore *state.FileStore
-	if cfg.Memory.Enabled {
-		stateDir := cfg.Memory.StateDir
-		if !filepath.IsAbs(stateDir) {
-			stateDir = filepath.Join(pwd, stateDir)
-		}
-		runStore, err = state.NewFileStore(stateDir)
-		if err != nil {
-			return nil, err
-		}
+	stateDir := cfg.Memory.StateDir
+	if !filepath.IsAbs(stateDir) {
+		stateDir = filepath.Join(pwd, stateDir)
+	}
+	runStore, err := state.NewFileStore(stateDir)
+	if err != nil {
+		return nil, err
 	}
 	if runStore != nil && approver != nil {
 		approver = audit.PermissionAuditApprover{Base: approver, Store: runStore}
 	}
 	memoryStore := domain.RepoMemoryStore(nil)
-	if cfg.Features.RepoMemory {
+	if cfg.Memory.Enabled && cfg.Features.RepoMemory {
 		memoryStore = runStore
 	}
 	contextCfg := cfg.Context
@@ -105,11 +107,18 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 	}
 	contextEngine := contextengine.New(contextCfg, memoryStore, runStore, cfg.Memory.MaxFacts)
 
-	taskCatalog, err := taskcatalog.New(pwd)
+	taskCatalog, err := taskcatalog.NewWithOptions(pwd, taskcatalog.LoadOptions{
+		IncludeUserTasks: !options.IsolatedWorkspace,
+		ConfineToWorkDir: options.IsolatedWorkspace,
+	})
 	if err != nil {
 		return nil, err
 	}
-	mcpBindings := taskcatalog.NewMCPBindings(mcpstdio.NewFactory(logger))
+	isolation, err := processisolation.New(cfg.Execution.ProcessIsolation)
+	if err != nil {
+		return nil, err
+	}
+	mcpBindings := taskcatalog.NewMCPBindings(mcpstdio.NewFactoryWithIsolation(logger, isolation))
 
 	tools := registry.New(
 		fstools.NewReadTool(pathPolicy, policyEngine, approver),
@@ -128,11 +137,12 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 		gittools.NewBlameTool(pathPolicy, policyEngine, approver),
 		gittools.NewFileHistoryTool(pathPolicy, policyEngine, approver),
 		tasktools.NewListTool(taskCatalog, mcpBindings),
-		tasktools.NewRunTool(taskCatalog, policyEngine, approver, memoryStore),
-		tasktools.NewBindTool(taskCatalog, mcpBindings, policyEngine, approver),
+		tasktools.NewRunToolWithOptions(taskCatalog, policyEngine, approver, memoryStore, tasktools.ExecutionOptions{AllowProcessExecution: !options.IsolatedWorkspace || isolation != nil, Isolation: isolation}),
+		tasktools.NewBindToolWithOptions(taskCatalog, mcpBindings, policyEngine, approver, tasktools.ExecutionOptions{AllowProcessExecution: !options.IsolatedWorkspace || isolation != nil}),
 		patchtools.New(pathPolicy, policyEngine, approver),
 	)
 	tools.RegisterProvider(mcptools.NewProvider(mcpBindings, policyEngine, approver))
+	tools.SetDurableActionGuard(state.NewDurableActionGuard(runStore))
 
 	agents := agentcatalog.New(cfg.Agents)
 	if err := agents.LoadUserAgents(cfg.AgentCatalog.Paths); err != nil {
@@ -166,18 +176,56 @@ func BuildFromConfig(cfg config.Config, approver domain.Approver, options BuildO
 			MemoryStore:             memoryStore,
 			RuntimeStore:            runStore,
 			ConversationStore:       runStore,
+			WorkflowStore:           runStore,
+			WorkerID:                fmt.Sprintf("worker-%d-%d", os.Getpid(), time.Now().UnixNano()),
+			WorkflowLeaseDuration:   workflowLeaseDuration(cfg.Execution.DefaultTimeout.Duration),
 		}),
 		Tools:           tools,
 		TaskCatalog:     taskCatalog,
 		MCPBindings:     mcpBindings,
 		AgentCatalog:    agents,
 		RunStore:        runStore,
+		WorkflowStore:   runStore,
 		MemoryStore:     memoryStore,
 		WorkingDir:      pwd,
 		DefaultModel:    server.Model,
 		RoutingProfiles: routingProfileNames(cfg.Routing.Profiles),
 		Closer:          logger,
 	}, nil
+}
+
+func resolveWorkingDir(override string) (string, error) {
+	workingDir := override
+	if workingDir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("カレントディレクトリの取得に失敗しました: %w", err)
+		}
+		workingDir = cwd
+	}
+	abs, err := filepath.Abs(workingDir)
+	if err != nil {
+		return "", fmt.Errorf("作業ディレクトリの解決に失敗しました: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("作業ディレクトリの確認に失敗しました: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("作業ディレクトリはディレクトリである必要があります: %s", abs)
+	}
+	return abs, nil
+}
+
+func workflowLeaseDuration(defaultTimeout time.Duration) time.Duration {
+	duration := 2 * defaultTimeout
+	if duration < 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return duration
 }
 
 func routingProfileNames(profiles map[string]config.RoutingProfileConfig) []string {

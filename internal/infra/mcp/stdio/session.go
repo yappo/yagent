@@ -15,14 +15,20 @@ import (
 	"sync/atomic"
 
 	"yagent/internal/domain"
+	"yagent/internal/infra/processisolation"
 )
 
 type Factory struct {
-	logger domain.StructuredLogSink
+	logger    domain.StructuredLogSink
+	isolation processisolation.Wrapper
 }
 
 func NewFactory(logger domain.StructuredLogSink) *Factory {
-	return &Factory{logger: logger}
+	return NewFactoryWithIsolation(logger, nil)
+}
+
+func NewFactoryWithIsolation(logger domain.StructuredLogSink, isolation processisolation.Wrapper) *Factory {
+	return &Factory{logger: logger, isolation: isolation}
 }
 
 func (f *Factory) Open(_ context.Context, task domain.TaskDefinition) (domain.MCPSession, error) {
@@ -32,9 +38,20 @@ func (f *Factory) Open(_ context.Context, task domain.TaskDefinition) (domain.MC
 	if task.MCPServer.Transport != "" && task.MCPServer.Transport != domain.MCPTransportStdio {
 		return nil, fmt.Errorf("未対応の MCP transport です: %s", task.MCPServer.Transport)
 	}
-	cmd := exec.Command(task.MCPServer.Command, task.MCPServer.Args...)
-	cmd.Dir = task.MCPServer.Cwd
-	cmd.Env = mergeEnv(task.MCPServer.Env)
+	command := task.MCPServer.Command
+	args := append([]string(nil), task.MCPServer.Args...)
+	cwd := task.MCPServer.Cwd
+	env := task.MCPServer.Env
+	if f.isolation != nil {
+		spec, err := f.isolation.Wrap(processisolation.Request{Mode: processisolation.ModeMCPStdio, Command: command, Args: args, Cwd: cwd, Env: env, ReadPaths: append([]string(nil), task.MCPServer.Roots...), AllowNetwork: task.MCPServer.AllowNetwork})
+		if err != nil {
+			return nil, fmt.Errorf("wrap MCP server with process isolation: %w", err)
+		}
+		command, args, cwd, env = spec.Command, spec.Args, spec.Cwd, spec.Env
+	}
+	cmd := exec.Command(command, args...)
+	cmd.Dir = cwd
+	cmd.Env = mergeEnv(env)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -163,12 +180,13 @@ func (s *Session) ListTools(ctx context.Context) ([]domain.MCPToolDescriptor, er
 		s.tools = make([]domain.MCPToolDescriptor, 0, len(payload.Tools))
 		for _, tool := range payload.Tools {
 			s.tools = append(s.tools, domain.MCPToolDescriptor{
-				Name:         tool.Name,
-				Description:  tool.Description,
-				InputSchema:  tool.InputSchema,
-				Annotations:  tool.Annotations,
-				ReadOnly:     annotationBool(tool.Annotations, "readOnlyHint"),
-				ParallelSafe: !annotationBool(tool.Annotations, "destructiveHint"),
+				Name:                   tool.Name,
+				Description:            tool.Description,
+				InputSchema:            tool.InputSchema,
+				Annotations:            tool.Annotations,
+				ReadOnly:               annotationBool(tool.Annotations, "readOnlyHint"),
+				ParallelSafe:           !annotationBool(tool.Annotations, "destructiveHint"),
+				SupportsDurableFencing: annotationBool(tool.Annotations, "dev.yagent/durable-action-fencing"),
 			})
 		}
 	})
@@ -180,24 +198,35 @@ func (s *Session) ListTools(ctx context.Context) ([]domain.MCPToolDescriptor, er
 	return out, nil
 }
 
-func (s *Session) CallTool(ctx context.Context, name string, arguments map[string]any) (string, error) {
+func (s *Session) CallTool(ctx context.Context, name string, arguments map[string]any, metadata map[string]any) (domain.MCPToolCallResult, error) {
 	s.callLock.Lock()
 	defer s.callLock.Unlock()
 
-	raw, err := s.call(ctx, "tools/call", map[string]any{
+	params := map[string]any{
 		"name":      name,
 		"arguments": arguments,
-	})
+	}
+	if len(metadata) > 0 {
+		params["_meta"] = metadata
+	}
+	raw, err := s.call(ctx, "tools/call", params)
 	if err != nil {
-		return "", err
+		return domain.MCPToolCallResult{}, err
 	}
 	var payload struct {
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		Metadata map[string]any `json:"_meta"`
 	}
-	if err := json.Unmarshal(raw, &payload); err == nil && len(payload.Content) > 0 {
+	result := domain.MCPToolCallResult{}
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		result.Metadata = payload.Metadata
+		if len(payload.Content) == 0 {
+			result.Output = string(raw)
+			return result, nil
+		}
 		var parts []string
 		for _, item := range payload.Content {
 			if item.Text != "" {
@@ -205,10 +234,12 @@ func (s *Session) CallTool(ctx context.Context, name string, arguments map[strin
 			}
 		}
 		if len(parts) > 0 {
-			return strings.Join(parts, "\n"), nil
+			result.Output = strings.Join(parts, "\n")
+			return result, nil
 		}
 	}
-	return string(raw), nil
+	result.Output = string(raw)
+	return result, nil
 }
 
 func (s *Session) Close() error {

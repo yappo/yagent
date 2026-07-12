@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"yagent/internal/domain"
+	"yagent/internal/infra/processisolation"
 	"yagent/internal/infra/tools/execctx"
 )
 
@@ -21,17 +23,25 @@ type listTool struct {
 }
 
 type runTool struct {
-	catalog  domain.TaskCatalog
-	engine   domain.PolicyEngine
-	approver domain.Approver
-	memory   domain.RepoMemoryStore
+	catalog          domain.TaskCatalog
+	engine           domain.PolicyEngine
+	approver         domain.Approver
+	memory           domain.RepoMemoryStore
+	processExecution bool
+	isolation        processisolation.Wrapper
 }
 
 type bindTool struct {
-	catalog  domain.TaskCatalog
-	bindings domain.MCPConnectionManager
-	engine   domain.PolicyEngine
-	approver domain.Approver
+	catalog          domain.TaskCatalog
+	bindings         domain.MCPConnectionManager
+	engine           domain.PolicyEngine
+	approver         domain.Approver
+	processExecution bool
+}
+
+type ExecutionOptions struct {
+	AllowProcessExecution bool
+	Isolation             processisolation.Wrapper
 }
 
 func NewListTool(catalog domain.TaskCatalog, bindings domain.MCPConnectionManager) domain.Tool {
@@ -39,11 +49,19 @@ func NewListTool(catalog domain.TaskCatalog, bindings domain.MCPConnectionManage
 }
 
 func NewRunTool(catalog domain.TaskCatalog, engine domain.PolicyEngine, approver domain.Approver, memory domain.RepoMemoryStore) domain.Tool {
-	return &runTool{catalog: catalog, engine: engine, approver: approver, memory: memory}
+	return NewRunToolWithOptions(catalog, engine, approver, memory, ExecutionOptions{AllowProcessExecution: true})
 }
 
 func NewBindTool(catalog domain.TaskCatalog, bindings domain.MCPConnectionManager, engine domain.PolicyEngine, approver domain.Approver) domain.Tool {
-	return &bindTool{catalog: catalog, bindings: bindings, engine: engine, approver: approver}
+	return NewBindToolWithOptions(catalog, bindings, engine, approver, ExecutionOptions{AllowProcessExecution: true})
+}
+
+func NewRunToolWithOptions(catalog domain.TaskCatalog, engine domain.PolicyEngine, approver domain.Approver, memory domain.RepoMemoryStore, options ExecutionOptions) domain.Tool {
+	return &runTool{catalog: catalog, engine: engine, approver: approver, memory: memory, processExecution: options.AllowProcessExecution, isolation: options.Isolation}
+}
+
+func NewBindToolWithOptions(catalog domain.TaskCatalog, bindings domain.MCPConnectionManager, engine domain.PolicyEngine, approver domain.Approver, options ExecutionOptions) domain.Tool {
+	return &bindTool{catalog: catalog, bindings: bindings, engine: engine, approver: approver, processExecution: options.AllowProcessExecution}
 }
 
 func (t *listTool) Definition() domain.ToolDefinition {
@@ -257,6 +275,9 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	if !ok || taskID == "" {
 		return failure(call, "missing_task_id", "task_id パラメータが必要です", nil)
 	}
+	if !t.processExecution {
+		return taskFailure(call, "process_execution_disabled", "この実行環境では OS-level process sandbox が未構成のため task_run は無効です", taskID, nil)
+	}
 	taskDef, ok := t.catalog.Get(ctx, taskID)
 	if !ok {
 		return taskFailure(call, "unknown_task", fmt.Sprintf("登録されていない task_id です: %s", taskID), taskID, nil)
@@ -277,8 +298,22 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, taskDef.Command.Command, taskDef.Command.Args...)
-	cmd.Dir = taskDef.Command.Cwd
+	command := taskDef.Command.Command
+	args := append([]string(nil), taskDef.Command.Args...)
+	cwd := taskDef.Command.Cwd
+	env := map[string]string(nil)
+	if t.isolation != nil {
+		spec, wrapErr := t.isolation.Wrap(processisolation.Request{Mode: processisolation.ModeCommand, Command: command, Args: args, Cwd: cwd, ReadPaths: append([]string(nil), taskDef.Command.ReadPaths...), WritePaths: append([]string(nil), taskDef.Command.WritePaths...), AllowNetwork: taskDef.Command.AllowNetwork})
+		if wrapErr != nil {
+			return taskFailure(call, "process_isolation_failed", wrapErr.Error(), taskID, nil)
+		}
+		command, args, cwd, env = spec.Command, spec.Args, spec.Cwd, spec.Env
+	}
+	cmd := exec.CommandContext(runCtx, command, args...)
+	cmd.Dir = cwd
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), environmentEntries(env)...)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -302,10 +337,22 @@ func (t *runTool) Execute(ctx context.Context, call domain.ToolCall) domain.Tool
 	return success(call, output)
 }
 
+func environmentEntries(values map[string]string) []string {
+	entries := make([]string, 0, len(values))
+	for key, value := range values {
+		entries = append(entries, key+"="+value)
+	}
+	slices.Sort(entries)
+	return entries
+}
+
 func (t *bindTool) Execute(ctx context.Context, call domain.ToolCall) domain.ToolResult {
 	taskID, ok := call.Arguments["task_id"].(string)
 	if !ok || taskID == "" {
 		return failure(call, "missing_task_id", "task_id パラメータが必要です", nil)
+	}
+	if !t.processExecution {
+		return taskFailure(call, "process_execution_disabled", "この実行環境では OS-level process sandbox が未構成のため task_bind は無効です", taskID, nil)
 	}
 	taskDef, ok := t.catalog.Get(ctx, taskID)
 	if !ok {

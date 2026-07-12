@@ -6,9 +6,104 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
+type styles struct {
+	user               lipgloss.Style
+	assistant          lipgloss.Style
+	tool               lipgloss.Style
+	separator          lipgloss.Style
+	hint               lipgloss.Style
+	markdownHeading    lipgloss.Style
+	markdownList       lipgloss.Style
+	markdownQuote      lipgloss.Style
+	markdownCode       lipgloss.Style
+	toolCard           lipgloss.Style
+	toolTitle          lipgloss.Style
+	toolMeta           lipgloss.Style
+	toolOption         lipgloss.Style
+	toolSuccess        lipgloss.Style
+	toolFailure        lipgloss.Style
+	toolLogCard        lipgloss.Style
+	toolLogTitle       lipgloss.Style
+	toolLogHint        lipgloss.Style
+	permissionCard     lipgloss.Style
+	permissionTitle    lipgloss.Style
+	permissionPath     lipgloss.Style
+	permissionHelp     lipgloss.Style
+	permissionOption   lipgloss.Style
+	permissionSelected lipgloss.Style
+	commandHint        lipgloss.Style
+	commandCandidate   lipgloss.Style
+	commandSelected    lipgloss.Style
+	panelTab           lipgloss.Style
+	panelTabActive     lipgloss.Style
+	panelMeta          lipgloss.Style
+}
+
 const defaultThemeName = "default"
 
 var themeNames = []string{defaultThemeName, "contrast", "mono"}
+
+func defaultStyles() styles {
+	return styles{
+		user:      lipgloss.NewStyle().Foreground(lipgloss.Color("206")).Bold(true),
+		assistant: lipgloss.NewStyle().Foreground(lipgloss.Color("75")),
+		tool:      lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Italic(true),
+		separator: lipgloss.NewStyle().Foreground(lipgloss.Color("240")),
+		hint:      lipgloss.NewStyle().Foreground(lipgloss.Color("99")).Italic(true),
+		markdownHeading: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("229")).
+			Bold(true),
+		markdownList:  lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		markdownQuote: lipgloss.NewStyle().Foreground(lipgloss.Color("110")).Italic(true),
+		markdownCode: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("230")).
+			Background(lipgloss.Color("236")),
+		toolCard: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("242")).
+			Padding(0, 1),
+		toolTitle:   lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Bold(true),
+		toolMeta:    lipgloss.NewStyle().Foreground(lipgloss.Color("250")),
+		toolOption:  lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		toolSuccess: lipgloss.NewStyle().Foreground(lipgloss.Color("114")).Bold(true),
+		toolFailure: lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
+		toolLogCard: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("238")).
+			Padding(0, 1),
+		toolLogTitle: lipgloss.NewStyle().Foreground(lipgloss.Color("223")).Bold(true),
+		toolLogHint:  lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
+		permissionCard: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			Padding(0, 1),
+		permissionTitle:  lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Bold(true),
+		permissionPath:   lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		permissionHelp:   lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
+		permissionOption: lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Padding(0, 1),
+		permissionSelected: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("232")).
+			Background(lipgloss.Color("221")).
+			Bold(true).
+			Padding(0, 1),
+		commandHint:      lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
+		commandCandidate: lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		commandSelected: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("232")).
+			Background(lipgloss.Color("110")).
+			Bold(true).
+			Padding(0, 1),
+		panelTab: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("248")).
+			Padding(0, 1),
+		panelTabActive: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("232")).
+			Background(lipgloss.Color("180")).
+			Bold(true).
+			Padding(0, 1),
+		panelMeta: lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Italic(true),
+	}
+}
 
 func stylesForTheme(name string) styles {
 	switch normalizeThemeName(name) {

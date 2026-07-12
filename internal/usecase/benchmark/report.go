@@ -62,12 +62,27 @@ type RecordGroupSummary struct {
 	AvgToolCalls                   float64              `json:"avg_tool_calls"`
 	AvgModelCalls                  float64              `json:"avg_model_calls"`
 	AvgModelDurationMS             float64              `json:"avg_model_duration_ms"`
+	AvgModelTransportAttempts      float64              `json:"avg_model_transport_attempts"`
+	ModelTransportFailures         int                  `json:"model_transport_failures"`
+	AvgModelTransportDurationMS    float64              `json:"avg_model_transport_duration_ms"`
+	ModelUsageAvailable            int                  `json:"model_usage_available"`
+	ModelUsageUnavailable          int                  `json:"model_usage_unavailable"`
+	ModelUsageCoverage             float64              `json:"model_usage_coverage"`
+	AvgModelInputTokens            float64              `json:"avg_model_input_tokens"`
+	AvgModelOutputTokens           float64              `json:"avg_model_output_tokens"`
+	AvgModelTotalTokens            float64              `json:"avg_model_total_tokens"`
+	AvgModelCachedInputTokens      float64              `json:"avg_model_cached_input_tokens"`
+	AvgModelReasoningTokens        float64              `json:"avg_model_reasoning_tokens"`
 	ModelFallbacks                 int                  `json:"model_fallbacks"`
 	ModelServers                   []string             `json:"model_servers,omitempty"`
 	ModelNames                     []string             `json:"model_names,omitempty"`
 	ModelAPIs                      []string             `json:"model_apis,omitempty"`
 	ModelProfiles                  []string             `json:"model_profiles,omitempty"`
 	AvgAgentStarts                 float64              `json:"avg_agent_starts"`
+	AvgMutations                   float64              `json:"avg_mutations"`
+	AvgPermissionRequests          float64              `json:"avg_permission_requests"`
+	AvgDelegations                 float64              `json:"avg_delegations"`
+	AvgHandoffs                    float64              `json:"avg_handoffs"`
 	FailedEvents                   int                  `json:"failed_events"`
 	VerificationFailures           int                  `json:"verification_failures"`
 	AvgArtifacts                   float64              `json:"avg_artifacts"`
@@ -90,6 +105,8 @@ type RecordBaselineDelta struct {
 	AvgEvents            float64 `json:"avg_events"`
 	AvgToolCalls         float64 `json:"avg_tool_calls"`
 	AvgModelCalls        float64 `json:"avg_model_calls"`
+	AvgModelTotalTokens  float64 `json:"avg_model_total_tokens"`
+	ModelUsageCoverage   float64 `json:"model_usage_coverage"`
 	VerificationFailures int     `json:"verification_failures"`
 }
 
@@ -486,16 +503,30 @@ type recordGroupKey struct {
 }
 
 type recordGroupAccumulator struct {
-	summary       RecordGroupSummary
-	durationMS    int64
-	events        int
-	toolCalls     int
-	modelCalls    int
-	modelDuration int64
-	agentStarts   int
-	artifacts     int
-	planNodes     int
-	failedDetails []string
+	summary                RecordGroupSummary
+	durationMS             int64
+	events                 int
+	toolCalls              int
+	modelCalls             int
+	modelDuration          int64
+	modelTransportAttempts int
+	modelTransportFailures int
+	modelTransportDuration int64
+	usageAvailable         int
+	usageUnavailable       int
+	inputTokens            int
+	outputTokens           int
+	totalTokens            int
+	cachedTokens           int
+	reasoningTokens        int
+	agentStarts            int
+	mutations              int
+	permissionRequests     int
+	delegations            int
+	handoffs               int
+	artifacts              int
+	planNodes              int
+	failedDetails          []string
 }
 
 func summarizeRecordGroups(records []ResultRecord) []RecordGroupSummary {
@@ -530,12 +561,39 @@ func summarizeRecordGroups(records []ResultRecord) []RecordGroupSummary {
 		acc.toolCalls += record.ToolCalls
 		acc.modelCalls += record.ModelCalls
 		acc.modelDuration += record.ModelDurationMS
+		transportAttempts := record.ModelTransportAttempts
+		if transportAttempts == 0 && record.ModelCalls > 0 {
+			transportAttempts = record.ModelCalls
+		}
+		acc.modelTransportAttempts += transportAttempts
+		acc.modelTransportFailures += record.ModelTransportFailures
+		transportDuration := record.ModelTransportDurationMS
+		if transportDuration == 0 {
+			transportDuration = record.ModelDurationMS
+		}
+		acc.modelTransportDuration += transportDuration
+		usageAvailable := record.ModelUsageAvailable
+		usageUnavailable := record.ModelUsageUnavailable
+		if usageAvailable+usageUnavailable == 0 && record.ModelCalls > 0 {
+			usageUnavailable = record.ModelCalls
+		}
+		acc.usageAvailable += usageAvailable
+		acc.usageUnavailable += usageUnavailable
+		acc.inputTokens += record.ModelInputTokens
+		acc.outputTokens += record.ModelOutputTokens
+		acc.totalTokens += record.ModelTotalTokens
+		acc.cachedTokens += record.ModelCachedTokens
+		acc.reasoningTokens += record.ModelReasoningTokens
 		acc.summary.ModelFallbacks += record.ModelFallbacks
 		acc.summary.ModelServers = appendUniqueStrings(acc.summary.ModelServers, record.ModelServers...)
 		acc.summary.ModelNames = appendUniqueStrings(acc.summary.ModelNames, record.ModelNames...)
 		acc.summary.ModelAPIs = appendUniqueStrings(acc.summary.ModelAPIs, record.ModelAPIs...)
 		acc.summary.ModelProfiles = appendUniqueStrings(acc.summary.ModelProfiles, record.ModelProfiles...)
 		acc.agentStarts += record.AgentStarts
+		acc.mutations += record.Mutations
+		acc.permissionRequests += record.PermissionRequests
+		acc.delegations += record.Delegations
+		acc.handoffs += record.Handoffs
 		acc.summary.FailedEvents += record.FailedEvents
 		acc.summary.VerificationFailures += record.VerificationFailures
 		acc.artifacts += record.Artifacts
@@ -574,7 +632,25 @@ func summarizeRecordGroups(records []ResultRecord) []RecordGroupSummary {
 		acc.summary.AvgToolCalls = float64(acc.toolCalls) / runs
 		acc.summary.AvgModelCalls = float64(acc.modelCalls) / runs
 		acc.summary.AvgModelDurationMS = float64(acc.modelDuration) / runs
+		acc.summary.AvgModelTransportAttempts = float64(acc.modelTransportAttempts) / runs
+		acc.summary.ModelTransportFailures = acc.modelTransportFailures
+		acc.summary.AvgModelTransportDurationMS = float64(acc.modelTransportDuration) / runs
+		acc.summary.ModelUsageAvailable = acc.usageAvailable
+		acc.summary.ModelUsageUnavailable = acc.usageUnavailable
+		usageCalls := acc.usageAvailable + acc.usageUnavailable
+		if usageCalls > 0 {
+			acc.summary.ModelUsageCoverage = float64(acc.usageAvailable) / float64(usageCalls)
+		}
+		acc.summary.AvgModelInputTokens = float64(acc.inputTokens) / runs
+		acc.summary.AvgModelOutputTokens = float64(acc.outputTokens) / runs
+		acc.summary.AvgModelTotalTokens = float64(acc.totalTokens) / runs
+		acc.summary.AvgModelCachedInputTokens = float64(acc.cachedTokens) / runs
+		acc.summary.AvgModelReasoningTokens = float64(acc.reasoningTokens) / runs
 		acc.summary.AvgAgentStarts = float64(acc.agentStarts) / runs
+		acc.summary.AvgMutations = float64(acc.mutations) / runs
+		acc.summary.AvgPermissionRequests = float64(acc.permissionRequests) / runs
+		acc.summary.AvgDelegations = float64(acc.delegations) / runs
+		acc.summary.AvgHandoffs = float64(acc.handoffs) / runs
 		acc.summary.AvgArtifacts = float64(acc.artifacts) / runs
 		acc.summary.AvgPlanNodes = float64(acc.planNodes) / runs
 		sort.Strings(acc.failedDetails)
@@ -615,6 +691,8 @@ func attachBaselineDeltas(groups []RecordGroupSummary, baselineProfile string) [
 				AvgEvents:            group.AvgEvents - baseline.AvgEvents,
 				AvgToolCalls:         group.AvgToolCalls - baseline.AvgToolCalls,
 				AvgModelCalls:        group.AvgModelCalls - baseline.AvgModelCalls,
+				AvgModelTotalTokens:  group.AvgModelTotalTokens - baseline.AvgModelTotalTokens,
+				ModelUsageCoverage:   group.ModelUsageCoverage - baseline.ModelUsageCoverage,
 				VerificationFailures: group.VerificationFailures - baseline.VerificationFailures,
 			}
 			group.BaselineDelta = &delta
@@ -751,7 +829,63 @@ func csvRecordFromRow(header map[string]int, row []string) (ResultRecord, error)
 	if err != nil {
 		return ResultRecord{}, err
 	}
+	modelTransportAttempts, err := parseInt("model_transport_attempts")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelTransportFailures, err := parseInt("model_transport_failures")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelTransportDurationMS, err := parseInt64("model_transport_duration_ms")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelUsageAvailable, err := parseInt("model_usage_available")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelUsageUnavailable, err := parseInt("model_usage_unavailable")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelInputTokens, err := parseInt("model_input_tokens")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelOutputTokens, err := parseInt("model_output_tokens")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelTotalTokens, err := parseInt("model_total_tokens")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelCachedTokens, err := parseInt("model_cached_input_tokens")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	modelReasoningTokens, err := parseInt("model_reasoning_tokens")
+	if err != nil {
+		return ResultRecord{}, err
+	}
 	agentStarts, err := parseInt("agent_starts")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	mutations, err := parseInt("mutations")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	permissionRequests, err := parseInt("permission_requests")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	delegations, err := parseInt("delegations")
+	if err != nil {
+		return ResultRecord{}, err
+	}
+	handoffs, err := parseInt("handoffs")
 	if err != nil {
 		return ResultRecord{}, err
 	}
@@ -801,7 +935,21 @@ func csvRecordFromRow(header map[string]int, row []string) (ResultRecord, error)
 		ModelCalls:                     modelCalls,
 		ModelFallbacks:                 modelFallbacks,
 		ModelDurationMS:                modelDurationMS,
+		ModelTransportAttempts:         modelTransportAttempts,
+		ModelTransportFailures:         modelTransportFailures,
+		ModelTransportDurationMS:       modelTransportDurationMS,
+		ModelUsageAvailable:            modelUsageAvailable,
+		ModelUsageUnavailable:          modelUsageUnavailable,
+		ModelInputTokens:               modelInputTokens,
+		ModelOutputTokens:              modelOutputTokens,
+		ModelTotalTokens:               modelTotalTokens,
+		ModelCachedTokens:              modelCachedTokens,
+		ModelReasoningTokens:           modelReasoningTokens,
 		AgentStarts:                    agentStarts,
+		Mutations:                      mutations,
+		PermissionRequests:             permissionRequests,
+		Delegations:                    delegations,
+		Handoffs:                       handoffs,
 		FailedEvents:                   failedEvents,
 		VerificationFailures:           verificationFailures,
 		Artifacts:                      artifacts,

@@ -18,6 +18,39 @@ func TestExecCommandIncludesEventSummaryFlags(t *testing.T) {
 			t.Fatalf("expected %s flag", flag)
 		}
 	}
+	if command.Flag("resume") != nil {
+		t.Fatal("exec must not expose --resume")
+	}
+}
+
+func TestRootIncludesConversationCommands(t *testing.T) {
+	root := NewRootCommand()
+	for _, name := range []string{"continue", "recover"} {
+		command, _, err := root.Find([]string{name})
+		if err != nil || command == nil || command.Name() != name {
+			t.Fatalf("expected root command %q, got command=%v err=%v", name, command, err)
+		}
+	}
+}
+
+func TestContinueAndRecoverCommandFlags(t *testing.T) {
+	configPath := ""
+	logPath := ""
+	continueCommand := newContinueCommand(&configPath, &logPath)
+	for _, flag := range []string{"conversation", "prompt", "model", "profile", "stream", "format", "show-events"} {
+		if continueCommand.Flag(flag) == nil {
+			t.Fatalf("continue command missing --%s", flag)
+		}
+	}
+	recoverCommand := newRecoverCommand(&configPath, &logPath)
+	for _, flag := range []string{"workflow", "format", "show-events"} {
+		if recoverCommand.Flag(flag) == nil {
+			t.Fatalf("recover command missing --%s", flag)
+		}
+	}
+	if recoverCommand.Flag("prompt") != nil || recoverCommand.Flag("stream") != nil {
+		t.Fatal("recover must not expose prompt or stream flags")
+	}
 }
 
 func TestRenderExecTextWithEventSummary(t *testing.T) {
@@ -37,6 +70,16 @@ func TestRenderExecTextWithEventSummary(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in exec text, got:\n%s", want, text)
 		}
+	}
+}
+
+func TestRenderExecTextMarksUnverifiedOutcome(t *testing.T) {
+	result := sampleExecTurnResult()
+	result.Run.Status = domain.RunStatusNeedsAttention
+
+	text := renderExecText(result, false)
+	if !strings.Contains(text, "[needs_attention] Verification did not pass. The requested outcome is not confirmed.") {
+		t.Fatalf("expected verification warning in exec text, got:\n%s", text)
 	}
 }
 

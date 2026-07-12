@@ -68,7 +68,7 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools returned error: %v", err)
 	}
-	if len(tools) != 1 || tools[0].Name != "search_docs" {
+	if len(tools) != 1 || tools[0].Name != "search_docs" || !tools[0].SupportsDurableFencing {
 		t.Fatalf("unexpected tools: %+v", tools)
 	}
 	tools, err = session.ListTools(context.Background())
@@ -82,12 +82,15 @@ func TestSessionInitializeListToolsAndCall(t *testing.T) {
 	if strings.TrimSpace(string(data)) != "1" {
 		t.Fatalf("expected tools/list to be cached, got %q", string(data))
 	}
-	output, err := session.CallTool(context.Background(), "search_docs", map[string]any{"query": "mcp"})
+	result, err := session.CallTool(context.Background(), "search_docs", map[string]any{"query": "mcp"}, map[string]any{"request_id": "req-1"})
 	if err != nil {
 		t.Fatalf("CallTool returned error: %v", err)
 	}
-	if !strings.Contains(output, "search_docs") {
-		t.Fatalf("unexpected output: %q", output)
+	if !strings.Contains(result.Output, "search_docs") || !strings.Contains(result.Output, `"query":"mcp"`) || !strings.Contains(result.Output, `"request_id":"req-1"`) {
+		t.Fatalf("unexpected output: %q", result.Output)
+	}
+	if result.Metadata["trace"] != "reply-1" {
+		t.Fatalf("unexpected result metadata: %+v", result.Metadata)
 	}
 	types := logger.snapshot()
 	assertContains(t, types, "mcp.protocol:initialize")
@@ -242,15 +245,18 @@ func TestHelperProcess(t *testing.T) {
 							"query": map[string]any{"type": "string"},
 						},
 					},
-					"annotations": map[string]any{"readOnlyHint": true},
+					"annotations": map[string]any{"readOnlyHint": true, "dev.yagent/durable-action-fencing": true},
 				}},
 			})
 		case "tools/call":
+			arguments, _ := json.Marshal(req.Params["arguments"])
+			metadata, _ := json.Marshal(req.Params["_meta"])
 			writeHelperResponse(writer, req.ID, map[string]any{
 				"content": []map[string]any{{
 					"type": "text",
-					"text": fmt.Sprintf("called %s", req.Params["name"]),
+					"text": fmt.Sprintf("called %s arguments=%s meta=%s", req.Params["name"], arguments, metadata),
 				}},
+				"_meta": map[string]any{"trace": "reply-1"},
 			})
 		default:
 			writeHelperResponse(writer, req.ID, map[string]any{})

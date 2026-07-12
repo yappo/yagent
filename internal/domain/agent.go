@@ -141,6 +141,7 @@ type AgentSpec struct {
 	RoutingProfile     string
 	Timeout            time.Duration
 	MaxTurns           int
+	MaxToolCalls       int
 	TokenBudget        int
 	Tags               []string
 	TaskKinds          []TaskKind
@@ -200,6 +201,9 @@ type ContextPack = RunContext
 type AgentInvocation struct {
 	RunID          string
 	ParentRunID    string
+	WorkflowID     WorkflowID
+	WorkUnitID     DurableWorkUnitID
+	Lease          LeaseCredential
 	Agent          AgentSpec
 	Messages       []Message
 	Context        RunContext
@@ -236,11 +240,46 @@ type ExecutionEvent struct {
 }
 
 type TurnRequest struct {
-	Messages []Message
-	Model    string
-	Profile  string
-	ResumeID string
-	Stream   bool
+	Messages   []Message
+	Provenance []ProvenanceEvidence
+	Model      string
+	Profile    string
+	Stream     bool
+}
+
+type ConversationTurnRequest struct {
+	ConversationID ConversationID
+	Messages       []Message
+	Provenance     []ProvenanceEvidence
+	Model          string
+	Profile        string
+	Stream         bool
+}
+
+type WorkflowRecoveryRequest struct {
+	WorkflowID WorkflowID
+}
+
+type ProvenanceSource string
+
+const (
+	ProvenancePlannerReason  ProvenanceSource = "planner_reason"
+	ProvenanceFileOutput     ProvenanceSource = "file_output"
+	ProvenanceDelegation     ProvenanceSource = "delegation"
+	ProvenanceMCPResponse    ProvenanceSource = "mcp_response"
+	ProvenancePriorAssistant ProvenanceSource = "prior_assistant"
+	ProvenancePriorTool      ProvenanceSource = "prior_tool"
+	ProvenancePriorSystem    ProvenanceSource = "prior_system"
+)
+
+// ProvenanceEvidence carries untrusted runtime input separately from the root
+// user message. Tool-backed sources retain the model tool protocol identifiers.
+type ProvenanceEvidence struct {
+	Source     ProvenanceSource `json:"source" toml:"source"`
+	Content    string           `json:"content" toml:"content"`
+	ToolCallID string           `json:"tool_call_id,omitempty" toml:"tool_call_id"`
+	ToolName   string           `json:"tool_name,omitempty" toml:"tool_name"`
+	AgentID    string           `json:"agent_id,omitempty" toml:"agent_id"`
 }
 
 type TurnResult struct {
@@ -257,6 +296,8 @@ type AgentCatalog interface {
 
 type Orchestrator interface {
 	RunTurn(ctx context.Context, request TurnRequest) (TurnResult, error)
+	ContinueConversation(ctx context.Context, request ConversationTurnRequest) (TurnResult, error)
+	RecoverWorkflow(ctx context.Context, request WorkflowRecoveryRequest) (TurnResult, error)
 }
 
 type ModelRequest struct {
@@ -297,6 +338,31 @@ type ModelInvocationMetadata struct {
 	Model              string
 	ProfileName        string
 	DurationMS         int64
+	Usage              ModelUsage
+	Attempts           []ModelInvocationAttempt
+}
+
+// ModelInvocationAttempt records one transport request within a logical model call.
+type ModelInvocationAttempt struct {
+	ServerName         string
+	Fallback           bool
+	FallbackFromServer string
+	API                string
+	Model              string
+	ProfileName        string
+	DurationMS         int64
+	Usage              ModelUsage
+	Success            bool
+	Error              string
+}
+
+type ModelUsage struct {
+	Available         bool `json:"available"`
+	InputTokens       int  `json:"input_tokens,omitempty"`
+	OutputTokens      int  `json:"output_tokens,omitempty"`
+	TotalTokens       int  `json:"total_tokens,omitempty"`
+	CachedInputTokens int  `json:"cached_input_tokens,omitempty"`
+	ReasoningTokens   int  `json:"reasoning_tokens,omitempty"`
 }
 
 type ModelSettings struct {

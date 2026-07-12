@@ -7,15 +7,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
+
+	"yagent/internal/config"
+	"yagent/internal/usecase/localmodel"
 )
 
 const (
 	DefaultConfigPath  = ".yagent/config.toml"
 	DefaultTasksPath   = ".yagent/tasks.toml"
 	DefaultLocalURL    = "http://127.0.0.1:1234"
-	DefaultLocalModel  = "Qwen/Qwen3.6-35B-A3B"
+	DefaultLocalPreset = localmodel.PresetAuto
+	DefaultLocalModel  = localmodel.DefaultQwen36Model
+	DefaultGemma4Model = localmodel.DefaultGemma4Model
 	DefaultOpenAIModel = "gpt-5.5"
 )
 
@@ -24,6 +30,7 @@ type Options struct {
 	ConfigPath  string
 	TasksPath   string
 	LocalURL    string
+	LocalPreset string
 	LocalModel  string
 	OpenAIModel string
 	Force       bool
@@ -45,13 +52,20 @@ type FileResult struct {
 
 func Run(options Options) (Result, error) {
 	options = normalizeOptions(options)
+	profile, err := localmodel.Resolve(options.LocalPreset, options.LocalModel)
+	if err != nil {
+		return Result{}, err
+	}
+	if options.LocalModel == "" {
+		options.LocalModel = profile.DefaultModel
+	}
 
 	files := []targetFile{}
 	if options.WriteConfig {
 		files = append(files, targetFile{
 			kind:    "config",
 			path:    resolvePath(options.WorkDir, options.ConfigPath),
-			content: renderConfig(options),
+			content: renderConfig(options, profile.Generation),
 		})
 	}
 	if options.WriteTasks {
@@ -97,8 +111,8 @@ func normalizeOptions(options Options) Options {
 	if options.LocalURL == "" {
 		options.LocalURL = DefaultLocalURL
 	}
-	if options.LocalModel == "" {
-		options.LocalModel = DefaultLocalModel
+	if options.LocalPreset == "" {
+		options.LocalPreset = DefaultLocalPreset
 	}
 	if options.OpenAIModel == "" {
 		options.OpenAIModel = DefaultOpenAIModel
@@ -153,17 +167,41 @@ func writeTarget(file targetFile, options Options) (string, error) {
 	return "created", nil
 }
 
-func renderConfig(options Options) string {
+func renderConfig(options Options, generation config.GenerationConfig) string {
 	data := struct {
-		LocalURL    string
-		LocalModel  string
-		OpenAIModel string
+		LocalURL        string
+		LocalModel      string
+		LocalGeneration string
+		OpenAIModel     string
 	}{
-		LocalURL:    quoteTOMLString(options.LocalURL),
-		LocalModel:  quoteTOMLString(options.LocalModel),
-		OpenAIModel: quoteTOMLString(options.OpenAIModel),
+		LocalURL:        quoteTOMLString(options.LocalURL),
+		LocalModel:      quoteTOMLString(options.LocalModel),
+		LocalGeneration: renderGenerationConfig(generation),
+		OpenAIModel:     quoteTOMLString(options.OpenAIModel),
 	}
 	return executeTemplate(configTemplate, data)
+}
+
+func renderGenerationConfig(generation config.GenerationConfig) string {
+	lines := []string{}
+	if generation.MaxOutputTokens > 0 {
+		lines = append(lines, fmt.Sprintf("max_output_tokens = %d", generation.MaxOutputTokens))
+	}
+	appendFloat := func(name string, value *float64) {
+		if value == nil {
+			return
+		}
+		lines = append(lines, name+" = "+strconv.FormatFloat(*value, 'f', -1, 64))
+	}
+	appendFloat("temperature", generation.Temperature)
+	appendFloat("top_p", generation.TopP)
+	if generation.TopK > 0 {
+		lines = append(lines, fmt.Sprintf("top_k = %d", generation.TopK))
+	}
+	appendFloat("min_p", generation.MinP)
+	appendFloat("presence_penalty", generation.PresencePenalty)
+	appendFloat("repetition_penalty", generation.RepetitionPenalty)
+	return strings.Join(lines, "\n")
 }
 
 func renderTasks(workDir string) (string, error) {
@@ -292,13 +330,7 @@ api = "chat_completions"
 timeout = "20m"
 
 [server.servers.generation]
-max_output_tokens = 8192
-temperature = 1.0
-top_p = 0.95
-top_k = 20
-min_p = 0.0
-presence_penalty = 1.5
-repetition_penalty = 1.0
+{{.LocalGeneration}}
 
 [[server.servers]]
 name = "openai"

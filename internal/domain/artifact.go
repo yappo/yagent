@@ -13,6 +13,16 @@ type ExecutionPlanArtifactPayload struct {
 	Plan *ExecutionPlan `json:"plan,omitempty"`
 }
 
+// WorkflowInputArtifactPayload freezes the request-scoped inputs needed to
+// resume a workflow after the creating process is gone.
+type WorkflowInputArtifactPayload struct {
+	Messages            []Message `json:"messages"`
+	Model               string    `json:"model,omitempty"`
+	Profile             string    `json:"profile,omitempty"`
+	EnabledCapabilities []string  `json:"enabled_capabilities,omitempty"`
+	Stream              bool      `json:"stream,omitempty"`
+}
+
 type RepoMapEntry struct {
 	Path        string   `json:"path"`
 	Kind        string   `json:"kind,omitempty"`
@@ -134,7 +144,13 @@ type FinalResponseArtifactPayload struct {
 	VerificationSummary string              `json:"verification_summary,omitempty"`
 	RemainingRisks      []string            `json:"remaining_risks,omitempty"`
 	NextSteps           []string            `json:"next_steps,omitempty"`
+	Claims              []GroundedClaim     `json:"claims,omitempty"`
 	ArtifactRefs        []ArtifactReference `json:"artifact_refs,omitempty"`
+}
+
+type GroundedClaim struct {
+	Claim        string   `json:"claim"`
+	EvidenceRefs []string `json:"evidence_refs"`
 }
 
 type WorkUnitDigest struct {

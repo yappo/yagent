@@ -18,7 +18,6 @@ func newExecCommand(configPath *string, logPath *string) *cobra.Command {
 	var prompt string
 	var model string
 	var profile string
-	var resumeID string
 	var stream bool
 	var format string
 	var showEvents bool
@@ -39,40 +38,123 @@ func newExecCommand(configPath *string, logPath *string) *cobra.Command {
 				Messages: []domain.Message{{Role: domain.RoleUser, Content: prompt}},
 				Model:    model,
 				Profile:  profile,
-				ResumeID: resumeID,
 				Stream:   stream,
 			})
 			if err != nil {
 				return err
 			}
 
-			switch format {
-			case "text":
-				fmt.Print(renderExecText(result, showEvents))
-			case "json":
-				output := execOutputFromResult(result)
-				data, err := json.MarshalIndent(output, "", "  ")
-				if err != nil {
-					return err
-				}
-				fmt.Println(string(data))
-			default:
-				return fmt.Errorf("unsupported format %q", format)
-			}
-			return nil
+			return renderTurnResult(result, format, showEvents)
 		},
 	}
 
 	command.Flags().StringVar(&prompt, "prompt", "", "AI に送信するプロンプト")
 	command.Flags().StringVar(&model, "model", "", "使用するモデル名")
 	command.Flags().StringVar(&profile, "profile", "", "routing profile 名")
-	command.Flags().StringVar(&resumeID, "resume", "", "復元する run id。latest も指定できます")
 	command.Flags().BoolVar(&stream, "stream", false, "ストリーミング応答を有効にする")
 	command.Flags().StringVar(&format, "format", "text", "出力形式: text または json")
 	command.Flags().BoolVar(&showEvents, "show-events", false, "text 出力で実行イベント要約を表示する")
 	_ = command.MarkFlagRequired("prompt")
 
 	return command
+}
+
+func newContinueCommand(configPath *string, logPath *string) *cobra.Command {
+	var conversation string
+	var prompt string
+	var model string
+	var profile string
+	var stream bool
+	var format string
+	var showEvents bool
+
+	command := &cobra.Command{
+		Use:   "continue",
+		Short: "既存の会話を継続",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			container, err := app.Build(*configPath, NewStdinApprover(), app.BuildOptions{LogPath: *logPath})
+			if err != nil {
+				return err
+			}
+			if container.Closer != nil {
+				defer container.Closer.Close()
+			}
+
+			result, err := container.Orchestrator.ContinueConversation(cmd.Context(), domain.ConversationTurnRequest{
+				ConversationID: domain.ConversationID(conversation),
+				Messages:       []domain.Message{{Role: domain.RoleUser, Content: prompt}},
+				Model:          model,
+				Profile:        profile,
+				Stream:         stream,
+			})
+			if err != nil {
+				return err
+			}
+			return renderTurnResult(result, format, showEvents)
+		},
+	}
+
+	command.Flags().StringVar(&conversation, "conversation", "", "継続する conversation id")
+	command.Flags().StringVar(&prompt, "prompt", "", "AI に送信するプロンプト")
+	command.Flags().StringVar(&model, "model", "", "使用するモデル名")
+	command.Flags().StringVar(&profile, "profile", "", "routing profile 名")
+	command.Flags().BoolVar(&stream, "stream", false, "ストリーミング応答を有効にする")
+	command.Flags().StringVar(&format, "format", "text", "出力形式: text または json")
+	command.Flags().BoolVar(&showEvents, "show-events", false, "text 出力で実行イベント要約を表示する")
+	_ = command.MarkFlagRequired("conversation")
+	_ = command.MarkFlagRequired("prompt")
+	return command
+}
+
+func newRecoverCommand(configPath *string, logPath *string) *cobra.Command {
+	var workflow string
+	var format string
+	var showEvents bool
+
+	command := &cobra.Command{
+		Use:   "recover",
+		Short: "中断した workflow を復旧",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			container, err := app.Build(*configPath, NewStdinApprover(), app.BuildOptions{LogPath: *logPath})
+			if err != nil {
+				return err
+			}
+			if container.Closer != nil {
+				defer container.Closer.Close()
+			}
+
+			result, err := container.Orchestrator.RecoverWorkflow(cmd.Context(), domain.WorkflowRecoveryRequest{
+				WorkflowID: domain.WorkflowID(workflow),
+			})
+			if err != nil {
+				return err
+			}
+			return renderTurnResult(result, format, showEvents)
+		},
+	}
+
+	command.Flags().StringVar(&workflow, "workflow", "", "復旧する workflow id")
+	command.Flags().StringVar(&format, "format", "text", "出力形式: text または json")
+	command.Flags().BoolVar(&showEvents, "show-events", false, "text 出力で実行イベント要約を表示する")
+	_ = command.MarkFlagRequired("workflow")
+	return command
+}
+
+func renderTurnResult(result domain.TurnResult, format string, showEvents bool) error {
+	switch format {
+	case "text":
+		fmt.Print(renderExecText(result, showEvents))
+	case "json":
+		output := execOutputFromResult(result)
+		data, err := json.MarshalIndent(output, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+	default:
+		return fmt.Errorf("unsupported format %q", format)
+	}
+	return nil
 }
 
 type execOutput struct {
@@ -146,6 +228,9 @@ func renderExecText(result domain.TurnResult, showEvents bool) string {
 	var sb strings.Builder
 	sb.WriteString(strings.TrimRight(result.Message.Content, "\n"))
 	sb.WriteString("\n")
+	if result.Run != nil && result.Run.Status == domain.RunStatusNeedsAttention {
+		sb.WriteString("\n[needs_attention] Verification did not pass. The requested outcome is not confirmed.\n")
+	}
 	if showEvents {
 		sb.WriteString("\n")
 		sb.WriteString(renderExecEventSummary(result))

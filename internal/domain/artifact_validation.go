@@ -23,6 +23,14 @@ func ValidateArtifactPayload(artifact RunArtifact) error {
 	}
 
 	switch kind {
+	case "workflow_input":
+		var payload WorkflowInputArtifactPayload
+		if err := decodeArtifactPayload(kind, artifact.Payload, &payload); err != nil {
+			return err
+		}
+		if len(payload.Messages) == 0 {
+			return fmt.Errorf("artifact %s payload.messages が必要です", kind)
+		}
 	case "agent_inventory":
 		var payload AgentInventoryArtifactPayload
 		return decodeArtifactPayload(kind, artifact.Payload, &payload)
@@ -134,7 +142,8 @@ func decodeArtifactPayload(kind string, raw json.RawMessage, into any) error {
 
 func isKnownTypedArtifactKind(kind string) bool {
 	switch kind {
-	case "agent_inventory",
+	case "workflow_input",
+		"agent_inventory",
 		"execution_plan",
 		"repo_map",
 		"execution",

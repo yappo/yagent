@@ -23,7 +23,11 @@ const (
 	RunStatusQueued    RunStatus = "queued"
 	RunStatusRunning   RunStatus = "running"
 	RunStatusCompleted RunStatus = "completed"
-	RunStatusFailed    RunStatus = "failed"
+	// RunStatusNeedsAttention means the runtime completed its bounded recovery
+	// loop but the latest verification still failed. The user-facing response is
+	// available, but the requested outcome is not verified as complete.
+	RunStatusNeedsAttention RunStatus = "needs_attention"
+	RunStatusFailed         RunStatus = "failed"
 )
 
 type PhasePolicy struct {
@@ -222,6 +226,7 @@ type ModelInvocationRecord struct {
 	Messages           int                     `json:"messages"`
 	Tools              int                     `json:"tools"`
 	Settings           ModelInvocationSettings `json:"settings,omitempty"`
+	Usage              ModelUsage              `json:"usage"`
 	DurationMS         int64                   `json:"duration_ms"`
 	Success            bool                    `json:"success"`
 	FinishReason       string                  `json:"finish_reason,omitempty"`
@@ -231,6 +236,8 @@ type ModelInvocationRecord struct {
 
 type ConversationTurnRecord struct {
 	ID                       string              `json:"id"`
+	ConversationID           ConversationID      `json:"conversation_id"`
+	WorkflowID               WorkflowID          `json:"workflow_id"`
 	RunID                    string              `json:"run_id,omitempty"`
 	RootRunID                string              `json:"root_run_id,omitempty"`
 	Profile                  string              `json:"profile,omitempty"`
@@ -276,6 +283,10 @@ type WorkUnit struct {
 type RunState struct {
 	ID                  string               `json:"id"`
 	RootRunID           string               `json:"root_run_id"`
+	ConversationID      ConversationID       `json:"conversation_id"`
+	ConversationTurnID  ConversationTurnID   `json:"conversation_turn_id"`
+	WorkflowID          WorkflowID           `json:"workflow_id"`
+	WorkflowRevision    int64                `json:"workflow_revision"`
 	Status              RunStatus            `json:"status"`
 	CurrentPhase        RunPhase             `json:"current_phase"`
 	Attempt             int                  `json:"attempt"`

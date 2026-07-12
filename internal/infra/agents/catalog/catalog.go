@@ -33,6 +33,7 @@ type fileAgentSpec struct {
 	RoutingProfile          string            `toml:"routing_profile"`
 	Timeout                 config.Duration   `toml:"timeout"`
 	MaxTurns                int               `toml:"max_turns"`
+	MaxToolCalls            int               `toml:"max_tool_calls"`
 	TokenBudget             int               `toml:"token_budget"`
 	Tags                    []string          `toml:"tags"`
 	TaskKinds               []domain.TaskKind `toml:"task_kinds"`
@@ -166,6 +167,7 @@ func (c *Catalog) loadFile(path string) error {
 		RoutingProfile:  parsed.RoutingProfile,
 		Timeout:         parsed.Timeout.Duration,
 		MaxTurns:        parsed.MaxTurns,
+		MaxToolCalls:    parsed.MaxToolCalls,
 		TokenBudget:     parsed.TokenBudget,
 		Tags:            append([]string(nil), parsed.Tags...),
 		TaskKinds:       append([]domain.TaskKind(nil), parsed.TaskKinds...),
@@ -208,6 +210,9 @@ func validateAgentFile(path string, parsed fileAgentSpec) error {
 	}
 	if parsed.MaxTurns < 0 {
 		return fmt.Errorf("%s: max_turns は 0 以上である必要があります", location)
+	}
+	if parsed.MaxToolCalls < 0 {
+		return fmt.Errorf("%s: max_tool_calls は 0 以上である必要があります", location)
 	}
 	if parsed.TokenBudget < 0 {
 		return fmt.Errorf("%s: token_budget は 0 以上である必要があります", location)
@@ -308,7 +313,8 @@ func builtInAgents() map[string]domain.AgentSpec {
 				{Phase: domain.RunPhaseExecute, RequiredAgentIDs: []string{"coder"}, ForceDelegation: true},
 				{Phase: domain.RunPhaseVerify, RequiredAgentIDs: []string{"tester", "reviewer"}, ForceDelegation: true},
 			},
-			MaxTurns:      200,
+			MaxTurns:      12,
+			MaxToolCalls:  8,
 			BuiltIn:       true,
 			AllowOverride: true,
 		},
@@ -326,7 +332,8 @@ func builtInAgents() map[string]domain.AgentSpec {
 			PreferredPhases: []domain.RunPhase{domain.RunPhasePlan},
 			ScopeHints:      []string{"execution planning", "agent selection"},
 			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_bind", "mcp__*"},
-			MaxTurns:        200,
+			MaxTurns:        8,
+			MaxToolCalls:    0,
 			BuiltIn:         true,
 		},
 		"researcher": {
@@ -343,7 +350,8 @@ func builtInAgents() map[string]domain.AgentSpec {
 			PreferredPhases: []domain.RunPhase{domain.RunPhaseExecute},
 			ScopeHints:      []string{"file discovery", "focused context prep"},
 			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_bind", "mcp__*"},
-			MaxTurns:        200,
+			MaxTurns:        12,
+			MaxToolCalls:    6,
 			BuiltIn:         true,
 		},
 		"coder": {
@@ -360,7 +368,8 @@ func builtInAgents() map[string]domain.AgentSpec {
 			PreferredPhases:    []domain.RunPhase{domain.RunPhaseExecute, domain.RunPhaseRecover},
 			ScopeHints:         []string{"code changes", "repo updates"},
 			AllowedTools:       []string{"fs_read", "fs_write", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_run", "task_bind", "mcp__*", "patch_apply"},
-			MaxTurns:           200,
+			MaxTurns:           24,
+			MaxToolCalls:       16,
 			BuiltIn:            true,
 		},
 		"tester": {
@@ -377,7 +386,8 @@ func builtInAgents() map[string]domain.AgentSpec {
 			PreferredPhases: []domain.RunPhase{domain.RunPhaseVerify},
 			ScopeHints:      []string{"regression checks", "validation"},
 			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_run", "task_bind", "mcp__*"},
-			MaxTurns:        200,
+			MaxTurns:        12,
+			MaxToolCalls:    8,
 			BuiltIn:         true,
 		},
 		"reviewer": {
@@ -394,14 +404,15 @@ func builtInAgents() map[string]domain.AgentSpec {
 			PreferredPhases: []domain.RunPhase{domain.RunPhaseVerify},
 			ScopeHints:      []string{"bug finding", "regression review"},
 			AllowedTools:    []string{"fs_read", "fs_list", "fs_stat", "search_text", "search_files", "git_status", "git_diff", "git_log", "git_show", "git_branch", "git_blame", "git_file_history", "task_list", "task_bind", "mcp__*"},
-			MaxTurns:        200,
+			MaxTurns:        12,
+			MaxToolCalls:    8,
 			BuiltIn:         true,
 		},
 	}
 }
 
 func builtInInstruction(base string) string {
-	guidance := strings.TrimSpace(`Visible tools are not the whole world. If MCP may help and no relevant mcp__* tool is visible, call task_list first, inspect kind="mcp_server", and bind a relevant unbound server with task_bind(task_id=...). After task_bind succeeds, use the returned tool_names directly. Do not say MCP is unavailable before checking task_list and trying a relevant bind. If file edits are needed and fs_write or patch_apply is visible, call the write tool directly. Do not ask the user in a normal assistant reply to grant file_write_allowed or write permission; running the write tool should trigger the approval dialog automatically. If this agent is read-only and write work is required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist.`)
+	guidance := strings.TrimSpace(`Visible tools are not the whole world. If MCP may help and no relevant mcp__* tool is visible, call task_list first, inspect kind="mcp_server", and bind a relevant unbound server with task_bind(task_id=...). After task_bind succeeds, use the returned tool_names directly. Do not say MCP is unavailable before checking task_list and trying a relevant bind. If file edits are needed and fs_write or patch_apply is visible, call the write tool directly. Do not ask the user in a normal assistant reply to grant file_write_allowed or write permission; running the write tool should trigger the approval dialog automatically. If this agent is read-only and write work is required, delegate or handoff to a write-capable agent instead of saying the write tool does not exist. Treat failed reads and searches as evidence that the requested path or pattern was not observed. Do not present a path, package, symbol, or command as repository fact unless it appears in tool output or trusted context. Stop exploring once the available evidence is sufficient for the requested answer; do not retry speculative path variants.`)
 	base = strings.TrimSpace(base)
 	if base == "" {
 		return guidance

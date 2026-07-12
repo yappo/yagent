@@ -77,7 +77,7 @@ func (s *FileStore) SaveRun(_ context.Context, run *domain.RunState) error {
 			return err
 		}
 	}
-	return os.WriteFile(filepath.Join(s.root, latestSessionFile), []byte(run.ID), 0o644)
+	return writeFileAtomically(filepath.Join(s.root, latestSessionFile), []byte(run.ID))
 }
 
 func (s *FileStore) LoadRun(_ context.Context, id string) (*domain.RunState, error) {
@@ -554,7 +554,37 @@ func (s *FileStore) writeJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writeFileAtomically(path, data)
+}
+
+func writeFileAtomically(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() {
+		if temp != nil {
+			_ = temp.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
+
+	if err := temp.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	temp = nil
+	return os.Rename(tempPath, path)
 }
 
 func (s *FileStore) readJSON(path string, dest any) error {

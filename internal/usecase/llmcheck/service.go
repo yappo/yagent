@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"yagent/internal/config"
+	"yagent/internal/usecase/localmodel"
 )
 
 type Service struct {
-	client *http.Client
+	client            *http.Client
+	usesDefaultClient bool
 }
 
 type Result struct {
@@ -45,6 +47,7 @@ type Recommendation struct {
 
 type CheckOptions struct {
 	ServerName      string
+	Model           string
 	Probe           bool
 	ProbeStructured bool
 	Runtime         bool
@@ -74,27 +77,37 @@ type RuntimeResult struct {
 }
 
 type RuntimeModelSummary struct {
-	ID                string   `json:"id,omitempty"`
-	DisplayName       string   `json:"display_name,omitempty"`
-	Loaded            bool     `json:"loaded"`
-	LoadedInstances   []string `json:"loaded_instances,omitempty"`
-	ContextLength     int      `json:"context_length,omitempty"`
-	MaxContextLength  int      `json:"max_context_length,omitempty"`
-	Quantization      string   `json:"quantization,omitempty"`
-	Format            string   `json:"format,omitempty"`
-	Params            string   `json:"params,omitempty"`
-	SizeBytes         int64    `json:"size_bytes,omitempty"`
-	TrainedForToolUse *bool    `json:"trained_for_tool_use,omitempty"`
-	Vision            *bool    `json:"vision,omitempty"`
-	ReasoningAllowed  []string `json:"reasoning_allowed,omitempty"`
-	ReasoningDefault  string   `json:"reasoning_default,omitempty"`
-	Variants          []string `json:"variants,omitempty"`
-	SelectedVariant   string   `json:"selected_variant,omitempty"`
+	ID                    string                        `json:"id,omitempty"`
+	DisplayName           string                        `json:"display_name,omitempty"`
+	Loaded                bool                          `json:"loaded"`
+	LoadedInstances       []string                      `json:"loaded_instances,omitempty"`
+	LoadedInstanceConfigs []RuntimeLoadedInstanceConfig `json:"loaded_instance_configs,omitempty"`
+	ContextLength         int                           `json:"context_length,omitempty"`
+	MaxContextLength      int                           `json:"max_context_length,omitempty"`
+	Quantization          string                        `json:"quantization,omitempty"`
+	Format                string                        `json:"format,omitempty"`
+	Params                string                        `json:"params,omitempty"`
+	SizeBytes             int64                         `json:"size_bytes,omitempty"`
+	TrainedForToolUse     *bool                         `json:"trained_for_tool_use,omitempty"`
+	Vision                *bool                         `json:"vision,omitempty"`
+	ReasoningAllowed      []string                      `json:"reasoning_allowed,omitempty"`
+	ReasoningDefault      string                        `json:"reasoning_default,omitempty"`
+	Variants              []string                      `json:"variants,omitempty"`
+	SelectedVariant       string                        `json:"selected_variant,omitempty"`
+}
+
+type RuntimeLoadedInstanceConfig struct {
+	ID            string `json:"id"`
+	ContextLength int    `json:"context_length,omitempty"`
+	Parallel      *int   `json:"parallel,omitempty"`
 }
 
 func New(client *http.Client) *Service {
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+		return &Service{
+			client:            &http.Client{Timeout: 5 * time.Second},
+			usesDefaultClient: true,
+		}
 	}
 	return &Service{client: client}
 }
@@ -111,15 +124,16 @@ func (s *Service) CheckWithOptions(ctx context.Context, cfg config.Config, optio
 	if err != nil {
 		return Result{}, err
 	}
+	checker := s.forServer(server)
 	result := Result{
 		ServerName: server.Name,
 		URL:        strings.TrimRight(server.URL, "/"),
 		API:        fallback(server.API, "chat_completions"),
-		Model:      server.Model,
+		Model:      firstNonEmpty(options.Model, server.Model),
 	}
 	result.Endpoint = result.URL + "/v1/models"
 
-	models, err := s.listModels(ctx, server)
+	models, err := checker.listModels(ctx, server)
 	if err != nil {
 		result.Problems = append(result.Problems, err.Error())
 		result.Suggestions = append(result.Suggestions, lmStudioServerSuggestions(result.URL)...)
@@ -137,7 +151,7 @@ func (s *Service) CheckWithOptions(ctx context.Context, cfg config.Config, optio
 		result.MatchedModel = matched
 		result.ModelExactMatch = matched == result.Model
 		if options.Runtime {
-			result.Runtime = s.checkRuntime(ctx, server, matched)
+			result.Runtime = checker.checkRuntime(ctx, server, matched)
 			appendRuntimeDiagnostics(&result)
 			appendRuntimeRecommendations(&result, cfg, server)
 		}
@@ -146,7 +160,7 @@ func (s *Service) CheckWithOptions(ctx context.Context, cfg config.Config, optio
 			result.Suggestions = append(result.Suggestions, fmt.Sprintf("config の server.servers[].model を %q に合わせると実行時の model mismatch を避けられます", matched))
 		}
 		if options.Probe {
-			result.Probe = s.runProbe(ctx, server, matched, options.ProbeStructured)
+			result.Probe = checker.runProbe(ctx, server, matched, options.ProbeStructured, probeOutputTokens(server.Generation))
 			if !result.Probe.OK {
 				result.Problems = append(result.Problems, result.Probe.Error)
 				result.Suggestions = append(result.Suggestions, probeSuggestions(result.API, result.URL)...)
@@ -156,12 +170,17 @@ func (s *Service) CheckWithOptions(ctx context.Context, cfg config.Config, optio
 	}
 
 	result.Problems = append(result.Problems, fmt.Sprintf("configured model %q was not found in LM Studio /v1/models", result.Model))
-	result.Suggestions = append(result.Suggestions,
-		"LM Studio で Qwen/Qwen3.6-35B-A3B の量子化モデルを download/load してください",
-		"LM Studio の model identifier が config の model と違う場合は、config 側を /v1/models に出ている名前へ合わせてください",
-		"MacBook Air M4 32GB では最初は text-only / 16k-32k context / Q4 系 quantization から始めるのが現実的です",
-	)
+	result.Suggestions = append(result.Suggestions, modelNotFoundSuggestions(result.Model)...)
 	return result, nil
+}
+
+func (s *Service) forServer(server config.ServerTarget) *Service {
+	if !s.usesDefaultClient || server.Timeout.Duration <= 0 {
+		return s
+	}
+	client := *s.client
+	client.Timeout = server.Timeout.Duration
+	return &Service{client: &client}
 }
 
 func (s *Service) checkRuntime(ctx context.Context, server config.ServerTarget, model string) RuntimeResult {
@@ -181,10 +200,16 @@ func (s *Service) checkRuntime(ctx context.Context, server config.ServerTarget, 
 	result.ModelFound = true
 	result.MatchedModel = matched
 	result.Loaded = matched.Loaded
-	result.ContextLength = matched.ContextLength
 	result.MaxContextLength = matched.MaxContextLength
-	if len(matched.LoadedInstances) > 0 {
-		result.LoadedInstance = matched.LoadedInstances[0]
+	if len(matched.LoadedInstanceConfigs) > 0 {
+		selected := matched.LoadedInstanceConfigs[0]
+		result.LoadedInstance = selected.ID
+		result.ContextLength = selected.ContextLength
+	} else {
+		result.ContextLength = matched.ContextLength
+		if len(matched.LoadedInstances) > 0 {
+			result.LoadedInstance = matched.LoadedInstances[0]
+		}
 	}
 	return result
 }
@@ -261,8 +286,12 @@ func appendRuntimeRecommendations(result *Result, cfg config.Config, server conf
 			})
 		}
 	}
-	if isQwen36(result.MatchedModel) || isQwen36(result.Model) || isQwen36(runtime.MatchedModel.ID) {
+	modelID := firstNonEmpty(result.MatchedModel, result.Model, runtime.MatchedModel.ID)
+	if localmodel.IsQwen36(modelID) {
 		appendQwenGenerationRecommendations(result, server.Generation)
+	}
+	if localmodel.IsGemma4(modelID) {
+		appendGemma4GenerationRecommendations(result, server.Generation)
 	}
 }
 
@@ -295,22 +324,104 @@ func appendQwenGenerationRecommendations(result *Result, generation config.Gener
 	}
 }
 
-func (s *Service) runProbe(ctx context.Context, server config.ServerTarget, model string, structured bool) ProbeResult {
-	api := fallback(server.API, "chat_completions")
-	switch api {
-	case "responses":
-		return s.runResponsesProbe(ctx, server, model, structured)
-	default:
-		return s.runChatProbe(ctx, server, model, structured)
+func appendGemma4GenerationRecommendations(result *Result, generation config.GenerationConfig) {
+	addFloatRecommendation := func(setting string, current *float64, target float64, reason string) {
+		if current != nil && floatEqual(*current, target) {
+			return
+		}
+		result.Recommendations = append(result.Recommendations, Recommendation{
+			Area:        "generation",
+			Setting:     setting,
+			Current:     formatFloatSetting(current),
+			Recommended: formatFloat(target),
+			Reason:      reason,
+		})
+	}
+	addFloatRecommendation("server.servers[].generation.temperature", generation.Temperature, 1.0, "Gemma 4 official best practices use temperature=1.0")
+	addFloatRecommendation("server.servers[].generation.top_p", generation.TopP, 0.95, "Gemma 4 official best practices use top_p=0.95")
+	appendUnsetFloatRecommendation(result, "server.servers[].generation.min_p", generation.MinP, "Gemma 4 official sampling guidance does not include min_p")
+	appendUnsetFloatRecommendation(result, "server.servers[].generation.presence_penalty", generation.PresencePenalty, "Gemma 4 official sampling guidance does not include presence_penalty")
+	appendUnsetFloatRecommendation(result, "server.servers[].generation.repetition_penalty", generation.RepetitionPenalty, "Gemma 4 official sampling guidance does not include repetition_penalty")
+	if generation.TopK != 64 {
+		result.Recommendations = append(result.Recommendations, Recommendation{
+			Area:        "generation",
+			Setting:     "server.servers[].generation.top_k",
+			Current:     formatIntSetting(generation.TopK),
+			Recommended: "64",
+			Reason:      "Gemma 4 official best practices use top_k=64",
+		})
 	}
 }
 
-func (s *Service) runChatProbe(ctx context.Context, server config.ServerTarget, model string, structured bool) ProbeResult {
+func appendUnsetFloatRecommendation(result *Result, setting string, current *float64, reason string) {
+	if current == nil {
+		return
+	}
+	result.Recommendations = append(result.Recommendations, Recommendation{
+		Area:        "generation",
+		Setting:     setting,
+		Current:     formatFloatSetting(current),
+		Recommended: "(unset)",
+		Reason:      reason,
+	})
+}
+
+func modelNotFoundSuggestions(model string) []string {
+	suggestions := []string{
+		"LM Studio の model identifier が config の model と違う場合は、config 側を /v1/models に出ている名前へ合わせてください",
+	}
+	switch localmodel.Detect(model) {
+	case localmodel.PresetGemma4:
+		return append([]string{
+			"LM Studio で Gemma 4 の instruction-tuned GGUF または MLX model を download/load してください",
+			"MacBook Air M4 32GB では Gemma 4 26B A4B または 12B を 16k-32k context から試すのが現実的です",
+		}, suggestions...)
+	case localmodel.PresetQwen36:
+		return append([]string{
+			"LM Studio で Qwen/Qwen3.6-35B-A3B の量子化モデルを download/load してください",
+			"MacBook Air M4 32GB では最初は text-only / 16k-32k context / Q4 系 quantization から始めるのが現実的です",
+		}, suggestions...)
+	default:
+		return append([]string{
+			"LM Studio で config に指定した local model を download/load してください",
+		}, suggestions...)
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (s *Service) runProbe(ctx context.Context, server config.ServerTarget, model string, structured bool, maxOutputTokens int) ProbeResult {
+	api := fallback(server.API, "chat_completions")
+	switch api {
+	case "responses":
+		return s.runResponsesProbe(ctx, server, model, structured, maxOutputTokens)
+	default:
+		return s.runChatProbe(ctx, server, model, structured, maxOutputTokens)
+	}
+}
+
+const defaultProbeMaxOutputTokens = 512
+
+func probeOutputTokens(generation config.GenerationConfig) int {
+	if generation.MaxOutputTokens > 0 {
+		return generation.MaxOutputTokens
+	}
+	return defaultProbeMaxOutputTokens
+}
+
+func (s *Service) runChatProbe(ctx context.Context, server config.ServerTarget, model string, structured bool, maxOutputTokens int) ProbeResult {
 	endpoint := strings.TrimRight(server.URL, "/") + "/v1/chat/completions"
 	result := ProbeResult{Requested: true, Structured: structured, Endpoint: endpoint, Model: model}
 	payload := map[string]any{
 		"model":       model,
-		"max_tokens":  32,
+		"max_tokens":  maxOutputTokens,
 		"temperature": 0,
 		"messages": []map[string]string{
 			{"role": "user", "content": probePrompt(structured)},
@@ -333,8 +444,10 @@ func (s *Service) runChatProbe(ctx context.Context, server config.ServerTarget, 
 	}
 	var decoded struct {
 		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
@@ -346,15 +459,19 @@ func (s *Service) runChatProbe(ctx context.Context, server config.ServerTarget, 
 		result.Error = "chat completion probe returned no choices"
 		return result
 	}
+	if strings.TrimSpace(decoded.Choices[0].Message.Content) == "" && decoded.Choices[0].FinishReason == "length" && strings.TrimSpace(decoded.Choices[0].Message.ReasoningContent) != "" {
+		result.Error = "probe output budget was exhausted by reasoning before final content"
+		return result
+	}
 	return validateProbeOutput(result, decoded.Choices[0].Message.Content)
 }
 
-func (s *Service) runResponsesProbe(ctx context.Context, server config.ServerTarget, model string, structured bool) ProbeResult {
+func (s *Service) runResponsesProbe(ctx context.Context, server config.ServerTarget, model string, structured bool, maxOutputTokens int) ProbeResult {
 	endpoint := strings.TrimRight(server.URL, "/") + "/v1/responses"
 	result := ProbeResult{Requested: true, Structured: structured, Endpoint: endpoint, Model: model}
 	payload := map[string]any{
 		"model":             model,
-		"max_output_tokens": 32,
+		"max_output_tokens": maxOutputTokens,
 		"input": []map[string]string{
 			{"role": "user", "content": probePrompt(structured)},
 		},
@@ -484,9 +601,9 @@ func validateProbeOutput(result ProbeResult, output string) ProbeResult {
 
 func probePrompt(structured bool) string {
 	if structured {
-		return `Return strict JSON only: {"ok":true,"message":"yagent-ok"}`
+		return "This is a local model health check with no external action. If you understand this request and can follow the supplied JSON schema, set ok to true and message to yagent-ok."
 	}
-	return "Reply with a short confirmation that says yagent-ok."
+	return "This is a local model health check with no external action. Reply with a short confirmation that says yagent-ok."
 }
 
 func probeSchema() map[string]any {
@@ -584,7 +701,8 @@ type runtimeModelDTO struct {
 	LoadedInstances []struct {
 		ID     string `json:"id"`
 		Config struct {
-			ContextLength int `json:"context_length"`
+			ContextLength int  `json:"context_length"`
+			Parallel      *int `json:"parallel"`
 		} `json:"config"`
 	} `json:"loaded_instances"`
 	MaxContextLength int `json:"max_context_length"`
@@ -630,6 +748,15 @@ func runtimeModelSummaryFromDTO(item runtimeModelDTO) RuntimeModelSummary {
 		}
 		summary.Loaded = true
 		summary.LoadedInstances = append(summary.LoadedInstances, instance.ID)
+		loadedConfig := RuntimeLoadedInstanceConfig{
+			ID:            instance.ID,
+			ContextLength: instance.Config.ContextLength,
+		}
+		if instance.Config.Parallel != nil {
+			parallel := *instance.Config.Parallel
+			loadedConfig.Parallel = &parallel
+		}
+		summary.LoadedInstanceConfigs = append(summary.LoadedInstanceConfigs, loadedConfig)
 		if instance.Config.ContextLength > summary.ContextLength {
 			summary.ContextLength = instance.Config.ContextLength
 		}
@@ -796,11 +923,6 @@ func recommendedMaxOutputTokens(contextLength int) int {
 		target = 1024
 	}
 	return target
-}
-
-func isQwen36(value string) bool {
-	normalized := normalizeModelID(value)
-	return strings.Contains(normalized, "qwen36") || strings.Contains(normalized, "qwen360")
 }
 
 func formatIntSetting(value int) string {

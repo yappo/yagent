@@ -16,7 +16,7 @@ func newSetupCommand(configPath *string) *cobra.Command {
 
 	command := &cobra.Command{
 		Use:   "setup",
-		Short: "local Qwen / LM Studio 用の starter files を生成",
+		Short: "local model / LM Studio 用の starter files を生成",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options.WriteConfig = !noConfig
 			options.WriteTasks = !noTasks
@@ -38,7 +38,8 @@ func newSetupCommand(configPath *string) *cobra.Command {
 	command.Flags().StringVar(&options.ConfigPath, "config-out", setupusecase.DefaultConfigPath, "生成する config TOML のパス")
 	command.Flags().StringVar(&options.TasksPath, "tasks-out", setupusecase.DefaultTasksPath, "生成する task catalog TOML のパス")
 	command.Flags().StringVar(&options.LocalURL, "local-url", setupusecase.DefaultLocalURL, "LM Studio OpenAI-compatible endpoint")
-	command.Flags().StringVar(&options.LocalModel, "local-model", setupusecase.DefaultLocalModel, "local server で使う model identifier")
+	command.Flags().StringVar(&options.LocalPreset, "local-preset", setupusecase.DefaultLocalPreset, "local model preset: auto, qwen36, gemma4, generic")
+	command.Flags().StringVar(&options.LocalModel, "local-model", "", "local server で使う model identifier。未指定時は preset の既定 model")
 	command.Flags().StringVar(&options.OpenAIModel, "openai-model", setupusecase.DefaultOpenAIModel, "fallback 用 OpenAI model")
 	command.Flags().BoolVar(&options.Force, "force", false, "既存ファイルを上書きする")
 	command.Flags().BoolVar(&options.DryRun, "dry-run", false, "ファイルを書かずに作成/上書き予定だけ表示する")

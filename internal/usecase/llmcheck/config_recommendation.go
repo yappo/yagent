@@ -156,6 +156,14 @@ func applyConfigRecommendation(cfg *config.Config, serverIndex int, recommendati
 }
 
 func applyFloatRecommendation(cfg *config.Config, serverIndex int, key string, recommendation Recommendation, target **float64) (ConfigChange, bool) {
+	if recommendation.Recommended == "(unset)" {
+		if *target == nil {
+			return ConfigChange{}, false
+		}
+		current := formatFloatSetting(*target)
+		*target = nil
+		return generationChange(cfg, serverIndex, key, current, recommendation), true
+	}
 	value, ok := parseRecommendedFloat(recommendation.Recommended)
 	if !ok || (*target != nil && floatEqual(**target, value)) {
 		return ConfigChange{}, false
