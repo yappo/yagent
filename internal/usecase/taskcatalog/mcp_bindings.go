@@ -101,14 +101,14 @@ func (b *MCPBindings) BoundTools() []domain.BoundMCPTool {
 	return result
 }
 
-func (b *MCPBindings) CallTool(ctx context.Context, taskID string, toolName string, arguments map[string]any) (string, error) {
+func (b *MCPBindings) CallTool(ctx context.Context, taskID string, toolName string, arguments map[string]any, metadata map[string]any) (domain.MCPToolCallResult, error) {
 	b.mu.RLock()
 	session, ok := b.sessions[taskID]
 	b.mu.RUnlock()
 	if !ok {
-		return "", fmt.Errorf("MCP server は bind されていません: %s", taskID)
+		return domain.MCPToolCallResult{}, fmt.Errorf("MCP server は bind されていません: %s", taskID)
 	}
-	return session.CallTool(ctx, toolName, arguments)
+	return session.CallTool(ctx, toolName, arguments, metadata)
 }
 
 func (b *MCPBindings) storeTools(task domain.TaskDefinition, descriptors []domain.MCPToolDescriptor) {
@@ -117,19 +117,20 @@ func (b *MCPBindings) storeTools(task domain.TaskDefinition, descriptors []domai
 	for _, tool := range descriptors {
 		safety := resolveMCPToolSafety(task.MCPServer, tool)
 		bound = append(bound, domain.BoundMCPTool{
-			TaskID:         task.ID,
-			ToolName:       tool.Name,
-			ServerToolName: tool.Name,
-			QualifiedName:  QualifiedToolName(task.ID, prefixForTask(task), tool.Name),
-			Description:    tool.Description,
-			InputSchema:    compactSchema(tool.InputSchema),
-			ReadOnly:       safety.readOnly,
-			ParallelSafe:   safety.parallelSafe,
-			Risk:           safety.risk,
-			AllowNetwork:   safety.allowNetwork,
-			Roots:          append([]string(nil), roots...),
-			TrustBoundary:  safety.trustBoundary,
-			SafetySource:   safety.source,
+			TaskID:                 task.ID,
+			ToolName:               tool.Name,
+			ServerToolName:         tool.Name,
+			QualifiedName:          QualifiedToolName(task.ID, prefixForTask(task), tool.Name),
+			Description:            tool.Description,
+			InputSchema:            compactSchema(tool.InputSchema),
+			ReadOnly:               safety.readOnly,
+			ParallelSafe:           safety.parallelSafe,
+			Risk:                   safety.risk,
+			AllowNetwork:           safety.allowNetwork,
+			Roots:                  append([]string(nil), roots...),
+			TrustBoundary:          safety.trustBoundary,
+			SafetySource:           safety.source,
+			SupportsDurableFencing: tool.SupportsDurableFencing,
 		})
 	}
 

@@ -20,13 +20,47 @@ func (stubOrchestrator) RunTurn(_ context.Context, _ domain.TurnRequest) (domain
 	return domain.TurnResult{}, nil
 }
 
+func (stubOrchestrator) ContinueConversation(_ context.Context, _ domain.ConversationTurnRequest) (domain.TurnResult, error) {
+	return domain.TurnResult{}, nil
+}
+
+func (stubOrchestrator) RecoverWorkflow(_ context.Context, _ domain.WorkflowRecoveryRequest) (domain.TurnResult, error) {
+	return domain.TurnResult{}, nil
+}
+
 type recordingOrchestrator struct {
-	last domain.TurnRequest
+	last            domain.TurnRequest
+	runCalls        int
+	continueRequest domain.ConversationTurnRequest
+	continueCalls   int
+	continueResult  domain.TurnResult
+	recoveryRequest domain.WorkflowRecoveryRequest
+	recoveryCalls   int
+	recoveryResult  domain.TurnResult
 }
 
 func (r *recordingOrchestrator) RunTurn(_ context.Context, request domain.TurnRequest) (domain.TurnResult, error) {
+	r.runCalls++
 	r.last = request
 	return domain.TurnResult{Message: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}, nil
+}
+
+func (r *recordingOrchestrator) ContinueConversation(_ context.Context, request domain.ConversationTurnRequest) (domain.TurnResult, error) {
+	r.continueCalls++
+	r.continueRequest = request
+	if r.continueResult.Message.Role == "" {
+		r.continueResult.Message = domain.Message{Role: domain.RoleAssistant, Content: "continued"}
+	}
+	return r.continueResult, nil
+}
+
+func (r *recordingOrchestrator) RecoverWorkflow(_ context.Context, request domain.WorkflowRecoveryRequest) (domain.TurnResult, error) {
+	r.recoveryCalls++
+	r.recoveryRequest = request
+	if r.recoveryResult.Message.Role == "" {
+		r.recoveryResult.Message = domain.Message{Role: domain.RoleAssistant, Content: "recovered"}
+	}
+	return r.recoveryResult, nil
 }
 
 type stubToolExecutor struct {
@@ -70,8 +104,8 @@ func (s stubMCPBindings) BoundTools() []domain.BoundMCPTool {
 	return append([]domain.BoundMCPTool(nil), s.bound...)
 }
 
-func (s stubMCPBindings) CallTool(_ context.Context, _ string, _ string, _ map[string]any) (string, error) {
-	return "", nil
+func (s stubMCPBindings) CallTool(_ context.Context, _ string, _ string, _ map[string]any, _ map[string]any) (domain.MCPToolCallResult, error) {
+	return domain.MCPToolCallResult{}, nil
 }
 
 type stubAgentCatalog struct {
@@ -100,8 +134,9 @@ type stubMemoryStore struct {
 }
 
 type stubRunStore struct {
-	runs   map[string]*domain.RunState
-	latest string
+	runs          map[string]*domain.RunState
+	latest        string
+	conversations []domain.ConversationTurnRecord
 }
 
 func (s stubRunStore) SaveRun(context.Context, *domain.RunState) error {
@@ -114,6 +149,14 @@ func (s stubRunStore) LoadRun(_ context.Context, id string) (*domain.RunState, e
 
 func (s stubRunStore) LoadLatestRun(ctx context.Context) (*domain.RunState, error) {
 	return s.LoadRun(ctx, s.latest)
+}
+
+func (s stubRunStore) SaveConversationTurn(context.Context, domain.ConversationTurnRecord) error {
+	return nil
+}
+
+func (s stubRunStore) ListConversationTurns(context.Context, int) ([]domain.ConversationTurnRecord, error) {
+	return append([]domain.ConversationTurnRecord(nil), s.conversations...), nil
 }
 
 func (s stubMemoryStore) LoadMemory(context.Context) (*domain.RepoMemory, error) {
@@ -2145,54 +2188,124 @@ func TestStreamSlashCommandAndDeltaBlock(t *testing.T) {
 	}
 }
 
-func TestResumeSlashCommandLoadsSelectedRun(t *testing.T) {
+func TestContinueSlashCommandUsesSelectedConversationForANewWorkflow(t *testing.T) {
+	runner := &recordingOrchestrator{
+		continueResult: domain.TurnResult{
+			Message: domain.Message{Role: domain.RoleAssistant, Content: "continued answer"},
+			Run: &domain.RunState{
+				ID:             "run-new",
+				WorkflowID:     "workflow-new",
+				ConversationID: "conversation-a",
+			},
+		},
+	}
 	store := stubRunStore{
 		runs: map[string]*domain.RunState{
-			"run-a": {
-				ID:           "run-a",
-				CurrentPhase: domain.RunPhaseExecute,
-				Status:       domain.RunStatusRunning,
-				Attempt:      2,
-				Profile:      "fast",
+			"run-old": {
+				ID:             "run-old",
+				WorkflowID:     "workflow-old",
+				ConversationID: "conversation-a",
 				Messages: []domain.Message{
-					{Role: domain.RoleUser, Content: "continue this"},
-				},
-			},
-			"run-b": {
-				ID:           "run-b",
-				CurrentPhase: domain.RunPhaseFinalize,
-				Status:       domain.RunStatusCompleted,
-				Attempt:      1,
-				Messages: []domain.Message{
-					{Role: domain.RoleAssistant, Content: "latest result"},
+					{Role: domain.RoleUser, Content: "old workflow prompt"},
 				},
 			},
 		},
-		latest: "run-b",
+		conversations: []domain.ConversationTurnRecord{{
+			ConversationID: "conversation-a",
+			WorkflowID:     "workflow-old",
+			Profile:        "fast",
+		}},
 	}
-	m := newModelWithStoresAndProfiles(stubOrchestrator{}, t.TempDir(), "qwen", nil, nil, nil, nil, store, nil, []string{"fast"})
+	m := newModelWithStoresAndProfiles(runner, t.TempDir(), "qwen", nil, nil, nil, nil, store, nil, []string{"fast"})
+	m.lastRun = store.runs["run-old"]
+	m.messages = append([]domain.Message(nil), m.lastRun.Messages...)
 
-	modelValue, _ := handleSlashCommand(m, "/resume run-a")
+	modelValue, _ := handleSlashCommand(m, "/continue conversation-a")
 	next := modelValue.(model)
-	if next.lastRun == nil || next.lastRun.ID != "run-a" {
-		t.Fatalf("expected run-a to be loaded, got %+v", next.lastRun)
+	if next.conversationID != "conversation-a" {
+		t.Fatalf("expected selected conversation, got %q", next.conversationID)
 	}
-	if len(next.messages) != 1 || next.messages[0].Content != "continue this" {
-		t.Fatalf("expected run messages to be restored, got %+v", next.messages)
+	if next.lastRun != nil || len(next.messages) != 0 {
+		t.Fatalf("continue must not restore the old run state, run=%+v messages=%+v", next.lastRun, next.messages)
 	}
 	if next.selectedProfile != "fast" {
-		t.Fatalf("expected run profile to be restored, got %q", next.selectedProfile)
-	}
-	output := flattenChatBlocks(next.chatBlocks)
-	if !strings.Contains(output, "Resumed run run-a") || !strings.Contains(output, "phase=execute status=running attempt=2") {
-		t.Fatalf("expected resume summary in output, got %q", output)
+		t.Fatalf("expected conversation profile to be selected, got %q", next.selectedProfile)
 	}
 
-	modelValue, _ = handleSlashCommand(next, "/resume")
-	next = modelValue.(model)
-	if next.lastRun == nil || next.lastRun.ID != "run-b" {
-		t.Fatalf("expected latest run-b to be loaded, got %+v", next.lastRun)
+	modelValue, cmd := submitPrompt(next, "new workflow prompt")
+	submitted := modelValue.(model)
+	msg := firstBatchChatMessage(t, cmd)
+	if runner.runCalls != 0 || runner.continueCalls != 1 {
+		t.Fatalf("expected ContinueConversation only, run=%d continue=%d", runner.runCalls, runner.continueCalls)
 	}
+	if runner.continueRequest.ConversationID != "conversation-a" || len(runner.continueRequest.Messages) != 1 || runner.continueRequest.Messages[0].Content != "new workflow prompt" {
+		t.Fatalf("unexpected continuation request: %+v", runner.continueRequest)
+	}
+	modelValue, _ = submitted.Update(msg)
+	completed := modelValue.(model)
+	if completed.lastRun == nil || completed.lastRun.WorkflowID != "workflow-new" || completed.lastRun.WorkflowID == "workflow-old" {
+		t.Fatalf("expected a distinct workflow identity, got %+v", completed.lastRun)
+	}
+	if completed.conversationID != "conversation-a" {
+		t.Fatalf("expected selected conversation to remain active, got %q", completed.conversationID)
+	}
+}
+
+func TestContinueSlashCommandSelectsLatestSavedConversation(t *testing.T) {
+	store := stubRunStore{conversations: []domain.ConversationTurnRecord{
+		{ConversationID: "conversation-latest"},
+		{ConversationID: "conversation-older"},
+	}}
+	m := newModelWithStores(stubOrchestrator{}, t.TempDir(), "", nil, nil, nil, nil, store, nil)
+
+	modelValue, _ := handleSlashCommand(m, "/continue latest")
+	next := modelValue.(model)
+	if next.conversationID != "conversation-latest" {
+		t.Fatalf("expected the latest saved conversation, got %q", next.conversationID)
+	}
+}
+
+func TestRecoverSlashCommandDoesNotAddAUserMessage(t *testing.T) {
+	runner := &recordingOrchestrator{recoveryResult: domain.TurnResult{
+		Message: domain.Message{Role: domain.RoleAssistant, Content: "workflow recovered"},
+		Run:     &domain.RunState{ID: "run-recovered", WorkflowID: "workflow-pending"},
+	}}
+	m := newModel(runner, t.TempDir(), "", nil, nil, nil, nil)
+	m.messages = []domain.Message{{Role: domain.RoleUser, Content: "existing conversation message"}}
+
+	modelValue, cmd := handleSlashCommand(m, "/recover workflow-pending")
+	next := modelValue.(model)
+	if len(next.messages) != 1 || next.messages[0].Content != "existing conversation message" {
+		t.Fatalf("recover must not append a user message before execution, got %+v", next.messages)
+	}
+	msg := firstBatchChatMessage(t, cmd)
+	if runner.recoveryCalls != 1 || runner.recoveryRequest.WorkflowID != "workflow-pending" || runner.runCalls != 0 || runner.continueCalls != 0 {
+		t.Fatalf("unexpected recovery calls: recovery=%d request=%+v run=%d continue=%d", runner.recoveryCalls, runner.recoveryRequest, runner.runCalls, runner.continueCalls)
+	}
+	modelValue, _ = next.Update(msg)
+	completed := modelValue.(model)
+	if len(completed.messages) != 1 || completed.messages[0].Content != "existing conversation message" {
+		t.Fatalf("recover must not mutate the local conversation, got %+v", completed.messages)
+	}
+	if completed.lastRun == nil || completed.lastRun.WorkflowID != "workflow-pending" {
+		t.Fatalf("expected recovered workflow state, got %+v", completed.lastRun)
+	}
+}
+
+func firstBatchChatMessage(t *testing.T, cmd tea.Cmd) chatMessage {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected command")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok || len(batch) == 0 {
+		t.Fatalf("expected batch command")
+	}
+	message, ok := batch[0]().(chatMessage)
+	if !ok {
+		t.Fatalf("expected chat message")
+	}
+	return message
 }
 
 func TestHandleSlashCommandListsAgents(t *testing.T) {

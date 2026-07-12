@@ -52,8 +52,8 @@ func (f *fakeBindings) BoundTools() []domain.BoundMCPTool {
 	return append([]domain.BoundMCPTool(nil), f.tools...)
 }
 
-func (f *fakeBindings) CallTool(context.Context, string, string, map[string]any) (string, error) {
-	return "", nil
+func (f *fakeBindings) CallTool(context.Context, string, string, map[string]any, map[string]any) (domain.MCPToolCallResult, error) {
+	return domain.MCPToolCallResult{}, nil
 }
 
 func TestRunToolRejectsUnknownTask(t *testing.T) {
@@ -72,6 +72,23 @@ func TestRunToolRejectsUnknownTask(t *testing.T) {
 	}
 	if payload.OK || payload.Error.Code != "unknown_task" || payload.Error.TaskID != "missing" || payload.Error.Tool != "task_run" {
 		t.Fatalf("unexpected structured error: %+v", payload)
+	}
+}
+
+func TestRunToolWithProcessExecutionDisabledFailsBeforeCatalogLookup(t *testing.T) {
+	tool := NewRunToolWithOptions(fakeCatalog{items: map[string]domain.TaskDefinition{
+		"test": {ID: "test", Kind: domain.TaskSpecKindCommand, Command: &domain.CommandTaskSpec{Command: "false"}},
+	}}, nil, nil, nil, ExecutionOptions{})
+	result := tool.Execute(context.Background(), domain.ToolCall{ID: "1", Name: "task_run", Arguments: map[string]any{"task_id": "test"}})
+	if result.Success {
+		t.Fatalf("expected process execution rejection, got %+v", result)
+	}
+	var payload taskErrorOutput
+	if err := json.Unmarshal([]byte(result.Output), &payload); err != nil {
+		t.Fatalf("expected structured error JSON, got %s: %v", result.Output, err)
+	}
+	if payload.Error.Code != "process_execution_disabled" || payload.Error.TaskID != "test" {
+		t.Fatalf("unexpected process isolation error: %+v", payload)
 	}
 }
 
@@ -206,6 +223,28 @@ func TestBindToolReturnsExposedToolNamesAndNextActionHint(t *testing.T) {
 		if !strings.Contains(result.Output, fragment) {
 			t.Fatalf("expected bind output to contain %q, got %s", fragment, result.Output)
 		}
+	}
+}
+
+func TestBindToolWithProcessExecutionDisabledDoesNotStartMCPServer(t *testing.T) {
+	calls := 0
+	bindings := &fakeBindings{bind: func(context.Context, domain.TaskDefinition) ([]domain.MCPToolDescriptor, error) {
+		calls++
+		return nil, nil
+	}}
+	tool := NewBindToolWithOptions(fakeCatalog{items: map[string]domain.TaskDefinition{
+		"docs": {ID: "docs", Kind: domain.TaskSpecKindMCPServer, MCPServer: &domain.MCPServerSpec{Command: "ignored"}},
+	}}, bindings, nil, nil, ExecutionOptions{})
+	result := tool.Execute(context.Background(), domain.ToolCall{ID: "1", Name: "task_bind", Arguments: map[string]any{"task_id": "docs"}})
+	if result.Success || calls != 0 {
+		t.Fatalf("expected MCP launch rejection before bind, result=%+v calls=%d", result, calls)
+	}
+	var payload taskErrorOutput
+	if err := json.Unmarshal([]byte(result.Output), &payload); err != nil {
+		t.Fatalf("expected structured error JSON, got %s: %v", result.Output, err)
+	}
+	if payload.Error.Code != "process_execution_disabled" || payload.Error.TaskID != "docs" {
+		t.Fatalf("unexpected process isolation error: %+v", payload)
 	}
 }
 

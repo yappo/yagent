@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"yagent/internal/domain"
@@ -9,6 +10,34 @@ import (
 
 type stubTool struct {
 	definition domain.ToolDefinition
+}
+
+type rejectingDurableActionGuard struct{}
+
+func (rejectingDurableActionGuard) ValidateDurableAction(context.Context, domain.DurableActionExecutionContext) error {
+	return domain.ErrDurableActionNotExecutable
+}
+
+type recordingTool struct {
+	definition domain.ToolDefinition
+	calls      *int
+}
+
+func (t recordingTool) Definition() domain.ToolDefinition { return t.definition }
+func (t recordingTool) Execute(context.Context, domain.ToolCall) domain.ToolResult {
+	*t.calls++
+	return domain.ToolResult{Success: true, Output: "unexpected"}
+}
+
+func TestRegistryRejectsStaleDurableActionBeforeProviderOrTool(t *testing.T) {
+	calls := 0
+	r := New(recordingTool{definition: domain.ToolDefinition{Name: "fs_write"}, calls: &calls})
+	r.SetDurableActionGuard(rejectingDurableActionGuard{})
+	ctx := domain.WithDurableActionExecutionContext(context.Background(), domain.DurableActionExecutionContext{ActionID: "action-1", WorkflowID: "workflow-1", WorkUnitID: "unit-1", IdempotencyKey: "idem-1", LeaseToken: "lease-1", FencingToken: 1})
+	result := r.Execute(ctx, domain.AgentSpec{}, domain.ToolCall{ID: "call-1", Name: "fs_write"})
+	if result.Success || calls != 0 || !strings.Contains(result.Output, domain.ErrDurableActionNotExecutable.Error()) {
+		t.Fatalf("expected stale action rejection before execution, result=%+v calls=%d", result, calls)
+	}
 }
 
 func (s stubTool) Definition() domain.ToolDefinition { return s.definition }

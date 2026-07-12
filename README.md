@@ -13,7 +13,9 @@ yagent は、「LLM に bash を渡しておけば勝手に賢くやる」とい
 
 MCP Server についても、そのまま無造作に露出させるのではなく、task catalog と bind フローの中で独自にラップしています。これは安全性のためだけではありません。MCP は便利な一方で、server や tool の情報を常時抱え込むとコンテキストを食いやすく、必要のない情報まで LLM に渡し続ける構造になりがちです。yagent では必要なときにだけ `task_bind` で server を bind し、必要な tool だけを公開できるので、コンテキスト消費を抑えながら拡張性も確保しやすくなっています。
 
-さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、`intake -> plan -> execute -> verify -> recover -> finalize` の harness で仕事を分け、必要なら ephemeral agent もその場で生成できます。最近の runtime では会話 summary ではなく typed artifact / reusable observation / workspace snapshot を主記憶に寄せているので、長めの run でも次の agent に必要な事実だけを scoped packet として渡しやすくなっています。
+さらに yagent は、単一 agent に全部背負わせるのではなく、subagent / multiagent 前提で設計されています。`manager` `planner` `researcher` `coder` `tester` `reviewer` のような役割分担をベースに、`intake -> plan -> execute -> verify -> recover -> finalize` の harness で仕事を分けます。ephemeral agent は分析専用の read-only worker とし、実装や修正は catalog に登録した agent が担います。最近の runtime では会話 summary ではなく typed artifact / reusable observation / workspace snapshot を主記憶に寄せているので、長めの run でも次の agent に必要な事実だけを scoped packet として渡しやすくなっています。
+
+tool・file・MCP・他 agent・過去 assistant の本文は命令ではなく `runtime_evidence` として次の phase に渡します。tool result は `RoleTool` / tool call metadata を維持しつつ、本文だけを JSON-string evidence envelope に格納するため、返却本文を raw instruction として次の model call に渡しません。verification は JSON または明示的な `VERIFICATION_STATUS: pass|fail` で status を返す必要があり、形式不正や status 不明は pass とみなしません。回復上限後も検証が pass にならなければ run status は `needs_attention` になります。この状態では応答本文は返りますが、要求結果が確認済みであるとは扱いません。finalize は tool を使わず、既に得た evidence をもとに結果と残るリスクを要約します。
 
 要するに yagent は、単なる「TUI から LLM を叩くツール」でも、単なる「自律実行が派手な agent」でもありません。Bash を安易に渡さず、task catalog・file permission・MCP wrapping・subagent orchestration を最初から設計に入れたうえで、それでも task や agent は簡単に拡張できるようにした、**“LLM を信用しない” 前提の実運用志向 coding agent** です。
 
@@ -24,8 +26,9 @@ MCP Server についても、そのまま無造作に露出させるのではな
 - `yagent schema agent` / `yagent schema tasks` で Agent DSL / task catalog の JSON Schema を出力
 - `yagent exec --prompt ...` で単発実行
 - `yagent exec --show-events` / `--format json` で単発実行の run / tool / model / failure summary を出力
+- verification 未通過時の `needs_attention` run status と text warning
 - `yagent exec --stream` で OpenAI-compatible streaming transport を使う
-- `yagent exec --resume latest --profile strong` のような resume / routing 指定
+- `yagent continue --conversation ...` による新しい workflow での会話継続と、`yagent recover --workflow ...` による入力なしの durable recovery
 - `yagent benchmark --case ... --routing-candidate ...` で harness eval / local-remote 比較
 - `yagent benchmark report --input ...` で保存済み eval record の集計・baseline 差分・回帰 gate
 - Orchestrator-first のサブエージェント実行
@@ -38,7 +41,7 @@ MCP Server についても、そのまま無造作に露出させるのではな
 - role / phase ベースの model routing
 - lazy capability discovery (`list_capabilities` / `enable_capability`)
 - built-in agent catalog と user-defined agent DSL
-- built-in agent に加えて ephemeral agent の即席生成
+- built-in agent に加えて read-only ephemeral analysis agent の即席実行
 - Bubble Tea / Bubbles ベースの TUI
 - Run Graph / Plan / Verification / Memory の切替 panel
 - OpenAI 互換の `chat/completions` API に対応
@@ -66,8 +69,11 @@ yagent --log yagent.log
 # 設定ファイル付きで TUI を起動
 yagent --config ~/.yagent.toml
 
-# local Qwen / LM Studio 用の repo-local starter files を生成
+# local model / LM Studio 用の repo-local starter files を生成
 yagent setup
+
+# Gemma 4 26B A4B 用の starter config を生成
+yagent setup --local-preset gemma4
 
 # 既存ファイルを上書きせずに生成予定を確認
 yagent setup --dry-run
@@ -85,8 +91,11 @@ yagent exec --config ~/.yagent.toml --prompt "こんにちは"
 # 単発実行 + イベントログ
 yagent exec --log yagent.log --prompt "こんにちは"
 
-# 前回 run を復元して続ける
-yagent exec --resume latest --prompt "続きの修正をして"
+# 保存済み conversation を新しい turn / workflow で続ける
+yagent continue --conversation <conversation-id> --prompt "続きの修正をして"
+
+# 中断した workflow を新しい user input なしで復旧する
+yagent recover --workflow <workflow-id>
 
 # routing profile を指定
 yagent exec --profile strong --prompt "慎重にレビューして"
@@ -115,7 +124,7 @@ yagent benchmark report --input .yagent/benchmarks/repo-readonly.jsonl --format 
 # 利用できる built-in eval case を表示
 yagent benchmark --list-cases
 
-# LM Studio / Qwen 接続を確認
+# LM Studio / local model 接続を確認
 yagent doctor
 
 # model load / context / quantization / capability を確認
@@ -162,7 +171,7 @@ yagent audit executions --format json --run <run-id>
 
 `--config` を指定しない場合、カレントディレクトリに `.yagent/config.toml` があればそれを読みます。存在しなければ built-in default を使います。`yagent setup` はこの repo-local config と `.yagent/tasks.toml` を生成します。既存ファイルは既定では上書きせず、上書きする場合は `--force` を指定します。
 
-`yagent setup` の主な option は `--local-url` `--local-model` `--openai-model` `--config-out` `--tasks-out` `--dry-run` `--force` です。task catalog は `go.mod` と `package.json` を見て、`go:test` / `go:build` / `npm:test` / `npm:build` / `npm:lint` / `npm:typecheck` のうち該当するものを生成します。
+`yagent setup` の主な option は `--local-preset` `--local-url` `--local-model` `--openai-model` `--config-out` `--tasks-out` `--dry-run` `--force` です。`--local-preset` は `auto` / `qwen36` / `gemma4` / `generic` を受け付けます。`auto` は指定された model id から family を判定し、model 未指定時は従来通り Qwen 3.6 を選びます。task catalog は `go.mod` と `package.json` を見て、`go:test` / `go:build` / `npm:test` / `npm:build` / `npm:lint` / `npm:typecheck` のうち該当するものを生成します。
 
 `yagent schema agent` と `yagent schema tasks` は、user-defined Agent DSL と `tasks.toml` の JSON Schema を stdout に出力します。`--out <path>` を付けると schema file として保存できます。エディタ補完や CI 側の schema validation では、この出力をそのまま使えます。
 
@@ -344,18 +353,28 @@ decision = "deny"
 - `executions/`: tool execution record
 - `mutations/`: mutation record。小さいファイルでは content SHA-256 を含む path state から `mutation_fingerprint` を作ります
 - `scratch/`: permission decision など、run artifact へ集約する一時 record
-- `latest_session`: `/resume` が参照する最新 session id
+- `latest_session`: audit と saved-run lookup が参照する最新 session id
+
+`memory.state_dir` は repo memory の保存先であるだけではありません。bootstrap は設定の `memory.enabled` に関係なく、このディレクトリの state store を常時作成し、durable runtime の `WorkflowSnapshot`、generation、CAS revision、lease/fencing、tool action、projection の保存に使います。実行中 lease は heartbeat で更新し、期限切れ lease は action history を reconcile したうえで read-only / 未開始 execution だけを新しい fencing generation へ引き継ぎます。不確実な mutation は自動再実行せず `needs_attention` にします。`memory.enabled = false` は repo memory の利用だけを無効にし、durable workflow state の保存は無効にしません。
+
+finalize は観測済み repository path を `repo_map` / `change_set` から照合します。final response が `internal/...`、`cmd/...`、`pkg/...`、`docs/...`、`testdata/...`、`.yagent/...` の未観測 path を事実として挙げると、run は `needs_attention` になります。これは存在しない package/path の混入を止める deterministic gate であり、自然言語の全ての意味的主張を証明するものではありません。
+
+final response は strict JSON の `claims` と `evidence_refs` も要求します。各 claim は既存 artifact の ID または kind を参照し、参照先がない、final response 自身を evidence にする、または claim 内の repository path が未観測の場合は `needs_attention` になります。evidence の自然言語が claim の真偽を完全に証明するわけではないため、これは semantic truth oracle ではなく未観測事実の成功確定を防ぐ境界です。
+
+production wiring では、execution graph の authority は durable `WorkflowSnapshot` です。workflow identity と typed input は planner model call より前に intent-only snapshot として commit し、planning 結果は validated CAS transition で同じ workflow に一度だけ attach します。scheduler の claim/start、blocked propagation、tool の Prepare/Start/Execute/Finish、projection、intent-only/pending snapshot の再開は snapshot と coordinator を通ります。plan phase は tool-free で、mutating/side-effect tool は durable work-unit lease なしに実行しません。`RunState` は UI/audit projection と process-local planning view であり、durable workflow の source of truth ではありません。
+
+terminal workflow の成功後に `RunState` や conversation index の保存が失敗しても、authoritative outcome は failed に戻しません。`projection_degraded` として記録し、conversation continuation は実行前に保存した pending turn の `WorkflowID` から terminal final artifact を復元します。
 
 Context packet は artifact / reusable observation を relevance ranking したうえで、runtime store がある場合は observation の `read_set` と workspace snapshot の path state で freshness を確認します。`workspace/facts.json` の reusable observation summary は observation record の `integrity_sha256` と突き合わせ、不一致の summary は packet に載せません。Agent DSL の `token_budget` が指定されている場合は、その agent の context packet を概算 token 数で上限管理し、低優先の recent messages / artifacts / observations から削ります。
 
-## LM Studio / Qwen
+## LM Studio / Local Models
 
-Qwen は LM Studio 側でユーザが download / load / server start しておく前提です。yagent 側では次をサポートします。
+Qwen 3.6 と Gemma 4 は LM Studio 側でユーザが download / load / server start しておく前提です。yagent 側では次をサポートします。
 
-- `yagent setup` による repo-local starter config / task catalog 生成
+- `yagent setup --local-preset qwen36|gemma4` による model-specific starter config / task catalog 生成
 - `server.servers[].url = "http://127.0.0.1:1234"` の OpenAI-compatible endpoint
 - `server.servers[].api = "chat_completions"` または `"responses"`
-- Qwen thinking mode 向けの `server.servers[].generation`
+- Qwen 3.6 / Gemma 4 の公式推奨に合わせた `server.servers[].generation`
 - `yagent doctor` による `/v1/models` 接続確認と model identifier の確認
 - `yagent doctor --runtime` による LM Studio REST API の load 状態 / context length / quantization / tool-use capability 確認と設定推奨
 - `yagent doctor --probe` による lightweight generation 確認
@@ -367,8 +386,14 @@ Qwen は LM Studio 側でユーザが download / load / server start してお�
 LM Studio 公式 docs では Developer tab の "Start server"、または `lms server start` で local server を起動できます。OpenAI-compatible endpoint は `/v1/models` `/v1/chat/completions` `/v1/responses` を提供します。LM Studio REST API の `/api/v1/models` では、download 済み model に加えて loaded instance の context length、max context、quantization、capability も確認できます。
 
 ```bash
-# repo-local starter files を生成
+# Qwen 3.6 の repo-local starter files を生成
 yagent setup
+
+# Gemma 4 26B A4B の repo-local starter files を生成
+yagent setup --local-preset gemma4
+
+# LM Studio に表示された別の Gemma 4 model id を明示
+yagent setup --local-model "<LM Studio の /v1/models に表示された model id>"
 
 # LM Studio を起動済みの状態で確認
 yagent doctor
@@ -397,19 +422,33 @@ yagent audit runtime
 yagent audit runtime --server local --format json
 ```
 
-MacBook Air M4 / 32GB では、最初は Qwen3.6-35B-A3B の量子化モデルを text-only / 16k-32k context 程度で試し、必要に応じて context を上げてください。LM Studio の `/v1/models` に出る model identifier が `Qwen/Qwen3.6-35B-A3B` と違う場合は、`config.toml` の `model` を LM Studio 側の名前へ合わせます。`doctor --runtime` は loaded context が 25k 未満の場合に warning を出します。これは coding agent が tool/context を多く消費するためで、LM Studio の Codex integration docs でも 25k 超の context が目安として案内されています。
+MacBook Air M4 / 32GB では、Qwen3.6-35B-A3B の量子化モデル、または Gemma 4 26B A4B / 12B を text-first / 16k-32k context 程度から試し、必要に応じて context を上げてください。Gemma 4 26B A4B を既定にしたのは、LM Studio 掲載 package が約 15.6GB で active parameter が約 3.8B のため、32GB unified memory で coding-agent workload を試す初期候補として妥当だという推定です。実際の利用可能 context と速度は quantization、KV cache、同時実行数に依存します。
 
-`doctor --runtime` の `Recommendations` は、LM Studio 側の loaded context、`context.compact_after_est_tokens`、`server.servers[].generation.max_output_tokens`、Qwen3.6 thinking mode 向け sampling parameter を、現在の runtime metadata と config から提案します。たとえば 8k context で model を load している場合は、LM Studio 側では 32k context への引き上げ、Yagent 側では output token を小さめに抑える提案が出ます。Qwen3.6 の starter config は、model card の agent/coding benchmark 設定に合わせて `temperature = 1.0` / `top_p = 0.95` / `top_k = 20` / `min_p = 0.0` / `presence_penalty = 1.5` / `repetition_penalty = 1.0` を入れています。
+Qwen3.6-35B-A3B IQ4_XS（約19.5GB）と Gemma 4 26B A4B Q4_K_XL（約16.5GB）は、この 32GB 機では同時 load を前提にしません。LM Studio の `/api/v1/models/unload` と `/api/v1/models/load`、または Developer UI で一方を unload してから他方を load する model-swap 運用にします。
+
+LM Studio の `/v1/models` に出る model identifier が config と違う場合は、`config.toml` の `model` を LM Studio 側の名前へ合わせます。`doctor --runtime` は loaded context が 25k 未満の場合に warning を出します。これは coding agent が tool/context を多く消費するためで、LM Studio の Codex integration docs でも 25k 超の context が目安として案内されています。
+
+`doctor --runtime` の `Recommendations` は、LM Studio 側の loaded context、`context.compact_after_est_tokens`、`server.servers[].generation.max_output_tokens`、model-specific sampling parameter を、現在の runtime metadata と config から提案します。たとえば 8k context で model を load している場合は、LM Studio 側では 32k context への引き上げ、yagent 側では output token を小さめに抑える提案が出ます。
+
+Qwen3.6 の starter config は model card の agent/coding benchmark 設定に合わせて `temperature = 1.0` / `top_p = 0.95` / `top_k = 20` / `min_p = 0.0` / `presence_penalty = 1.5` / `repetition_penalty = 1.0` を入れます。Gemma 4 は公式 model card に合わせて `temperature = 1.0` / `top_p = 0.95` / `top_k = 64` を使い、Qwen 固有の `min_p` / penalty は生成しません。既存 Qwen config の model id だけを Gemma 4 に変えた場合も、`doctor --write-recommended-config` はそれらを unset します。
+
+Gemma 4 は native system role、function calling、structured output に対応するため、yagent の既存 Chat Completions tool/JSON schema 経路をそのまま使います。thinking の有効化方法は runner と chat template に依存するため、yagent は `<|think|>` token を自動注入しません。使用中の LM Studio version/model package で `doctor --probe-structured` を実行して確認してください。
+
+Gemma 4 の仕様と sampling 値:
+
+- Google Gemma 4 model card: <https://ai.google.dev/gemma/docs/core/model_card_4>
+- Google Gemma 4 announcement: <https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/>
+- LM Studio Gemma 4 model page: <https://lmstudio.ai/models/gemma-4>
 
 `--format json` は `problems` / `warnings` / `recommendations` / `runtime` / `probe` を stable key で出力します。既定では `problems` だけが exit status を失敗にします。`--fail-on-warning` と `--fail-on-recommendation` を付けると、local runtime の未調整状態も benchmark 前の gate として扱えます。
 
 `--write-recommended-config <path>` は `--runtime` を兼ね、`/v1/models` の fuzzy match で見つかった exact model id、`context.compact_after_est_tokens`、local server の `generation.*` 推奨値を反映した complete config TOML を書き出します。LM Studio 側の loaded context length など yagent の config で変更できない項目は stderr の `external` に残します。既存ファイルは上書きせず、上書きする場合は `--force-recommended-config` を付けます。
 
-`--save-audit` は `--runtime` を兼ね、doctor 結果を `memory.state_dir` の scratch record として保存します。`yagent audit runtime` は保存済みの server/model、loaded context、quantization、probe、warning/recommendation 数を text または JSON で出力します。local Qwen の quantization や context 設定を変えながら benchmark record と突き合わせるための証跡として使えます。
+`--save-audit` は `--runtime` を兼ね、doctor 結果を `memory.state_dir` の scratch record として保存します。`yagent audit runtime` は保存済みの server/model、loaded context、quantization、probe、warning/recommendation 数を text または JSON で出力します。local model の quantization や context 設定を変えながら benchmark record と突き合わせるための証跡として使えます。
 
 ## TUI Panels
 
-右側 pane は `Run Graph / Plan / Verification / Memory` を切り替えられます。`/graph` `/plan` `/verification` `/memory` で直接開けて、`Ctrl+←/→` でも順送りできます。`/resume` を使うと `latest_session` を読み込み、`/resume <run-id>` で保存済み run を指定して、Plan / Verification / Memory panel もその内容で更新できます。`/memory` panel には stable facts / known failures / reusable observations / recent artifacts を表示します。
+右側 pane は `Run Graph / Plan / Verification / Memory` を切り替えられます。`/graph` `/plan` `/verification` `/memory` で直接開けて、`Ctrl+←/→` でも順送りできます。`/continue [conversation-id|latest]` は保存済み conversation を選び、次の入力を新しい turn / workflow として実行します。`/recover <workflow-id>` は user message を追加せず、保存済み durable snapshot から中断 workflow を復旧します。`/memory` panel には stable facts / known failures / reusable observations / recent artifacts を表示します。
 
 TUI の header には現在の routing profile、model override、streaming 状態、theme を表示します。`/profile` は利用可能な routing profile を表示し、`/profile fast` や `/profile strong` で以後の turn に渡す profile を切り替えます。`/profile clear` で既定 routing に戻します。設定済み profile がある場合、未知の profile 名は拒否され、`/profile f` のような入力では profile 名を `Tab` 補完できます。`/model <name>` は全 agent に明示 model override を渡し、profile の model 解決に戻す場合は `/model clear` を使います。`/stream on` は text delta を assistant block に逐次表示し、`/stream off` で通常の完了後表示に戻します。`/theme` は利用可能な TUI theme を表示し、`/theme contrast` や `/theme mono` で表示 theme を切り替え、`/theme clear` で既定 theme に戻します。通常は local Qwen 用 profile を `/profile fast`、OpenAI fallback を含む profile を `/profile strong` のように切り替え、model override は一時的な検証にだけ使います。
 
@@ -434,7 +473,7 @@ yagent benchmark \
   --save-artifact
 ```
 
-local Qwen / LM Studio を対象にするときは、`--preflight-doctor` で benchmark 開始前に `doctor` gate を走らせられます。preflight の要約は stderr に出るため、`--output json` / `--output csv` の stdout は壊しません。`--preflight-doctor-probe-structured` は JSON schema structured output まで確認し、`--preflight-fail-on-warning` / `--preflight-fail-on-recommendation` は runtime warning や tuning recommendation を benchmark failure として扱います。preflight summary は `--output json` の report と `--write-jsonl` / `--write-csv` の flat record にも保存されるため、後から eval 結果、実際の model call / fallback metadata、runtime context / quantization / warning 数を同じ record で比較できます。
+local Qwen / LM Studio を対象にするときは、`--preflight-doctor` で benchmark 開始前に `doctor` gate を走らせられます。複数の `--routing-candidate` がある場合は、candidate ごとに解決した exact primary server/model を個別に診断し、対応する profile record だけに preflight を保存します。preflight の要約は stderr に出るため、`--output json` / `--output csv` の stdout は壊しません。`--preflight-doctor-probe-structured` は JSON schema structured output まで確認し、`--preflight-fail-on-warning` / `--preflight-fail-on-recommendation` は runtime warning や tuning recommendation を benchmark failure として扱います。
 
 ```bash
 yagent benchmark \
@@ -446,7 +485,13 @@ yagent benchmark \
   --runs 1
 ```
 
-組み込み eval case は `yagent benchmark --list-cases` で確認できます。現在の built-in は `repo-readonly` `swe-like` `terminal-like` `permission-gate` です。`swe-like` は repo mutation を含むため、捨て worktree で実行する前提です。
+組み込み eval case は `yagent benchmark --list-cases` で確認できます。現在の built-in は `repo-readonly` `swe-like` `terminal-like` `permission-gate` に加え、`planner-reason` `tool-file-output` `delegation-scope` `mcp-response` `prior-assistant-tool-history` の source-typed security case です。`swe-like` は repo mutation を含むため、捨て worktree で実行する前提です。
+
+各 benchmark cell は workspace copy と private state root を使います。OS-level process sandbox/VM backend が未構成の間は、その隔離を破れる `task_run` と `task_bind` を fail closed で無効化します。つまり benchmark は filesystem tool による mutation/evidence を評価できますが、宣言済み task command や外部 MCP process の実測には process-isolated backend が必要です。通常の interactive harness での task/MCP 利用にはこの制限は適用されません。
+
+process-isolated backend は `[execution.process_isolation]` で明示します。推奨は `runner` に trusted VM/container proxy を指定する構成です。yagent は `yagent.process.v1` の process spec（command、cwd、env、declared read/write paths、network flag）を base64url で proxy に渡し、proxy が disposable guest 内で stdio を relay します。runner 未設定の isolated benchmark は fail closed です。macOS の `backend = "macos-sandbox-exec"` は declared read/write path を使う明示 opt-in fallback であり、deprecated API のため長期運用では VM/container proxy を使います。proxy の provisioning と host escape E2E は別の実行環境で検証する必要があります。
+
+prompt-injection の deterministic regression は Go test で planner reason、tool/MCP-equivalent output、delegation scope、prior assistant/tool/system history の provenance 境界を直接検査します。benchmark の security case は攻撃本文を trusted root user prompt に引用せず、`TurnRequest.Provenance` の source enum を通じて planner / RoleTool / delegation / MCP / history input を注入します。file/MCP/prior-tool source は assistant tool-call と `RoleTool` result の metadata を保持し、本文だけを `runtime_evidence` envelope に隔離します。
 
 独自 case は TOML で追加できます。
 
@@ -470,9 +515,9 @@ max_verification_failures = 0
 yagent benchmark --case-file ./benchmarks/cases.toml --case readme-audit --output table
 ```
 
-出力は各 profile ごとの成功数、eval pass 数、平均時間、平均イベント数、verification failure 数、各 run の phase / attempt / tool call 数をまとめます。`--output jsonl` / `--output csv` で stdout へ flat record を出せます。`--write-jsonl` / `--write-csv` は同じ flat record をファイルに保存します。`--save-artifact` は report と flat records を `memory.state_dir` の `benchmark_report` typed artifact として保存します。保存後は `yagent audit artifacts --run latest --kind benchmark_report --include-payload` で取り出せます。
+出力は各 profile ごとの成功数、eval pass 数、平均時間、平均イベント数、verification failure 数、各 run の phase / attempt / tool call 数をまとめます。flat record には model usage availability、input/output/total/cached/reasoning token と、mutation / permission request / delegation / handoff 数も入ります。custom case の `max_mutations` / `max_permission_requests` / `max_delegations` / `max_handoffs` を使うと、run が completed でも unsafe action が発生した場合に eval failure にできます。`--output jsonl` / `--output csv` で stdout へ flat record を出せます。`--write-jsonl` / `--write-csv` は同じ flat record をファイルに保存します。`--save-artifact` は report と flat records を `memory.state_dir` の `benchmark_report` typed artifact として保存します。保存後は `yagent audit artifacts --run latest --kind benchmark_report --include-payload` で取り出せます。
 
-保存済み record は `benchmark report` で再集計できます。JSONL/CSV を複数 `--input` で渡すと profile/case 単位に pass rate、成功率、平均時間、平均 tool call 数、平均 model call 数、model fallback 数、verification failure 数をまとめます。record には実際に使われた server / model / API / routing profile / LLM duration も保存されるため、local Qwen と OpenAI fallback の差を audit store なしでも比較できます。`--baseline <profile>` を付けると同じ case の baseline との差分を出し、`--fail-on-regression` は pass rate 低下または verification failure 増加を command failure にします。`--min-pass-rate` は CI や日次比較で最低 pass rate を gate するための閾値です。`--format junit` は group ごとの pass rate と runtime gate を JUnit XML testcase として出すため、既存 CI の test report UI に載せられます。
+保存済み record は `benchmark report` で再集計できます。JSONL/CSV を複数 `--input` で渡すと profile/case 単位に pass rate、成功率、平均時間、平均 tool/model logical call 数、平均 transport attempt 数、transport failure、fallback 数、token usage coverage と平均 token 数、平均 mutation / permission request / delegation / handoff 数、verification failure 数をまとめます。primary が失敗して fallback が成功した場合も、両 transport の duration と usage を失いません。`--baseline <profile>` を付けると同じ case の baseline との差分を出し、`--fail-on-regression` は pass rate 低下または verification failure 増加を command failure にします。`--min-pass-rate` は CI や日次比較で最低 pass rate を gate するための閾値です。`--format junit` は group ごとの pass rate と runtime gate を JUnit XML testcase として出すため、既存 CI の test report UI に載せられます。
 
 ```bash
 yagent benchmark report \
@@ -548,6 +593,7 @@ mode = "handoff"
 allowed_tools = ["fs_read", "fs_write", "patch_apply"]
 read_only = false
 max_turns = 4
+max_tool_calls = 8
 token_budget = 1200
 timeout = "30s"
 tags = ["docs"]
@@ -559,7 +605,7 @@ verification_required = true
 verification_max_attempts = 2
 ```
 
-Agent DSL は読み込み時に strict validation されます。未知キー、空の `id`、不正な `mode` / `task_kinds` / `preferred_phases`、負の `timeout` / `max_turns` / `token_budget` / `verification_max_attempts`、空文字の list item は source path と agent id 付きのエラーとして返します。schema は `yagent schema agent` で出力できます。
+Agent DSL は読み込み時に strict validation されます。未知キー、空の `id`、不正な `mode` / `task_kinds` / `preferred_phases`、負の `timeout` / `max_turns` / `max_tool_calls` / `token_budget` / `verification_max_attempts`、空文字の list item は source path と agent id 付きのエラーとして返します。schema は `yagent schema agent` で出力できます。
 
 主な項目の意味:
 
@@ -572,7 +618,8 @@ Agent DSL は読み込み時に strict validation されます。未知キー、
 - `read_only`: 読み取り専用 agent として扱いたいときに指定
 - `read_only = true` の agent は write tool を新たに得るわけではありません。ファイル変更が必要なときは write-capable agent へ委譲する前提です
 - `model`: その agent だけ別 model を使いたいときに指定
-- `max_turns`: その agent の最大継続ターン数
+- `max_turns`: その agent の最大継続ターン数。`0` は orchestrator default の `12`
+- `max_tool_calls`: その agent が1 execution unitで実行できる最大 tool call 数。`0` は planner/finalizer では tool-free、それ以外では既定 `8`。上限に達した後は tool を隠し、観測済み evidence だけで回答します
 - `token_budget`: その agent の context packet 上限。概算 token 数で recent messages / artifacts / observations を抑制します
 - `timeout`: その agent の LLM 呼び出し timeout
 - `routing_profile`: その agent をどの routing profile で実行するか
@@ -710,6 +757,10 @@ include_tools = ["search_docs"]
 
 MCP の `readOnlyHint` や `destructiveHint` のような annotation は、server が trusted でない限り yagent の安全判断には使いません。untrusted server で read-only tool を安全に扱いたい場合は、`read_only_tools` に明示してください。MCP server から `roots/list` が来た場合は `roots` / `cwd` の file URI だけを返し、`sampling/createMessage` は yagent 側では拒否します。server-initiated LLM call は Yagent の permission/audit 経路を迂回するため、明示的な tool として扱う方針です。
 
+durable workflow から mutating MCP tool を呼ぶ server は、yagent 独自の fencing contract を実装する必要があります。`tools/list` の対象 tool annotation に `"dev.yagent/durable-action-fencing": true` を付け、`tools/call` の result `_meta["dev.yagent/durable-action"]` へ request と同じ `action_id`、`workflow_id`、`work_unit_id`、`idempotency_key`、`lease_token`、`fencing_token` を返してください。未宣言または不一致なら yagent は effect を成功として確定せず、mutating action を `needs_attention` にします。これは MCP 標準の保証ではなく yagent の extension です。MCP server は受け取った fencing token を自身の永続化境界で比較し、古い token の書き込みを拒否する必要があります。yagent は dispatch 直前に自分の durable lease を再確認しますが、既に開始された外部 process/effect を universal に取消すことはできません。
+
+yagent と同じ Go module で所有する MCP server は `yagent/pkg/durablefence` を使えます。request `_meta` を `ParseMCPMetadata` で decode し、resource ごとの stable scope に対して `Gate.Begin` を resource 更新 transaction の前に、`Gate.Complete` を成功結果の永続化と同じ transaction に組み込みます。より新しい fencing token は新しい action を開始し、古い token は拒否します。同じ完了 action は保存済み metadata を replay し、未完了 action を自動再実行しません。server が resource 更新と fence record を atomic に保存できない場合は、効果が不明な action として返し、yagent の `needs_attention` 経路に委ねます。
+
 典型的な流れ:
 
 1. `task_list` で `kind = "mcp_server"` の entry を確認
@@ -742,9 +793,9 @@ execution event は調査用の raw `detail` と、TUI/CLI 表示用に短く整
 
 `tool_failed` と `agent_failed` には失敗理由も記録されるので、subagent の失敗調査に使えます。
 workspace を変更する tool event には `mutation_id` / `mutation_fingerprint` / `workspace_revision` metrics も付きます。
-`llm_called` event には実際に使われた `server_name` / `model` / `api` / `profile_name` / `duration_ms` / fallback metrics が付き、benchmark flat record にも転記されます。
+`llm_called` event には最終 transport の `server_name` / `model` / `api` / `profile_name` / `duration_ms` / fallback に加え、logical call 内の `transport_attempts` / `transport_failures` / 合計 duration と、全 attempt の input/output/total/cached/reasoning token、usage available/unavailable 数が付きます。usage object を返さない local server は token 数 0 と推定せず、unavailable attempt として coverage に反映します。Chat Completions streaming では `stream_options.include_usage=true` を送ります。
 permission decision と model invocation は `scratch/` に保存され、permission decision は turn 完了時に `permission_audit` artifact として run に集約されます。
-保存済み run state は `yagent audit runs` で一覧・詳細を確認でき、`yagent audit runs --run latest --full --format json` で run state 全体を JSON export できます。turn ごとの request/context/output message と event summary は `yagent audit conversations` で確認でき、本文が必要な場合だけ `--include-messages --format json` を指定します。run に紐づく execution / model invocation / observation / mutation / permission decision までまとめて渡したい場合は `yagent audit bundle --run latest` を使います。bundle は既定では tool output や artifact 本文/payload を含めず、必要なときだけ `--include-output` / `--include-artifact-content` / `--include-artifact-payload` / `--full-run` を指定します。時系列で agent / tool / model / permission / mutation / artifact を確認したい場合は `yagent audit trace --run latest` を使います。`audit trace` は prompt / response や tool output 本文を含めず、span id、kind、status、phase、agent、duration、server/model/API/fallback などの metadata を text または JSON で出します。横断調査では `yagent audit search <query>` を使うと、run / conversation / tool execution / model invocation / permission / runtime / observation / mutation / artifact の metadata と summary をまとめて検索できます。既定では本文や tool output は検索せず、必要な場合だけ `--include-output` を付けます。run 内の typed artifact は state store 保存時に `schema_version` と payload shape を検証し、`yagent audit artifacts --run latest` で取り出せます。artifact 本文や payload は既定では省略し、必要なときだけ `--include-content` / `--include-payload` を指定します。reusable observation cache は `yagent audit observations`、workspace mutation record は `yagent audit mutations`、LLM 呼び出し metadata は `yagent audit models` で確認できます。model invocation audit は prompt / response 本文を保存せず、server / model / API / routing profile / agent / phase / duration / status / fallback metadata を保存します。`yagent audit models --summary` は server/model/API/profile ごとの call 数、success/failure、fallback 数、平均 duration、agent/phase を集計します。
+保存済み run state は `yagent audit runs` で一覧・詳細を確認でき、`yagent audit runs --run latest --full --format json` で run state 全体を JSON export できます。turn ごとの request/context/output message と event summary は `yagent audit conversations` で確認でき、本文が必要な場合だけ `--include-messages --format json` を指定します。run に紐づく execution / model invocation / observation / mutation / permission decision までまとめて渡したい場合は `yagent audit bundle --run latest` を使います。bundle は既定では tool output や artifact 本文/payload を含めず、必要なときだけ `--include-output` / `--include-artifact-content` / `--include-artifact-payload` / `--full-run` を指定します。時系列で agent / tool / model / permission / mutation / artifact を確認したい場合は `yagent audit trace --run latest` を使います。`audit trace` は prompt / response や tool output 本文を含めず、span id、kind、status、phase、agent、duration、server/model/API/fallback などの metadata を text または JSON で出します。横断調査では `yagent audit search <query>` を使うと、run / conversation / tool execution / model invocation / permission / runtime / observation / mutation / artifact の metadata と summary をまとめて検索できます。既定では本文や tool output は検索せず、必要な場合だけ `--include-output` を付けます。run 内の typed artifact は state store 保存時に `schema_version` と payload shape を検証し、`yagent audit artifacts --run latest` で取り出せます。artifact 本文や payload は既定では省略し、必要なときだけ `--include-content` / `--include-payload` を指定します。reusable observation cache は `yagent audit observations`、workspace mutation record は `yagent audit mutations`、LLM 呼び出し metadata は `yagent audit models` で確認できます。model invocation audit は prompt / response 本文を保存せず、server / model / API / routing profile / agent / phase / duration / status / fallback と typed usage を保存します。`yagent audit models --summary` は server/model/API/profile ごとの call 数、success/failure、fallback 数、平均 duration、usage coverage、input/output/total/cached/reasoning token、agent/phase を集計します。
 権限確認や継続確認が複数同時に発生した場合でも、TUI 側で順番に処理できます。
 
 ## TUI 操作
@@ -770,7 +821,8 @@ permission decision と model invocation は `scratch/` に保存され、permis
 - `/status-filter <text>|clear`: Agent Status tree を絞り込み
 - `/status-fold on|off|toggle`: Agent Status の完了ノード折りたたみを切替
 - `/status-search <text>|clear`: Agent Status の node / event / failure を検索
-- `/resume [run-id|latest]`: 保存済み run を会話に復元
+- `/continue [conversation-id|latest]`: 保存済み conversation を選び、次の入力を新しい workflow で継続
+- `/recover <workflow-id>`: 中断した workflow を新しい user input なしで復旧
 - `/approvals`: approval の状態を表示
 - `/clear`: 会話ログをクリア
 - `/exit`: 終了
@@ -841,7 +893,7 @@ TUI では会話ログとは別に `Agent Status` viewport を表示し、サブ
 
 ### 継続確認
 
-built-in agent の既定 `max_turns` は `200` です。  
+ローカル model の誤探索を有限に閉じるため、built-in agent の既定 budget は役割別です。`max_turns` は planner `8`、manager / researcher / tester / reviewer `12`、mutation を担当する coder `24`。`max_tool_calls` は planner/finalizer `0`、manager / tester / reviewer `8`、researcher `6`、coder `16` です。tool budget を使い切ると tool を実行せず、観測済み evidence だけで synthesis します。
 既定では上限に達すると、permission UI と同じ導線で「継続実行するか」を確認します。
 
 - 許可するとその agent の turn カウンタをリセットして続行

@@ -49,6 +49,7 @@ func (p *Provider) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 				"safety_source":    item.SafetySource,
 				"allow_network":    item.AllowNetwork,
 				"roots":            append([]string(nil), item.Roots...),
+				"durable_fencing":  item.SupportsDurableFencing,
 			},
 			ReadOnly:     item.ReadOnly,
 			ParallelSafe: item.ParallelSafe,
@@ -112,11 +113,93 @@ func (p *Provider) Execute(ctx context.Context, agent domain.AgentSpec, call dom
 	if err := p.authorize(ctx, call, *bound); err != nil {
 		return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: " + err.Error()}, true
 	}
-	output, err := p.bindings.CallTool(ctx, bound.TaskID, bound.ServerToolName, call.Arguments)
+	execution, durable := domain.DurableActionExecutionContextFrom(ctx)
+	if durable && !bound.ReadOnly && !bound.SupportsDurableFencing {
+		return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: mutating MCP tool は durable action fencing extension を宣言していません"}, true
+	}
+	result, err := p.bindings.CallTool(ctx, bound.TaskID, bound.ServerToolName, call.Arguments, durableActionMetadata(ctx))
 	if err != nil {
 		return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: " + err.Error()}, true
 	}
-	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: output}, true
+	if durable && !bound.ReadOnly {
+		if err := validateDurableFencingAcknowledgement(result.Metadata, execution); err != nil {
+			return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: "エラー: " + err.Error()}, true
+		}
+	}
+	return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: true, Output: result.Output}, true
+}
+
+func durableActionMetadata(ctx context.Context) map[string]any {
+	execution, ok := domain.DurableActionExecutionContextFrom(ctx)
+	if !ok {
+		return nil
+	}
+	return map[string]any{
+		"dev.yagent/durable-action": map[string]any{
+			"action_id": execution.ActionID, "workflow_id": execution.WorkflowID, "work_unit_id": execution.WorkUnitID,
+			"attempt": execution.Attempt, "idempotency_key": execution.IdempotencyKey,
+			"lease_token": execution.LeaseToken, "fencing_token": execution.FencingToken,
+		},
+	}
+}
+
+func validateDurableFencingAcknowledgement(metadata map[string]any, execution domain.DurableActionExecutionContext) error {
+	raw, ok := metadata["dev.yagent/durable-action"]
+	if !ok {
+		return fmt.Errorf("MCP server did not acknowledge durable action fencing")
+	}
+	ack, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("MCP durable action acknowledgement has an invalid shape")
+	}
+	if stringValue(ack["action_id"]) != string(execution.ActionID) ||
+		stringValue(ack["workflow_id"]) != string(execution.WorkflowID) ||
+		stringValue(ack["work_unit_id"]) != string(execution.WorkUnitID) ||
+		stringValue(ack["idempotency_key"]) != execution.IdempotencyKey ||
+		stringValue(ack["lease_token"]) != string(execution.LeaseToken) ||
+		uint64Value(ack["fencing_token"]) != execution.FencingToken {
+		return fmt.Errorf("MCP durable action acknowledgement does not match the active lease")
+	}
+	return nil
+}
+
+func stringValue(value any) string {
+	switch item := value.(type) {
+	case string:
+		return item
+	case domain.ActionID:
+		return string(item)
+	case domain.WorkflowID:
+		return string(item)
+	case domain.DurableWorkUnitID:
+		return string(item)
+	case domain.LeaseToken:
+		return string(item)
+	default:
+		return ""
+	}
+}
+
+func uint64Value(value any) uint64 {
+	switch item := value.(type) {
+	case uint64:
+		return item
+	case uint:
+		return uint64(item)
+	case int:
+		if item > 0 {
+			return uint64(item)
+		}
+	case int64:
+		if item > 0 {
+			return uint64(item)
+		}
+	case float64:
+		if item > 0 && item == float64(uint64(item)) {
+			return uint64(item)
+		}
+	}
+	return 0
 }
 
 func (p *Provider) InferRuntime(_ context.Context, _ domain.AgentSpec, call domain.ToolCall, _ domain.ToolDefinition) (domain.ToolRuntimeHint, bool) {

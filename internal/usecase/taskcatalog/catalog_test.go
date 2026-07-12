@@ -44,6 +44,30 @@ args = ["test"]
 	}
 }
 
+func TestNewWithOptionsRejectsTaskPathsOutsideIsolatedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".yagent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	content := `
+[[tasks]]
+id = "outside-task"
+description = "outside"
+command = "go"
+args = ["test"]
+cwd = "` + outside + `"
+`
+	if err := os.WriteFile(filepath.Join(root, ".yagent", "tasks.toml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewWithOptions(root, LoadOptions{IncludeUserTasks: false, ConfineToWorkDir: true})
+	if err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("expected isolated workspace rejection, got %v", err)
+	}
+}
+
 func TestCatalogAddsAutoGoTasks(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)

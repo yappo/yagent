@@ -9,6 +9,15 @@ import (
 func TestValidateArtifactPayloadAcceptsKnownTypedPayloads(t *testing.T) {
 	cases := []RunArtifact{
 		{
+			Kind:          "workflow_input",
+			SchemaVersion: "workflow_input.v1",
+			Payload: mustArtifactPayload(t, WorkflowInputArtifactPayload{
+				Messages: []Message{{Role: RoleUser, Content: "root goal"}},
+				Model:    "gemma-4",
+				Profile:  "local",
+			}),
+		},
+		{
 			Kind:          "final_response",
 			SchemaVersion: "final_response.v1",
 			Payload: mustArtifactPayload(t, FinalResponseArtifactPayload{
@@ -65,6 +74,15 @@ func TestValidateArtifactPayloadRejectsInvalidTypedPayload(t *testing.T) {
 		artifact RunArtifact
 		want     string
 	}{
+		{
+			name: "workflow input missing messages",
+			artifact: RunArtifact{
+				Kind:          "workflow_input",
+				SchemaVersion: "workflow_input.v1",
+				Payload:       json.RawMessage(`{"model":"gemma-4"}`),
+			},
+			want: "payload.messages",
+		},
 		{
 			name: "schema version mismatch",
 			artifact: RunArtifact{

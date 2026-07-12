@@ -1,13 +1,18 @@
 package orchestrator
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"yagent/internal/domain"
 )
+
+var artifactIDCounter atomic.Uint64
 
 func newInventoryArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, inventory []domain.AgentInventoryEntry) domain.RunArtifact {
 	return newTypedArtifact(run, phase, agentID, "Agent inventory", "agent_inventory", inventoryArtifactSummary(inventory), domain.AgentInventoryArtifactPayload{
@@ -20,6 +25,10 @@ func newExecutionPlanArtifact(run *domain.RunState, phase domain.RunPhase, agent
 	return newTypedArtifact(run, phase, agentID, "Execution plan", "execution_plan", content, domain.ExecutionPlanArtifactPayload{
 		Plan: plan,
 	}, nil)
+}
+
+func newWorkflowInputArtifact(run *domain.RunState, payload domain.WorkflowInputArtifactPayload) domain.RunArtifact {
+	return newTypedArtifact(run, domain.RunPhaseIntake, "runtime", "Workflow input", "workflow_input", run.UserGoal, payload, nil)
 }
 
 func newRepoMapArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, entries []domain.RepoMapEntry) domain.RunArtifact {
@@ -133,14 +142,14 @@ func newFinalResponseArtifact(run *domain.RunState, phase domain.RunPhase, messa
 		VerificationSummary: payload.VerificationSummary,
 		RemainingRisks:      payload.RemainingRisks,
 		NextSteps:           payload.NextSteps,
+		Claims:              payload.Claims,
 		ArtifactRefs:        payload.ArtifactRefs,
 	}, refs)
 }
 
 func newTypedArtifact(run *domain.RunState, phase domain.RunPhase, agentID string, name string, kind string, content string, payload any, refs []domain.ArtifactReference) domain.RunArtifact {
-	seed := fmt.Sprintf("%s:%s:%s:%d", fallbackString(run.RootRunID, run.ID), phase, kind, time.Now().UnixNano())
 	return domain.RunArtifact{
-		ID:            nextExecutionID("artifact", seed),
+		ID:            newArtifactID(),
 		Name:          name,
 		Kind:          kind,
 		SchemaVersion: kind + ".v1",
@@ -153,6 +162,14 @@ func newTypedArtifact(run *domain.RunState, phase domain.RunPhase, agentID strin
 		References:    append([]domain.ArtifactReference(nil), refs...),
 		CreatedAt:     time.Now(),
 	}
+}
+
+func newArtifactID() string {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return "artifact-" + hex.EncodeToString(random[:])
+	}
+	return fmt.Sprintf("artifact-%d-%d", time.Now().UnixNano(), artifactIDCounter.Add(1))
 }
 
 func marshalArtifactPayload(payload any) json.RawMessage {

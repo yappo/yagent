@@ -308,7 +308,7 @@ func TestRouterAuditsFallbackModelInvocation(t *testing.T) {
 		return http.StatusInternalServerError, `bad`
 	})
 	attachFakeRouterClient(router, "openai", func(r *http.Request) (int, string) {
-		return http.StatusOK, `{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`
+		return http.StatusOK, `{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":13,"output_tokens":9,"total_tokens":22,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":6}}}`
 	})
 
 	response, err := router.Generate(context.Background(), domain.ModelRequest{})
@@ -317,6 +317,19 @@ func TestRouterAuditsFallbackModelInvocation(t *testing.T) {
 	}
 	if !response.Invocation.Fallback || response.Invocation.FallbackFromServer != "local" || response.Invocation.ServerName != "openai" || response.Invocation.API != "responses" || response.Invocation.Model != "gpt-5.5" {
 		t.Fatalf("unexpected fallback response invocation metadata: %+v", response.Invocation)
+	}
+	if response.Invocation.Usage != (domain.ModelUsage{Available: true, InputTokens: 13, OutputTokens: 9, TotalTokens: 22, CachedInputTokens: 4, ReasoningTokens: 6}) {
+		t.Fatalf("unexpected fallback usage: %+v", response.Invocation.Usage)
+	}
+	if len(response.Invocation.Attempts) != 2 {
+		t.Fatalf("expected primary and fallback attempts, got %+v", response.Invocation.Attempts)
+	}
+	primaryAttempt, fallbackAttempt := response.Invocation.Attempts[0], response.Invocation.Attempts[1]
+	if primaryAttempt.Success || primaryAttempt.Error == "" || primaryAttempt.ServerName != "local" || primaryAttempt.Fallback || primaryAttempt.Usage.Available {
+		t.Fatalf("unexpected primary transport attempt: %+v", primaryAttempt)
+	}
+	if !fallbackAttempt.Success || fallbackAttempt.Error != "" || fallbackAttempt.ServerName != "openai" || !fallbackAttempt.Fallback || fallbackAttempt.FallbackFromServer != "local" || fallbackAttempt.Usage != response.Invocation.Usage {
+		t.Fatalf("unexpected fallback transport attempt: %+v", fallbackAttempt)
 	}
 	if len(store.records) != 2 {
 		t.Fatalf("expected primary and fallback audit records, got %+v", store.records)
@@ -328,11 +341,53 @@ func TestRouterAuditsFallbackModelInvocation(t *testing.T) {
 	if err := json.Unmarshal(store.records[1].Payload, &fallback); err != nil {
 		t.Fatal(err)
 	}
-	if primary.Success || primary.ServerName != "local" || primary.Error == "" {
+	if primary.Success || primary.ServerName != "local" || primary.Error == "" || primary.Usage.Available {
 		t.Fatalf("unexpected primary audit: %+v", primary)
 	}
-	if !fallback.Success || !fallback.Fallback || fallback.FallbackFromServer != "local" || fallback.ServerName != "openai" || fallback.API != "responses" {
+	if !fallback.Success || !fallback.Fallback || fallback.FallbackFromServer != "local" || fallback.ServerName != "openai" || fallback.API != "responses" || fallback.Usage != response.Invocation.Usage {
 		t.Fatalf("unexpected fallback audit: %+v", fallback)
+	}
+}
+
+func TestRouterReturnsAllFailedTransportAttempts(t *testing.T) {
+	router, err := NewRouter(config.Config{
+		Server: config.ServerConfig{
+			Default: "local",
+			Servers: []config.ServerTarget{
+				{Name: "local", URL: "http://local.test", Model: "local-model", Timeout: config.Duration{Duration: time.Minute}},
+				{Name: "fallback", URL: "http://fallback.test", Model: "fallback-model", Timeout: config.Duration{Duration: time.Minute}},
+			},
+		},
+		Routing: config.RoutingConfig{Profiles: map[string]config.RoutingProfileConfig{
+			"default": {Server: "local", FallbackServer: "fallback", FallbackModel: "fallback-model"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter returned error: %v", err)
+	}
+	attachFakeRouterClient(router, "local", func(*http.Request) (int, string) {
+		return http.StatusInternalServerError, `primary failed`
+	})
+	attachFakeRouterClient(router, "fallback", func(*http.Request) (int, string) {
+		return http.StatusBadGateway, `fallback failed`
+	})
+
+	response, err := router.Generate(context.Background(), domain.ModelRequest{})
+	if err == nil {
+		t.Fatal("expected fallback failure")
+	}
+	if !response.Invocation.Fallback || response.Invocation.ServerName != "fallback" || response.Invocation.Model != "fallback-model" {
+		t.Fatalf("expected final fallback metadata, got %+v", response.Invocation)
+	}
+	if len(response.Invocation.Attempts) != 2 {
+		t.Fatalf("expected two failed attempts, got %+v", response.Invocation.Attempts)
+	}
+	primary, fallback := response.Invocation.Attempts[0], response.Invocation.Attempts[1]
+	if primary.Success || primary.Error == "" || primary.ServerName != "local" || primary.Fallback || primary.DurationMS < 0 || primary.Usage.Available {
+		t.Fatalf("unexpected failed primary attempt: %+v", primary)
+	}
+	if fallback.Success || fallback.Error == "" || fallback.ServerName != "fallback" || !fallback.Fallback || fallback.FallbackFromServer != "local" || fallback.DurationMS < 0 || fallback.Usage.Available {
+		t.Fatalf("unexpected failed fallback attempt: %+v", fallback)
 	}
 }
 

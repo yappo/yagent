@@ -127,6 +127,42 @@ func TestRunForceOverwritesExistingFile(t *testing.T) {
 	}
 }
 
+func TestRunGeneratesGemma4Preset(t *testing.T) {
+	dir := t.TempDir()
+	result, err := Run(Options{
+		WorkDir:     dir,
+		WriteConfig: true,
+		WriteTasks:  false,
+		LocalPreset: "gemma4",
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(result.Files) != 1 || result.Files[0].Status != "created" {
+		t.Fatalf("expected generated config, got %+v", result.Files)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, DefaultConfigPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		`model = "google/gemma-4-26b-a4b"`,
+		"temperature = 1",
+		"top_p = 0.95",
+		"top_k = 64",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in Gemma config, got %q", want, text)
+		}
+	}
+	for _, unwanted := range []string{"min_p =", "presence_penalty =", "repetition_penalty ="} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("did not expect Qwen-only setting %q in Gemma config, got %q", unwanted, text)
+		}
+	}
+}
+
 func TestRunDryRunDoesNotWriteFiles(t *testing.T) {
 	dir := t.TempDir()
 	result, err := Run(Options{WorkDir: dir, DryRun: true})

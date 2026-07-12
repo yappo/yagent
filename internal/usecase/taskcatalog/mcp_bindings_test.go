@@ -3,6 +3,7 @@ package taskcatalog
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"yagent/internal/domain"
@@ -17,22 +18,47 @@ func (f fakeSessionFactory) Open(context.Context, domain.TaskDefinition) (domain
 }
 
 type fakeSession struct {
-	tools []domain.MCPToolDescriptor
+	tools           []domain.MCPToolDescriptor
+	calledArguments map[string]any
+	calledMetadata  map[string]any
 }
 
 func (f *fakeSession) Initialize(context.Context) error { return nil }
 func (f *fakeSession) ListTools(context.Context) ([]domain.MCPToolDescriptor, error) {
 	return append([]domain.MCPToolDescriptor(nil), f.tools...), nil
 }
-func (f *fakeSession) CallTool(context.Context, string, map[string]any) (string, error) {
-	return "ok", nil
+func (f *fakeSession) CallTool(_ context.Context, _ string, arguments map[string]any, metadata map[string]any) (domain.MCPToolCallResult, error) {
+	f.calledArguments = arguments
+	f.calledMetadata = metadata
+	return domain.MCPToolCallResult{Output: "ok"}, nil
 }
 func (f *fakeSession) Close() error { return nil }
+
+func TestMCPBindingsCallToolSeparatesArgumentsAndMetadata(t *testing.T) {
+	session := &fakeSession{tools: []domain.MCPToolDescriptor{{Name: "search_docs"}}}
+	bindings := NewMCPBindings(fakeSessionFactory{session: session})
+	task := domain.TaskDefinition{ID: "docs", Kind: domain.TaskSpecKindMCPServer, MCPServer: &domain.MCPServerSpec{}}
+	if _, err := bindings.Bind(context.Background(), task); err != nil {
+		t.Fatalf("Bind returned error: %v", err)
+	}
+
+	arguments := map[string]any{"query": "mcp", "limit": float64(3)}
+	metadata := map[string]any{"request_id": "req-1", "trace": map[string]any{"sampled": true}}
+	if _, err := bindings.CallTool(context.Background(), "docs", "search_docs", arguments, metadata); err != nil {
+		t.Fatalf("CallTool returned error: %v", err)
+	}
+	if !reflect.DeepEqual(session.calledArguments, arguments) {
+		t.Fatalf("arguments changed or were not forwarded unchanged: got %#v, want %#v", session.calledArguments, arguments)
+	}
+	if !reflect.DeepEqual(session.calledMetadata, metadata) {
+		t.Fatalf("metadata was not forwarded separately: got %#v, want %#v", session.calledMetadata, metadata)
+	}
+}
 
 func TestMCPBindingsApplyFiltersAndQualifyNames(t *testing.T) {
 	bindings := NewMCPBindings(fakeSessionFactory{session: &fakeSession{
 		tools: []domain.MCPToolDescriptor{
-			{Name: "allowed.tool:v1", InputSchema: map[string]any{"type": "object"}, ParallelSafe: true},
+			{Name: "allowed.tool:v1", InputSchema: map[string]any{"type": "object"}, ParallelSafe: true, SupportsDurableFencing: true},
 			{Name: "ignored", InputSchema: map[string]any{"type": "object"}, ParallelSafe: true},
 		},
 	}})
@@ -60,6 +86,9 @@ func TestMCPBindingsApplyFiltersAndQualifyNames(t *testing.T) {
 	}
 	if bound[0].QualifiedName != "mcp__docs_api_v1__allowed_tool_v1__docs_v1" {
 		t.Fatalf("unexpected qualified name: %s", bound[0].QualifiedName)
+	}
+	if !bound[0].SupportsDurableFencing {
+		t.Fatalf("durable fencing declaration was not retained: %+v", bound[0])
 	}
 }
 

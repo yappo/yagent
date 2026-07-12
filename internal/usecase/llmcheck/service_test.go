@@ -34,6 +34,49 @@ func TestCheckFindsConfiguredModel(t *testing.T) {
 	}
 }
 
+func TestCheckWithOptionsUsesExactModelOverride(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) (int, string) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		return http.StatusOK, `{"data":[{"id":"candidate-model"}]}`
+	})
+
+	result, err := New(client).CheckWithOptions(context.Background(), testConfig("http://lmstudio.test", "server-model"), CheckOptions{Model: "candidate-model"})
+	if err != nil {
+		t.Fatalf("CheckWithOptions returned error: %v", err)
+	}
+	if result.Model != "candidate-model" || result.MatchedModel != "candidate-model" || !result.ModelExactMatch || len(result.Problems) != 0 {
+		t.Fatalf("expected exact model override, got %+v", result)
+	}
+}
+
+func TestDefaultClientUsesConfiguredServerTimeout(t *testing.T) {
+	service := New(nil)
+	configured := service.forServer(config.ServerTarget{Timeout: config.Duration{Duration: 42 * time.Second}})
+	if configured == service {
+		t.Fatal("expected server-specific service for default client")
+	}
+	if configured.client.Timeout != 42*time.Second {
+		t.Fatalf("configured timeout = %s, want %s", configured.client.Timeout, 42*time.Second)
+	}
+	if service.client.Timeout != 5*time.Second {
+		t.Fatalf("default client timeout changed to %s", service.client.Timeout)
+	}
+}
+
+func TestInjectedClientRetainsItsTimeout(t *testing.T) {
+	client := fakeHTTPClient(func(*http.Request) (int, string) { return http.StatusOK, `{}` })
+	service := New(client)
+	configured := service.forServer(config.ServerTarget{Timeout: config.Duration{Duration: 42 * time.Second}})
+	if configured != service {
+		t.Fatal("injected client must not be replaced")
+	}
+	if configured.client.Timeout != time.Second {
+		t.Fatalf("injected client timeout = %s, want %s", configured.client.Timeout, time.Second)
+	}
+}
+
 func TestCheckUsesTokenEnvForModelList(t *testing.T) {
 	t.Setenv("YAGENT_TEST_OPENAI_KEY", "secret-from-env")
 	client := fakeHTTPClient(func(r *http.Request) (int, string) {
@@ -107,6 +150,7 @@ func TestCheckReportsModelEndpointFailure(t *testing.T) {
 
 func TestCheckProbeChatCompletionsStructuredOutput(t *testing.T) {
 	var sawStructuredFormat bool
+	var maxTokens int
 	client := fakeHTTPClient(func(r *http.Request) (int, string) {
 		switch r.URL.Path {
 		case "/v1/models":
@@ -118,6 +162,12 @@ func TestCheckProbeChatCompletionsStructuredOutput(t *testing.T) {
 			}
 			if _, ok := payload["response_format"].(map[string]any); ok {
 				sawStructuredFormat = true
+			}
+			maxTokens = int(payload["max_tokens"].(float64))
+			messages := payload["messages"].([]any)
+			prompt := messages[0].(map[string]any)["content"].(string)
+			if !strings.Contains(prompt, "local model health check") || strings.Contains(prompt, `{"ok":true`) {
+				t.Fatalf("structured probe prompt is not task-oriented: %q", prompt)
 			}
 			return http.StatusOK, `{"choices":[{"message":{"role":"assistant","content":"{\"ok\":true,\"message\":\"yagent-ok\"}"}}]}`
 		default:
@@ -135,8 +185,38 @@ func TestCheckProbeChatCompletionsStructuredOutput(t *testing.T) {
 	if len(result.Problems) != 0 {
 		t.Fatalf("unexpected problems: %+v", result.Problems)
 	}
-	if !result.Probe.OK || !result.Probe.Structured || !sawStructuredFormat {
+	if !result.Probe.OK || !result.Probe.Structured || !sawStructuredFormat || maxTokens != defaultProbeMaxOutputTokens {
 		t.Fatalf("expected successful structured probe, got %+v saw=%v", result.Probe, sawStructuredFormat)
+	}
+}
+
+func TestProbeOutputTokensUsesConfiguredGenerationLimit(t *testing.T) {
+	if got := probeOutputTokens(config.GenerationConfig{}); got != defaultProbeMaxOutputTokens {
+		t.Fatalf("default probe output tokens = %d, want %d", got, defaultProbeMaxOutputTokens)
+	}
+	if got := probeOutputTokens(config.GenerationConfig{MaxOutputTokens: 2048}); got != 2048 {
+		t.Fatalf("configured probe output tokens = %d, want 2048", got)
+	}
+}
+
+func TestCheckProbeDiagnosesReasoningBudgetExhaustion(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) (int, string) {
+		switch r.URL.Path {
+		case "/v1/models":
+			return http.StatusOK, `{"data":[{"id":"gemma-4"}]}`
+		case "/v1/chat/completions":
+			return http.StatusOK, `{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"","reasoning_content":"still reasoning"}}]}`
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		return http.StatusNotFound, `not found`
+	})
+	result, err := New(client).CheckWithOptions(context.Background(), testConfig("http://lmstudio.test", "gemma-4"), CheckOptions{Probe: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Probe.OK || !strings.Contains(result.Probe.Error, "exhausted by reasoning") {
+		t.Fatalf("unexpected probe diagnosis: %+v", result.Probe)
 	}
 }
 
@@ -153,7 +233,7 @@ func TestCheckRuntimeMetadataReportsLocalModelSettings(t *testing.T) {
 				"quantization":{"name":"Q4_K_M","bits_per_weight":4},
 				"size_bytes":21000000000,
 				"params_string":"35B-A3B",
-				"loaded_instances":[{"id":"Qwen/Qwen3.6-35B-A3B","config":{"context_length":8192}}],
+				"loaded_instances":[{"id":"Qwen/Qwen3.6-35B-A3B","config":{"context_length":8192,"parallel":4}}],
 				"max_context_length":131072,
 				"format":"gguf",
 				"capabilities":{"vision":false,"trained_for_tool_use":false,"reasoning":{"allowed_options":["on","off"],"default":"on"}},
@@ -178,6 +258,9 @@ func TestCheckRuntimeMetadataReportsLocalModelSettings(t *testing.T) {
 	if !result.Runtime.ModelFound || !result.Runtime.Loaded || result.Runtime.ContextLength != 8192 || result.Runtime.MatchedModel.Quantization != "Q4_K_M" {
 		t.Fatalf("unexpected runtime metadata: %+v", result.Runtime)
 	}
+	if configs := result.Runtime.MatchedModel.LoadedInstanceConfigs; len(configs) != 1 || configs[0].ID != "Qwen/Qwen3.6-35B-A3B" || configs[0].Parallel == nil || *configs[0].Parallel != 4 {
+		t.Fatalf("unexpected loaded instance configs: %+v", configs)
+	}
 	if !containsWarning(result.Warnings, "context_length") || !containsWarning(result.Warnings, "trained_for_tool_use") {
 		t.Fatalf("expected runtime warnings, got %+v", result.Warnings)
 	}
@@ -185,6 +268,114 @@ func TestCheckRuntimeMetadataReportsLocalModelSettings(t *testing.T) {
 		!containsRecommendation(result.Recommendations, "server.servers[].generation.max_output_tokens", "2048") ||
 		!containsRecommendation(result.Recommendations, "server.servers[].generation.temperature", "1") {
 		t.Fatalf("expected runtime recommendations, got %+v", result.Recommendations)
+	}
+}
+
+func TestCheckRuntimeMetadataReportsGemma4Settings(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) (int, string) {
+		switch r.URL.Path {
+		case "/v1/models":
+			return http.StatusOK, `{"data":[{"id":"google/gemma-4-26b-a4b"}]}`
+		case "/api/v1/models":
+			return http.StatusOK, `{"models":[{
+				"type":"llm",
+				"key":"google/gemma-4-26b-a4b",
+				"display_name":"Gemma 4 26B A4B",
+				"quantization":{"name":"Q4_K_M","bits_per_weight":4},
+				"size_bytes":15600000000,
+				"params_string":"26B-A4B",
+				"loaded_instances":[{"id":"google/gemma-4-26b-a4b","config":{"context_length":32768}}],
+				"max_context_length":262144,
+				"format":"gguf",
+				"capabilities":{"vision":true,"trained_for_tool_use":true,"reasoning":{"allowed_options":["on","off"],"default":"on"}}
+			}]}`
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		return http.StatusNotFound, `not found`
+	})
+
+	cfg := testConfig("http://lmstudio.test", "google/gemma-4-26b-a4b")
+	cfg.Server.Servers[0].Generation = config.GenerationConfig{
+		TopK:              20,
+		MinP:              floatTestPtr(0),
+		PresencePenalty:   floatTestPtr(1.5),
+		RepetitionPenalty: floatTestPtr(1),
+	}
+	result, err := New(client).CheckWithOptions(context.Background(), cfg, CheckOptions{Runtime: true})
+	if err != nil {
+		t.Fatalf("CheckWithOptions returned error: %v", err)
+	}
+	if configs := result.Runtime.MatchedModel.LoadedInstanceConfigs; len(configs) != 1 || configs[0].Parallel != nil {
+		t.Fatalf("expected missing parallel to remain unavailable, got %+v", configs)
+	}
+	for setting, recommended := range map[string]string{
+		"server.servers[].generation.temperature":        "1",
+		"server.servers[].generation.top_p":              "0.95",
+		"server.servers[].generation.top_k":              "64",
+		"server.servers[].generation.min_p":              "(unset)",
+		"server.servers[].generation.presence_penalty":   "(unset)",
+		"server.servers[].generation.repetition_penalty": "(unset)",
+	} {
+		if !containsRecommendation(result.Recommendations, setting, recommended) {
+			t.Fatalf("expected Gemma 4 recommendation %s=%s, got %+v", setting, recommended, result.Recommendations)
+		}
+	}
+
+	plan := BuildRecommendedConfig(cfg, result)
+	generation := plan.Config.Server.Servers[0].Generation
+	if generation.TopK != 64 || generation.Temperature == nil || *generation.Temperature != 1 || generation.TopP == nil || *generation.TopP != 0.95 {
+		t.Fatalf("unexpected Gemma 4 recommended generation config: %+v", generation)
+	}
+	if generation.MinP != nil || generation.PresencePenalty != nil || generation.RepetitionPenalty != nil {
+		t.Fatalf("expected Qwen-only sampling settings to be removed: %+v", generation)
+	}
+}
+
+func TestCheckRuntimeMetadataKeepsLoadedInstanceConfigsSeparate(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) (int, string) {
+		switch r.URL.Path {
+		case "/v1/models":
+			return http.StatusOK, `{"data":[{"id":"Qwen/Qwen3.6-35B-A3B"}]}`
+		case "/api/v1/models":
+			return http.StatusOK, `{"models":[{
+				"key":"Qwen/Qwen3.6-35B-A3B",
+				"loaded_instances":[
+					{"id":"instance-small","config":{"context_length":8192,"parallel":1}},
+					{"id":"instance-large","config":{"context_length":32768,"parallel":4}}
+				],
+				"max_context_length":131072
+			}]}`
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		return http.StatusNotFound, `not found`
+	})
+
+	result, err := New(client).CheckWithOptions(context.Background(), testConfig("http://lmstudio.test", "Qwen/Qwen3.6-35B-A3B"), CheckOptions{Runtime: true})
+	if err != nil {
+		t.Fatalf("CheckWithOptions returned error: %v", err)
+	}
+	if result.Runtime.LoadedInstance != "instance-small" || result.Runtime.ContextLength != 8192 {
+		t.Fatalf("selected instance metadata was mixed: %+v", result.Runtime)
+	}
+	configs := result.Runtime.MatchedModel.LoadedInstanceConfigs
+	if len(configs) != 2 || configs[0].ContextLength != 8192 || configs[0].Parallel == nil || *configs[0].Parallel != 1 || configs[1].ContextLength != 32768 || configs[1].Parallel == nil || *configs[1].Parallel != 4 {
+		t.Fatalf("loaded instance configs were not preserved independently: %+v", configs)
+	}
+}
+
+func TestCheckReportsGemma4MissingModelSuggestions(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) (int, string) {
+		return http.StatusOK, `{"data":[{"id":"other-model"}]}`
+	})
+
+	result, err := New(client).Check(context.Background(), testConfig("http://lmstudio.test", "google/gemma-4-26b-a4b"), "")
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if !containsWarning(result.Suggestions, "Gemma 4") {
+		t.Fatalf("expected Gemma 4-specific suggestions, got %+v", result.Suggestions)
 	}
 }
 
@@ -393,6 +584,7 @@ func TestWriteRecommendedConfigWritesParseableConfig(t *testing.T) {
 }
 
 func TestNewAuditRecordCopiesDoctorResult(t *testing.T) {
+	parallel := 4
 	createdAt := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
 	record := NewAuditRecord(Result{
 		ServerName:   "local",
@@ -407,6 +599,10 @@ func TestNewAuditRecordCopiesDoctorResult(t *testing.T) {
 			Loaded:           true,
 			ContextLength:    32768,
 			MaxContextLength: 131072,
+			MatchedModel: RuntimeModelSummary{LoadedInstanceConfigs: []RuntimeLoadedInstanceConfig{
+				{ID: "instance-with-parallel", ContextLength: 32768, Parallel: &parallel},
+				{ID: "instance-without-parallel", ContextLength: 16384},
+			}},
 		},
 		Probe: ProbeResult{
 			Requested:  true,
@@ -420,6 +616,13 @@ func TestNewAuditRecordCopiesDoctorResult(t *testing.T) {
 	}
 	if record.CreatedAt != createdAt || record.Runtime.ContextLength != 32768 || !record.Probe.OK {
 		t.Fatalf("unexpected audit record: %+v", record)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"parallel":4`) || strings.Count(string(data), `"parallel":`) != 1 {
+		t.Fatalf("audit JSON did not preserve available parallel or omitted missing parallel: %s", data)
 	}
 	if summary := AuditSummary(record); !strings.Contains(summary, "warning") || !strings.Contains(summary, "local") || !strings.Contains(summary, "qwen3.6-35b-a3b-q4_k_m") {
 		t.Fatalf("unexpected audit summary: %q", summary)
@@ -442,6 +645,10 @@ func containsRecommendation(recommendations []Recommendation, setting string, re
 		}
 	}
 	return false
+}
+
+func floatTestPtr(value float64) *float64 {
+	return &value
 }
 
 func testConfig(url string, model string) config.Config {

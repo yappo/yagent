@@ -82,6 +82,35 @@ func TestResolveBenchmarkProfilesWithRoutingCandidates(t *testing.T) {
 	}
 }
 
+func TestResolveBenchmarkDoctorTargetUsesRoutingAndCandidateModel(t *testing.T) {
+	cfg := config.Default()
+	cfg.Routing.Profiles["remote"] = config.RoutingProfileConfig{
+		Server: "remote-server",
+		Model:  "routing-model",
+	}
+	profile := benchmarkusecase.Profile{
+		Name:           "current@remote",
+		RoutingProfile: "remote",
+		Model:          "candidate-model",
+	}
+
+	server, model, err := resolveBenchmarkDoctorTarget(cfg, profile, "", "")
+	if err != nil {
+		t.Fatalf("resolveBenchmarkDoctorTarget returned error: %v", err)
+	}
+	if server != "remote-server" || model != "candidate-model" {
+		t.Fatalf("expected routing server and candidate model, got server=%q model=%q", server, model)
+	}
+	profile.Model = ""
+	server, model, err = resolveBenchmarkDoctorTarget(cfg, profile, "", "")
+	if err != nil {
+		t.Fatalf("resolveBenchmarkDoctorTarget without candidate model returned error: %v", err)
+	}
+	if server != "remote-server" || model != "routing-model" {
+		t.Fatalf("expected routing profile model fallback, got server=%q model=%q", server, model)
+	}
+}
+
 func TestResolveBenchmarkCasesUsesBuiltins(t *testing.T) {
 	cases, err := resolveBenchmarkCases([]string{"repo-readonly"}, nil)
 	if err != nil {
@@ -144,6 +173,15 @@ func TestBenchmarkCommandIncludesPreflightDoctorFlags(t *testing.T) {
 		if command.Flag(flag) == nil {
 			t.Fatalf("expected %s flag", flag)
 		}
+	}
+}
+
+func TestBenchmarkCommandDoesNotExposeResume(t *testing.T) {
+	configPath := ""
+	logPath := ""
+	command := newBenchmarkCommand(&configPath, &logPath)
+	if command.Flag("resume") != nil {
+		t.Fatal("benchmark must not expose --resume")
 	}
 }
 

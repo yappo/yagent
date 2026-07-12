@@ -123,11 +123,11 @@ func newAuditRuntimeCommand(configPath *string) *cobra.Command {
 			case "text":
 				fmt.Print(renderDoctorRuntimeAuditText(records))
 			case "json":
-				data, err := json.MarshalIndent(records, "", "  ")
+				output, err := renderDoctorRuntimeAuditJSON(records)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(data))
+				fmt.Println(output)
 			default:
 				return fmt.Errorf("unsupported format: %s", format)
 			}
@@ -318,29 +318,45 @@ func modelInvocationRecordsFromScratch(items []domain.ScratchRecord, filter mode
 }
 
 type modelInvocationSummaryReport struct {
-	Records       int                           `json:"records"`
-	Successes     int                           `json:"successes"`
-	Failures      int                           `json:"failures"`
-	Fallbacks     int                           `json:"fallbacks"`
-	TotalDuration int64                         `json:"total_duration_ms"`
-	AvgDuration   float64                       `json:"avg_duration_ms"`
-	Groups        []modelInvocationGroupSummary `json:"groups,omitempty"`
+	Records           int                           `json:"records"`
+	Successes         int                           `json:"successes"`
+	Failures          int                           `json:"failures"`
+	Fallbacks         int                           `json:"fallbacks"`
+	UsageAvailable    int                           `json:"usage_available"`
+	UsageUnavailable  int                           `json:"usage_unavailable"`
+	UsageCoverage     float64                       `json:"usage_coverage"`
+	InputTokens       int                           `json:"input_tokens"`
+	OutputTokens      int                           `json:"output_tokens"`
+	TotalTokens       int                           `json:"total_tokens"`
+	CachedInputTokens int                           `json:"cached_input_tokens"`
+	ReasoningTokens   int                           `json:"reasoning_tokens"`
+	TotalDuration     int64                         `json:"total_duration_ms"`
+	AvgDuration       float64                       `json:"avg_duration_ms"`
+	Groups            []modelInvocationGroupSummary `json:"groups,omitempty"`
 }
 
 type modelInvocationGroupSummary struct {
-	ServerName    string   `json:"server_name,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	API           string   `json:"api,omitempty"`
-	ProfileName   string   `json:"profile_name,omitempty"`
-	Records       int      `json:"records"`
-	Successes     int      `json:"successes"`
-	Failures      int      `json:"failures"`
-	Fallbacks     int      `json:"fallbacks"`
-	TotalDuration int64    `json:"total_duration_ms"`
-	AvgDuration   float64  `json:"avg_duration_ms"`
-	MaxDuration   int64    `json:"max_duration_ms"`
-	Agents        []string `json:"agents,omitempty"`
-	Phases        []string `json:"phases,omitempty"`
+	ServerName        string   `json:"server_name,omitempty"`
+	Model             string   `json:"model,omitempty"`
+	API               string   `json:"api,omitempty"`
+	ProfileName       string   `json:"profile_name,omitempty"`
+	Records           int      `json:"records"`
+	Successes         int      `json:"successes"`
+	Failures          int      `json:"failures"`
+	Fallbacks         int      `json:"fallbacks"`
+	UsageAvailable    int      `json:"usage_available"`
+	UsageUnavailable  int      `json:"usage_unavailable"`
+	UsageCoverage     float64  `json:"usage_coverage"`
+	InputTokens       int      `json:"input_tokens"`
+	OutputTokens      int      `json:"output_tokens"`
+	TotalTokens       int      `json:"total_tokens"`
+	CachedInputTokens int      `json:"cached_input_tokens"`
+	ReasoningTokens   int      `json:"reasoning_tokens"`
+	TotalDuration     int64    `json:"total_duration_ms"`
+	AvgDuration       float64  `json:"avg_duration_ms"`
+	MaxDuration       int64    `json:"max_duration_ms"`
+	Agents            []string `json:"agents,omitempty"`
+	Phases            []string `json:"phases,omitempty"`
 }
 
 type modelInvocationGroupKey struct {
@@ -365,6 +381,16 @@ func summarizeModelInvocations(records []domain.ModelInvocationRecord) modelInvo
 			report.Fallbacks++
 		}
 		report.TotalDuration += record.DurationMS
+		if record.Usage.Available {
+			report.UsageAvailable++
+			report.InputTokens += record.Usage.InputTokens
+			report.OutputTokens += record.Usage.OutputTokens
+			report.TotalTokens += record.Usage.TotalTokens
+			report.CachedInputTokens += record.Usage.CachedInputTokens
+			report.ReasoningTokens += record.Usage.ReasoningTokens
+		} else {
+			report.UsageUnavailable++
+		}
 
 		key := modelInvocationGroupKey{
 			serverName:  record.ServerName,
@@ -394,6 +420,16 @@ func summarizeModelInvocations(records []domain.ModelInvocationRecord) modelInvo
 			group.Fallbacks++
 		}
 		group.TotalDuration += record.DurationMS
+		if record.Usage.Available {
+			group.UsageAvailable++
+			group.InputTokens += record.Usage.InputTokens
+			group.OutputTokens += record.Usage.OutputTokens
+			group.TotalTokens += record.Usage.TotalTokens
+			group.CachedInputTokens += record.Usage.CachedInputTokens
+			group.ReasoningTokens += record.Usage.ReasoningTokens
+		} else {
+			group.UsageUnavailable++
+		}
 		if record.DurationMS > group.MaxDuration {
 			group.MaxDuration = record.DurationMS
 		}
@@ -406,10 +442,12 @@ func summarizeModelInvocations(records []domain.ModelInvocationRecord) modelInvo
 	}
 	if report.Records > 0 {
 		report.AvgDuration = float64(report.TotalDuration) / float64(report.Records)
+		report.UsageCoverage = float64(report.UsageAvailable) / float64(report.Records)
 	}
 	for key, group := range groups {
 		if group.Records > 0 {
 			group.AvgDuration = float64(group.TotalDuration) / float64(group.Records)
+			group.UsageCoverage = float64(group.UsageAvailable) / float64(group.Records)
 		}
 		group.Agents = sortedStringSet(agentsByGroup[key])
 		group.Phases = sortedStringSet(phasesByGroup[key])
@@ -606,6 +644,18 @@ func renderModelInvocationAuditText(records []domain.ModelInvocationRecord) stri
 			}
 		}
 		sb.WriteString(fmt.Sprintf(" messages=%d tools=%d duration=%dms", record.Messages, record.Tools, record.DurationMS))
+		if record.Usage.Available {
+			sb.WriteString(fmt.Sprintf(
+				" usage=%d/%d/%d cached=%d reasoning=%d",
+				record.Usage.InputTokens,
+				record.Usage.OutputTokens,
+				record.Usage.TotalTokens,
+				record.Usage.CachedInputTokens,
+				record.Usage.ReasoningTokens,
+			))
+		} else {
+			sb.WriteString(" usage=unavailable")
+		}
 		if record.FinishReason != "" {
 			sb.WriteString(" finish=" + record.FinishReason)
 		}
@@ -624,10 +674,19 @@ func renderModelInvocationSummaryText(report modelInvocationSummaryReport) strin
 	sb.WriteString(fmt.Sprintf("  success: %d\n", report.Successes))
 	sb.WriteString(fmt.Sprintf("  failure: %d\n", report.Failures))
 	sb.WriteString(fmt.Sprintf("  fallback: %d\n", report.Fallbacks))
+	sb.WriteString(fmt.Sprintf("  usage_coverage: %.1f%% (%d/%d)\n", report.UsageCoverage*100, report.UsageAvailable, report.Records))
+	sb.WriteString(fmt.Sprintf(
+		"  tokens: input=%d output=%d total=%d cached=%d reasoning=%d\n",
+		report.InputTokens,
+		report.OutputTokens,
+		report.TotalTokens,
+		report.CachedInputTokens,
+		report.ReasoningTokens,
+	))
 	sb.WriteString(fmt.Sprintf("  avg_duration: %.1fms\n", report.AvgDuration))
 	for _, group := range report.Groups {
 		sb.WriteString(fmt.Sprintf(
-			"- %s %s api=%s profile=%s calls=%d success=%d failure=%d fallback=%d avg=%.1fms max=%dms",
+			"- %s %s api=%s profile=%s calls=%d success=%d failure=%d fallback=%d avg=%.1fms max=%dms usage=%.1f%% tokens=%d/%d/%d",
 			fallbackAuditString(group.ServerName, "-"),
 			fallbackAuditString(group.Model, "-"),
 			fallbackAuditString(group.API, "-"),
@@ -638,6 +697,10 @@ func renderModelInvocationSummaryText(report modelInvocationSummaryReport) strin
 			group.Fallbacks,
 			group.AvgDuration,
 			group.MaxDuration,
+			group.UsageCoverage*100,
+			group.InputTokens,
+			group.OutputTokens,
+			group.TotalTokens,
 		))
 		if len(group.Agents) > 0 {
 			sb.WriteString(" agents=" + strings.Join(group.Agents, ","))
@@ -679,6 +742,9 @@ func renderDoctorRuntimeAuditText(records []llmcheck.AuditRecord) string {
 				if record.Runtime.MatchedModel.Quantization != "" {
 					sb.WriteString(" quant=" + record.Runtime.MatchedModel.Quantization)
 				}
+				if instances := formatRuntimeLoadedInstanceConfigs(record.Runtime.MatchedModel.LoadedInstanceConfigs); instances != "" {
+					sb.WriteString(" instances=" + instances)
+				}
 			}
 		}
 		if record.Probe.Requested {
@@ -703,6 +769,36 @@ func renderDoctorRuntimeAuditText(records []llmcheck.AuditRecord) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+func renderDoctorRuntimeAuditJSON(records []llmcheck.AuditRecord) (string, error) {
+	data, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func formatRuntimeLoadedInstanceConfigs(instances []llmcheck.RuntimeLoadedInstanceConfig) string {
+	formatted := make([]string, 0, len(instances))
+	for _, instance := range instances {
+		fields := make([]string, 0, 2)
+		if instance.ContextLength > 0 {
+			fields = append(fields, fmt.Sprintf("context=%d", instance.ContextLength))
+		}
+		if instance.Parallel != nil {
+			fields = append(fields, fmt.Sprintf("parallel=%d", *instance.Parallel))
+		}
+		item := fallbackAuditString(instance.ID, "-")
+		if len(fields) > 0 {
+			item += "(" + strings.Join(fields, ",") + ")"
+		}
+		formatted = append(formatted, item)
+	}
+	if len(formatted) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(formatted, ",") + "]"
 }
 
 func doctorAuditStatus(record llmcheck.AuditRecord) string {

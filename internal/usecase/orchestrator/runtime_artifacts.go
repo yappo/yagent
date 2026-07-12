@@ -204,12 +204,6 @@ func (s *Service) buildPermissionAuditArtifact(ctx context.Context, run *domain.
 	})
 }
 
-func (s *Service) appendPermissionAuditArtifact(ctx context.Context, run *domain.RunState, phase domain.RunPhase) {
-	if artifact := s.buildPermissionAuditArtifact(ctx, run, phase); artifact.ID != "" {
-		run.Artifacts = append(run.Artifacts, artifact)
-	}
-}
-
 func (s *Service) buildTestReportArtifact(run *domain.RunState, phase domain.RunPhase, attempt int, status string, results []domain.VerificationResult) domain.RunArtifact {
 	if run == nil || len(results) == 0 {
 		return domain.RunArtifact{}

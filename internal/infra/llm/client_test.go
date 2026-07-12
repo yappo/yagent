@@ -19,7 +19,14 @@ func TestGenerate(t *testing.T) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		return http.StatusOK, `{"choices":[{"message":{"role":"assistant","content":"hello"}}]}`
+		var body chatRequestDTO
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if body.StreamOptions != nil {
+			t.Fatalf("non-streaming request included stream_options: %+v", body.StreamOptions)
+		}
+		return http.StatusOK, `{"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":5}}}`
 	})
 
 	response, err := client.Generate(context.Background(), domain.ModelRequest{
@@ -32,6 +39,24 @@ func TestGenerate(t *testing.T) {
 
 	if response.Message.Content != "hello" {
 		t.Fatalf("unexpected content: %s", response.Message.Content)
+	}
+	if response.Invocation.Usage != (domain.ModelUsage{Available: true, InputTokens: 11, OutputTokens: 7, TotalTokens: 18, CachedInputTokens: 3, ReasoningTokens: 5}) {
+		t.Fatalf("unexpected usage: %+v", response.Invocation.Usage)
+	}
+}
+
+func TestGenerateWithoutUsageMarksUsageUnavailable(t *testing.T) {
+	client := NewClient("http://llm.test", "", time.Minute, "chat_completions")
+	client.httpClient = fakeHTTPClient(func(_ *http.Request) (int, string) {
+		return http.StatusOK, `{"choices":[{"message":{"role":"assistant","content":"hello"}}]}`
+	})
+
+	response, err := client.Generate(context.Background(), domain.ModelRequest{})
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if response.Invocation.Usage.Available {
+		t.Fatalf("expected unavailable usage, got %+v", response.Invocation.Usage)
 	}
 }
 
@@ -48,10 +73,15 @@ func TestGenerateChatCompletionsStream(t *testing.T) {
 		if !body.Stream {
 			t.Fatalf("expected stream request")
 		}
+		if body.StreamOptions == nil || !body.StreamOptions.IncludeUsage {
+			t.Fatalf("expected stream_options.include_usage=true, got %+v", body.StreamOptions)
+		}
 		return http.StatusOK, strings.Join([]string{
 			`data: {"choices":[{"delta":{"role":"assistant","content":"hel"}}]}`,
 			"",
 			`data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}`,
+			"",
+			`data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":5}}}`,
 			"",
 			`data: [DONE]`,
 			"",
@@ -76,6 +106,9 @@ func TestGenerateChatCompletionsStream(t *testing.T) {
 	}
 	if strings.Join(deltas, "") != "hello" {
 		t.Fatalf("unexpected deltas: %+v", deltas)
+	}
+	if response.Invocation.Usage != (domain.ModelUsage{Available: true, InputTokens: 11, OutputTokens: 7, TotalTokens: 18, CachedInputTokens: 3, ReasoningTokens: 5}) {
+		t.Fatalf("unexpected streaming usage: %+v", response.Invocation.Usage)
 	}
 }
 
@@ -141,7 +174,7 @@ func TestGenerateResponses(t *testing.T) {
 		if len(body.Tools) != 1 || body.Tools[0].Name != "lookup" {
 			t.Fatalf("unexpected tools: %+v", body.Tools)
 		}
-		return http.StatusOK, `{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}`
+		return http.StatusOK, `{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":13,"output_tokens":9,"total_tokens":22,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":6}}}`
 	})
 
 	response, err := client.Generate(context.Background(), domain.ModelRequest{
@@ -168,6 +201,9 @@ func TestGenerateResponses(t *testing.T) {
 	if response.Message.Content != "hello" {
 		t.Fatalf("unexpected content: %s", response.Message.Content)
 	}
+	if response.Invocation.Usage != (domain.ModelUsage{Available: true, InputTokens: 13, OutputTokens: 9, TotalTokens: 22, CachedInputTokens: 4, ReasoningTokens: 6}) {
+		t.Fatalf("unexpected Responses usage: %+v", response.Invocation.Usage)
+	}
 }
 
 func TestGenerateResponsesStream(t *testing.T) {
@@ -188,7 +224,7 @@ func TestGenerateResponsesStream(t *testing.T) {
 			"",
 			`data: {"type":"response.output_text.delta","delta":"lo"}`,
 			"",
-			`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}`,
+			`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":13,"output_tokens":9,"total_tokens":22,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":6}}}}`,
 			"",
 			`data: [DONE]`,
 			"",
@@ -213,6 +249,34 @@ func TestGenerateResponsesStream(t *testing.T) {
 	}
 	if strings.Join(deltas, "") != "hello" {
 		t.Fatalf("unexpected deltas: %+v", deltas)
+	}
+	if response.Invocation.Usage != (domain.ModelUsage{Available: true, InputTokens: 13, OutputTokens: 9, TotalTokens: 22, CachedInputTokens: 4, ReasoningTokens: 6}) {
+		t.Fatalf("unexpected Responses streaming usage: %+v", response.Invocation.Usage)
+	}
+}
+
+func TestGenerateResponsesStreamRetainsCompletedUsageWithAccumulatedOutput(t *testing.T) {
+	client := NewClient("http://llm.test", "", time.Minute, "responses")
+	client.httpClient = fakeHTTPClient(func(_ *http.Request) (int, string) {
+		return http.StatusOK, strings.Join([]string{
+			`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}`,
+			"",
+			`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":13,"output_tokens":9,"total_tokens":22,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":6}}}}`,
+			"",
+			`data: [DONE]`,
+			"",
+		}, "\n")
+	})
+
+	response, err := client.Generate(context.Background(), domain.ModelRequest{Stream: true})
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if response.Message.Content != "hello" || response.FinishReason != "completed" {
+		t.Fatalf("unexpected streaming response: %+v", response)
+	}
+	if response.Invocation.Usage != (domain.ModelUsage{Available: true, InputTokens: 13, OutputTokens: 9, TotalTokens: 22, CachedInputTokens: 4, ReasoningTokens: 6}) {
+		t.Fatalf("unexpected accumulated-output usage: %+v", response.Invocation.Usage)
 	}
 }
 

@@ -131,12 +131,24 @@ func submitPrompt(m model, input string) (tea.Model, tea.Cmd) {
 	layoutCmd := m.syncAfterComposerChange(false)
 
 	send := func() tea.Msg {
-		result, err := m.runner.RunTurn(context.Background(), domain.TurnRequest{
-			Messages: m.messages,
-			Model:    m.modelOverride,
-			Profile:  m.selectedProfile,
-			Stream:   m.streaming,
-		})
+		var result domain.TurnResult
+		var err error
+		if m.conversationID != "" {
+			result, err = m.runner.ContinueConversation(context.Background(), domain.ConversationTurnRequest{
+				ConversationID: m.conversationID,
+				Messages:       []domain.Message{{Role: domain.RoleUser, Content: normalized}},
+				Model:          m.modelOverride,
+				Profile:        m.selectedProfile,
+				Stream:         m.streaming,
+			})
+		} else {
+			result, err = m.runner.RunTurn(context.Background(), domain.TurnRequest{
+				Messages: m.messages,
+				Model:    m.modelOverride,
+				Profile:  m.selectedProfile,
+				Stream:   m.streaming,
+			})
+		}
 		return chatMessage{content: result.Message.Content, run: result.Run, err: err}
 	}
 

@@ -10,8 +10,9 @@ import (
 )
 
 type Registry struct {
-	tools     map[string]domain.Tool
-	providers []domain.DynamicToolProvider
+	tools              map[string]domain.Tool
+	providers          []domain.DynamicToolProvider
+	durableActionGuard domain.DurableActionGuard
 }
 
 func New(tools ...domain.Tool) *Registry {
@@ -28,6 +29,10 @@ func (r *Registry) Register(tool domain.Tool) {
 
 func (r *Registry) RegisterProvider(provider domain.DynamicToolProvider) {
 	r.providers = append(r.providers, provider)
+}
+
+func (r *Registry) SetDurableActionGuard(guard domain.DurableActionGuard) {
+	r.durableActionGuard = guard
 }
 
 func (r *Registry) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
@@ -54,6 +59,11 @@ func (r *Registry) Definitions(agent domain.AgentSpec) []domain.ToolDefinition {
 }
 
 func (r *Registry) Execute(ctx context.Context, agent domain.AgentSpec, call domain.ToolCall) domain.ToolResult {
+	if execution, ok := domain.DurableActionExecutionContextFrom(ctx); ok && r.durableActionGuard != nil {
+		if err := r.durableActionGuard.ValidateDurableAction(ctx, execution); err != nil {
+			return domain.ToolResult{CallID: call.ID, Name: call.Name, Success: false, Output: fmt.Sprintf("エラー: durable action guard: %v", err)}
+		}
+	}
 	for _, provider := range r.providers {
 		if result, ok := provider.Execute(ctx, agent, call); ok {
 			return result

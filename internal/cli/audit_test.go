@@ -323,6 +323,7 @@ func TestSummarizeModelInvocations(t *testing.T) {
 			Phase:       domain.RunPhasePlan,
 			DurationMS:  100,
 			Success:     true,
+			Usage:       domain.ModelUsage{Available: true, InputTokens: 100, OutputTokens: 20, TotalTokens: 120, CachedInputTokens: 10, ReasoningTokens: 5},
 		},
 		{
 			ServerName:  "local",
@@ -344,10 +345,14 @@ func TestSummarizeModelInvocations(t *testing.T) {
 			DurationMS:  200,
 			Success:     true,
 			Fallback:    true,
+			Usage:       domain.ModelUsage{Available: true, InputTokens: 200, OutputTokens: 40, TotalTokens: 240, CachedInputTokens: 20, ReasoningTokens: 10},
 		},
 	})
 	if report.Records != 3 || report.Successes != 2 || report.Failures != 1 || report.Fallbacks != 1 || report.AvgDuration != 200 {
 		t.Fatalf("unexpected summary: %+v", report)
+	}
+	if report.UsageAvailable != 2 || report.UsageUnavailable != 1 || report.UsageCoverage != float64(2)/3 || report.TotalTokens != 360 || report.CachedInputTokens != 30 || report.ReasoningTokens != 15 {
+		t.Fatalf("unexpected usage summary: %+v", report)
 	}
 	if len(report.Groups) != 2 {
 		t.Fatalf("expected two groups, got %+v", report.Groups)
@@ -362,6 +367,9 @@ func TestSummarizeModelInvocations(t *testing.T) {
 	if local.Records != 2 || local.Successes != 1 || local.Failures != 1 || local.AvgDuration != 200 || local.MaxDuration != 300 {
 		t.Fatalf("unexpected local group: %+v", local)
 	}
+	if local.UsageAvailable != 1 || local.UsageUnavailable != 1 || local.UsageCoverage != 0.5 || local.TotalTokens != 120 {
+		t.Fatalf("unexpected local usage group: %+v", local)
+	}
 	if strings.Join(local.Agents, ",") != "coder,planner" || strings.Join(local.Phases, ",") != "execute,plan" {
 		t.Fatalf("unexpected local group sets: %+v", local)
 	}
@@ -369,24 +377,36 @@ func TestSummarizeModelInvocations(t *testing.T) {
 
 func TestRenderModelInvocationSummaryText(t *testing.T) {
 	rendered := renderModelInvocationSummaryText(modelInvocationSummaryReport{
-		Records:     2,
-		Successes:   1,
-		Failures:    1,
-		Fallbacks:   1,
-		AvgDuration: 150,
+		Records:          2,
+		Successes:        1,
+		Failures:         1,
+		Fallbacks:        1,
+		UsageAvailable:   1,
+		UsageUnavailable: 1,
+		UsageCoverage:    0.5,
+		InputTokens:      100,
+		OutputTokens:     20,
+		TotalTokens:      120,
+		AvgDuration:      150,
 		Groups: []modelInvocationGroupSummary{{
-			ServerName:  "local",
-			Model:       "qwen",
-			API:         "chat_completions",
-			ProfileName: "fast",
-			Records:     2,
-			Successes:   1,
-			Failures:    1,
-			Fallbacks:   1,
-			AvgDuration: 150,
-			MaxDuration: 200,
-			Agents:      []string{"coder", "planner"},
-			Phases:      []string{"execute", "plan"},
+			ServerName:       "local",
+			Model:            "qwen",
+			API:              "chat_completions",
+			ProfileName:      "fast",
+			Records:          2,
+			Successes:        1,
+			Failures:         1,
+			Fallbacks:        1,
+			UsageAvailable:   1,
+			UsageUnavailable: 1,
+			UsageCoverage:    0.5,
+			InputTokens:      100,
+			OutputTokens:     20,
+			TotalTokens:      120,
+			AvgDuration:      150,
+			MaxDuration:      200,
+			Agents:           []string{"coder", "planner"},
+			Phases:           []string{"execute", "plan"},
 		}},
 	})
 	for _, want := range []string{
@@ -395,6 +415,8 @@ func TestRenderModelInvocationSummaryText(t *testing.T) {
 		"success: 1",
 		"failure: 1",
 		"fallback: 1",
+		"usage_coverage: 50.0% (1/2)",
+		"tokens: input=100 output=20 total=120",
 		"avg_duration: 150.0ms",
 		"local qwen api=chat_completions profile=fast calls=2 success=1 failure=1 fallback=1 avg=150.0ms max=200ms",
 		"agents=coder,planner",
@@ -423,6 +445,7 @@ func TestRenderModelInvocationAuditText(t *testing.T) {
 		Tools:              7,
 		DurationMS:         1234,
 		FinishReason:       "completed",
+		Usage:              domain.ModelUsage{Available: true, InputTokens: 100, OutputTokens: 20, TotalTokens: 120, CachedInputTokens: 10, ReasoningTokens: 5},
 	}})
 	for _, want := range []string{
 		"Model invocations",
@@ -436,6 +459,7 @@ func TestRenderModelInvocationAuditText(t *testing.T) {
 		"fallback=true",
 		"from=local",
 		"messages=3 tools=7 duration=1234ms",
+		"usage=100/20/120 cached=10 reasoning=5",
 		"finish=completed",
 	} {
 		if !strings.Contains(rendered, want) {
@@ -475,6 +499,8 @@ func TestDoctorAuditRecordsFromScratch(t *testing.T) {
 
 func TestRenderDoctorRuntimeAuditText(t *testing.T) {
 	falseValue := false
+	parallelOne := 1
+	parallelFour := 4
 	rendered := renderDoctorRuntimeAuditText([]llmcheck.AuditRecord{{
 		ID:              "llm-doctor-1",
 		ServerName:      "local",
@@ -491,6 +517,11 @@ func TestRenderDoctorRuntimeAuditText(t *testing.T) {
 			MatchedModel: llmcheck.RuntimeModelSummary{
 				Quantization:      "Q4_K_M",
 				TrainedForToolUse: &falseValue,
+				LoadedInstanceConfigs: []llmcheck.RuntimeLoadedInstanceConfig{
+					{ID: "instance-small", ContextLength: 8192, Parallel: &parallelOne},
+					{ID: "instance-large", ContextLength: 32768, Parallel: &parallelFour},
+					{ID: "instance-unknown", ContextLength: 4096},
+				},
 			},
 		},
 		Probe: llmcheck.ProbeResult{
@@ -510,6 +541,7 @@ func TestRenderDoctorRuntimeAuditText(t *testing.T) {
 		"runtime_loaded=true",
 		"context=32768/131072",
 		"quant=Q4_K_M",
+		"instances=[instance-small(context=8192,parallel=1),instance-large(context=32768,parallel=4),instance-unknown(context=4096)]",
 		"probe=ok",
 		"probe_format=json_schema",
 		"warnings=1",
@@ -518,6 +550,26 @@ func TestRenderDoctorRuntimeAuditText(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected %q in runtime audit output, got %q", want, rendered)
 		}
+	}
+}
+
+func TestRenderDoctorRuntimeAuditJSONIncludesAvailableParallelOnly(t *testing.T) {
+	parallel := 4
+	output, err := renderDoctorRuntimeAuditJSON([]llmcheck.AuditRecord{{
+		Runtime: llmcheck.RuntimeResult{
+			MatchedModel: llmcheck.RuntimeModelSummary{
+				LoadedInstanceConfigs: []llmcheck.RuntimeLoadedInstanceConfig{
+					{ID: "instance-with-parallel", ContextLength: 32768, Parallel: &parallel},
+					{ID: "instance-without-parallel", ContextLength: 16384},
+				},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("renderDoctorRuntimeAuditJSON returned error: %v", err)
+	}
+	if !strings.Contains(output, `"parallel": 4`) || strings.Count(output, `"parallel":`) != 1 {
+		t.Fatalf("runtime audit JSON did not preserve available parallel or omit missing parallel: %s", output)
 	}
 }
 

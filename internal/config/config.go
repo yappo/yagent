@@ -71,9 +71,18 @@ type PermissionRuleConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelAgents int      `toml:"max_parallel_agents"`
-	MaxHandoffDepth   int      `toml:"max_handoff_depth"`
-	DefaultTimeout    Duration `toml:"default_timeout"`
+	MaxParallelAgents int                    `toml:"max_parallel_agents"`
+	MaxHandoffDepth   int                    `toml:"max_handoff_depth"`
+	DefaultTimeout    Duration               `toml:"default_timeout"`
+	ProcessIsolation  ProcessIsolationConfig `toml:"process_isolation"`
+}
+
+// ProcessIsolationConfig names a trusted host-side proxy that executes an
+// untrusted task inside a disposable VM or container and relays its stdio.
+type ProcessIsolationConfig struct {
+	Backend string   `toml:"backend"`
+	Runner  string   `toml:"runner"`
+	Args    []string `toml:"args"`
 }
 
 type FeaturesConfig struct {

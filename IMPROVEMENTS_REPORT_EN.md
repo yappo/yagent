@@ -121,9 +121,9 @@
 - **期待効果**: ユーザーの好みに合わせた利用環境
 
 ### 6.3 セッション再開機能 (TODO.md: Nice To Have)
-- **現状**: `/resume` は latest_session のみ
-- **改善案**: 過去のセッション一覧から選択して再開
-- **実装場所**: `internal/infra/state`
+- **現状**: 実装済み。`/continue [conversation-id|latest]` は新しい turn / workflow で会話を継続し、`/recover <workflow-id>` は新しい user input なしで durable workflow を復旧する
+- **改善案**: conversation 一覧と ambiguous recovery action の選択 UI
+- **実装場所**: `internal/tui/slash.go`, `internal/usecase/orchestrator`
 - **期待効果**: 断続的な作業環境でも継続性の確保
 
 ## 7. ビルド・デプロイメント

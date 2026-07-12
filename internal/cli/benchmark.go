@@ -24,7 +24,6 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 	var prompt string
 	var model string
 	var routingProfile string
-	var resumeID string
 	var output string
 	var runs int
 	var featureProfiles []string
@@ -52,7 +51,6 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 	command.Flags().StringVar(&prompt, "prompt", "", "benchmark に使うプロンプト。--case 指定時は省略できます")
 	command.Flags().StringVar(&model, "model", "", "使用するモデル名")
 	command.Flags().StringVar(&routingProfile, "profile", "", "routing profile 名")
-	command.Flags().StringVar(&resumeID, "resume", "", "復元する run id。latest も指定できます")
 	command.Flags().StringVar(&output, "output", "table", "出力形式: table, json, jsonl, csv")
 	command.Flags().IntVar(&runs, "runs", 0, "各 feature profile を何回実行するか。0 なら config の既定値")
 	command.Flags().StringSliceVar(&featureProfiles, "feature-profile", nil, "比較する feature profile 名")
@@ -88,16 +86,6 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 			FailOnWarning:        preflightFailOnWarning,
 			FailOnRecommendation: preflightFailOnRecommendation,
 		}
-		var preflightResult *llmcheck.Result
-		if shouldRunBenchmarkDoctorPreflight(preflightOptions) && !listCases {
-			result, err := runBenchmarkDoctorPreflight(cmd.Context(), cfg, preflightOptions)
-			if err != nil {
-				return err
-			}
-			preflightResult = &result
-			fmt.Fprint(os.Stderr, renderBenchmarkDoctorPreflightSummary(result))
-		}
-
 		cases, err := resolveBenchmarkCases(caseIDs, caseFiles)
 		if err != nil {
 			return err
@@ -111,17 +99,23 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 		if err != nil {
 			return err
 		}
+		preflight := map[string]*benchmarkusecase.PreflightReport{}
+		if shouldRunBenchmarkDoctorPreflight(preflightOptions) {
+			preflight, err = runBenchmarkDoctorPreflight(cmd.Context(), cfg, profiles, model, preflightOptions)
+			if err != nil {
+				return err
+			}
+		}
 
 		report, err := benchmarkusecase.Execute(cmd.Context(), cfg, benchmarkusecase.Request{
 			Prompt:         prompt,
 			Model:          model,
-			ResumeID:       resumeID,
 			Runs:           runs,
 			RoutingProfile: routingProfile,
 			Profiles:       profiles,
 			Cases:          cases,
-		}, func(runCfg config.Config) (domain.Orchestrator, func(), error) {
-			container, err := app.BuildFromConfig(runCfg, NewStdinApprover(), app.BuildOptions{LogPath: *logPath})
+		}, func(runCfg config.Config, environment benchmarkusecase.CellEnvironment) (domain.Orchestrator, func(), error) {
+			container, err := app.BuildFromConfig(runCfg, NewStdinApprover(), app.BuildOptions{LogPath: *logPath, WorkingDir: environment.WorkspaceDir, IsolatedWorkspace: true})
 			if err != nil {
 				return nil, nil, err
 			}
@@ -135,9 +129,9 @@ func newBenchmarkCommand(configPath *string, logPath *string) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if preflightResult != nil {
-			report.Preflight = &benchmarkusecase.PreflightReport{
-				Doctor: doctorPreflightReportFromResult(*preflightResult),
+		for idx := range report.Results {
+			if item, ok := preflight[report.Results[idx].Profile.Name]; ok {
+				report.Results[idx].Preflight = item
 			}
 		}
 		if writeJSONL != "" {
@@ -225,23 +219,63 @@ func shouldRunBenchmarkDoctorPreflight(options benchmarkDoctorPreflightOptions) 
 	return options.Enabled || options.Probe || options.ProbeStructured || options.FailOnWarning || options.FailOnRecommendation || strings.TrimSpace(options.ServerName) != ""
 }
 
-func runBenchmarkDoctorPreflight(ctx context.Context, cfg config.Config, options benchmarkDoctorPreflightOptions) (llmcheck.Result, error) {
-	result, err := llmcheck.New(nil).CheckWithOptions(ctx, cfg, llmcheck.CheckOptions{
-		ServerName:      options.ServerName,
-		Probe:           options.Probe,
-		ProbeStructured: options.ProbeStructured,
-		Runtime:         options.Runtime,
-	})
-	if err != nil {
-		return result, err
+func runBenchmarkDoctorPreflight(ctx context.Context, cfg config.Config, profiles []benchmarkusecase.Profile, requestModel string, options benchmarkDoctorPreflightOptions) (map[string]*benchmarkusecase.PreflightReport, error) {
+	results := make(map[string]*benchmarkusecase.PreflightReport, len(profiles))
+	var gateErr error
+	for _, profile := range profiles {
+		serverName, model, err := resolveBenchmarkDoctorTarget(cfg, profile, requestModel, options.ServerName)
+		if err != nil {
+			return nil, err
+		}
+		result, err := llmcheck.New(nil).CheckWithOptions(ctx, cfg, llmcheck.CheckOptions{
+			ServerName:      serverName,
+			Model:           model,
+			Probe:           options.Probe,
+			ProbeStructured: options.ProbeStructured,
+			Runtime:         options.Runtime,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := doctorGateError(result, doctorGateOptions{
+			FailOnWarning:        options.FailOnWarning,
+			FailOnRecommendation: options.FailOnRecommendation,
+		}); err != nil {
+			if gateErr == nil {
+				gateErr = fmt.Errorf("benchmark preflight doctor failed for profile %q: %w", profile.Name, err)
+			}
+		}
+		fmt.Fprint(os.Stderr, renderBenchmarkDoctorPreflightSummary(result))
+		results[profile.Name] = &benchmarkusecase.PreflightReport{Doctor: doctorPreflightReportFromResult(result)}
 	}
-	if err := doctorGateError(result, doctorGateOptions{
-		FailOnWarning:        options.FailOnWarning,
-		FailOnRecommendation: options.FailOnRecommendation,
-	}); err != nil {
-		return result, fmt.Errorf("benchmark preflight doctor failed: %w", err)
+	return results, gateErr
+}
+
+func resolveBenchmarkDoctorTarget(cfg config.Config, profile benchmarkusecase.Profile, requestModel, explicitServer string) (string, string, error) {
+	serverName := strings.TrimSpace(explicitServer)
+	routingModel := ""
+	if routing, ok := cfg.Routing.Profiles[profile.RoutingProfile]; ok {
+		serverName = fallbackBenchmarkString(serverName, routing.Server)
+		routingModel = strings.TrimSpace(routing.Model)
 	}
-	return result, nil
+	model := fallbackBenchmarkString(strings.TrimSpace(requestModel), fallbackBenchmarkString(strings.TrimSpace(profile.Model), routingModel))
+	if model == "" {
+		if serverName == "" {
+			server, err := cfg.ResolveServer()
+			if err != nil {
+				return "", "", err
+			}
+			model = server.Model
+		} else {
+			for _, server := range cfg.Server.Servers {
+				if server.Name == serverName {
+					model = server.Model
+					break
+				}
+			}
+		}
+	}
+	return serverName, model, nil
 }
 
 func renderBenchmarkDoctorPreflightSummary(result llmcheck.Result) string {
@@ -679,7 +713,7 @@ func renderBenchmarkRecordReport(report benchmarkusecase.RecordReport) string {
 		))
 	}
 	sb.WriteString("\n")
-	sb.WriteString("Profile       Case             Runs  Pass Rate  Success  Avg Time  Avg Tools  Avg LLM  Fallbacks  Verify Fails  Preflight        Delta        Models\n")
+	sb.WriteString("Profile       Case             Runs  Pass Rate  Success  Avg Time  Avg Tools  Avg LLM  Avg Tx  Tx Fails  Fallbacks  Verify Fails  Preflight        Delta        Models\n")
 	for _, group := range report.Groups {
 		delta := "-"
 		if group.BaselineDelta != nil {
@@ -690,7 +724,7 @@ func renderBenchmarkRecordReport(report benchmarkusecase.RecordReport) string {
 			preflight = fmt.Sprintf("ctx=%d warn=%d rec=%d", group.PreflightRuntimeContextLength, group.PreflightDoctorWarnings, group.PreflightDoctorRecommendations)
 		}
 		sb.WriteString(fmt.Sprintf(
-			"%-12s  %-15s  %-4d  %-9s  %-7s  %-8s  %-9.1f  %-7.1f  %-9d  %-12d  %-16s %-12s %s\n",
+			"%-12s  %-15s  %-4d  %-9s  %-7s  %-8s  %-9.1f  %-7.1f  %-7.1f %-8d  %-9d  %-12d  %-16s %-12s %s\n",
 			group.ProfileName,
 			fallbackBenchmarkString(group.CaseID, "-"),
 			group.Runs,
@@ -699,6 +733,8 @@ func renderBenchmarkRecordReport(report benchmarkusecase.RecordReport) string {
 			(time.Duration(group.AvgDurationMS) * time.Millisecond).Round(time.Millisecond),
 			group.AvgToolCalls,
 			group.AvgModelCalls,
+			group.AvgModelTransportAttempts,
+			group.ModelTransportFailures,
 			group.ModelFallbacks,
 			group.VerificationFailures,
 			preflight,
@@ -738,6 +774,11 @@ func recordModelSummary(group benchmarkusecase.RecordGroupSummary) string {
 	if len(group.ModelAPIs) > 0 {
 		parts = append(parts, "apis="+strings.Join(group.ModelAPIs, "|"))
 	}
+	parts = append(parts,
+		fmt.Sprintf("usage=%.0f%%", group.ModelUsageCoverage*100),
+		fmt.Sprintf("tokens=%.0f", group.AvgModelTotalTokens),
+		fmt.Sprintf("actions=%.1f/%.1f/%.1f/%.1f", group.AvgMutations, group.AvgPermissionRequests, group.AvgDelegations, group.AvgHandoffs),
+	)
 	if len(parts) == 0 {
 		return "-"
 	}
@@ -762,14 +803,31 @@ func renderBenchmarkRecordReportCSV(report benchmarkusecase.RecordReport) (strin
 		"avg_tool_calls",
 		"avg_model_calls",
 		"avg_model_duration_ms",
+		"avg_model_transport_attempts",
+		"model_transport_failures",
+		"avg_model_transport_duration_ms",
+		"model_usage_available",
+		"model_usage_unavailable",
+		"model_usage_coverage",
+		"avg_model_input_tokens",
+		"avg_model_output_tokens",
+		"avg_model_total_tokens",
+		"avg_model_cached_input_tokens",
+		"avg_model_reasoning_tokens",
 		"model_fallbacks",
 		"model_servers",
 		"model_names",
 		"model_apis",
 		"model_profiles",
+		"avg_mutations",
+		"avg_permission_requests",
+		"avg_delegations",
+		"avg_handoffs",
 		"failed_events",
 		"verification_failures",
 		"baseline_pass_rate_delta",
+		"baseline_avg_model_total_tokens_delta",
+		"baseline_model_usage_coverage_delta",
 		"baseline_verification_failures_delta",
 		"preflight_doctor",
 		"preflight_doctor_server",
@@ -791,8 +849,12 @@ func renderBenchmarkRecordReportCSV(report benchmarkusecase.RecordReport) (strin
 	for _, group := range report.Groups {
 		passRateDelta := ""
 		verifyDelta := ""
+		tokenDelta := ""
+		usageDelta := ""
 		if group.BaselineDelta != nil {
 			passRateDelta = fmt.Sprintf("%.6f", group.BaselineDelta.PassRate)
+			tokenDelta = fmt.Sprintf("%.1f", group.BaselineDelta.AvgModelTotalTokens)
+			usageDelta = fmt.Sprintf("%.6f", group.BaselineDelta.ModelUsageCoverage)
 			verifyDelta = fmt.Sprint(group.BaselineDelta.VerificationFailures)
 		}
 		runtimeServer := ""
@@ -824,14 +886,31 @@ func renderBenchmarkRecordReportCSV(report benchmarkusecase.RecordReport) (strin
 			fmt.Sprintf("%.1f", group.AvgToolCalls),
 			fmt.Sprintf("%.1f", group.AvgModelCalls),
 			fmt.Sprintf("%.1f", group.AvgModelDurationMS),
+			fmt.Sprintf("%.1f", group.AvgModelTransportAttempts),
+			fmt.Sprint(group.ModelTransportFailures),
+			fmt.Sprintf("%.1f", group.AvgModelTransportDurationMS),
+			fmt.Sprint(group.ModelUsageAvailable),
+			fmt.Sprint(group.ModelUsageUnavailable),
+			fmt.Sprintf("%.6f", group.ModelUsageCoverage),
+			fmt.Sprintf("%.1f", group.AvgModelInputTokens),
+			fmt.Sprintf("%.1f", group.AvgModelOutputTokens),
+			fmt.Sprintf("%.1f", group.AvgModelTotalTokens),
+			fmt.Sprintf("%.1f", group.AvgModelCachedInputTokens),
+			fmt.Sprintf("%.1f", group.AvgModelReasoningTokens),
 			fmt.Sprint(group.ModelFallbacks),
 			strings.Join(group.ModelServers, "|"),
 			strings.Join(group.ModelNames, "|"),
 			strings.Join(group.ModelAPIs, "|"),
 			strings.Join(group.ModelProfiles, "|"),
+			fmt.Sprintf("%.1f", group.AvgMutations),
+			fmt.Sprintf("%.1f", group.AvgPermissionRequests),
+			fmt.Sprintf("%.1f", group.AvgDelegations),
+			fmt.Sprintf("%.1f", group.AvgHandoffs),
 			fmt.Sprint(group.FailedEvents),
 			fmt.Sprint(group.VerificationFailures),
 			passRateDelta,
+			tokenDelta,
+			usageDelta,
 			verifyDelta,
 			fmt.Sprint(group.PreflightDoctor),
 			group.PreflightDoctorServer,

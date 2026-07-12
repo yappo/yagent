@@ -39,9 +39,35 @@ func TestBuiltInAgentsIncludeToolDiscoveryGuidance(t *testing.T) {
 		"fs_write or patch_apply is visible",
 		"approval dialog automatically",
 		"delegate or handoff to a write-capable agent",
+		"Do not present a path, package, symbol, or command as repository fact",
+		"do not retry speculative path variants",
 	} {
 		if !strings.Contains(planner.Instruction, fragment) {
 			t.Fatalf("expected planner instruction to contain %q, got %q", fragment, planner.Instruction)
+		}
+	}
+}
+
+func TestBuiltInAgentsUseRoleSpecificTurnBudgets(t *testing.T) {
+	catalog := New(nil)
+	want := map[string]int{
+		"manager": 12, "planner": 8, "researcher": 12,
+		"coder": 24, "tester": 12, "reviewer": 12,
+	}
+	wantToolCalls := map[string]int{
+		"manager": 8, "planner": 0, "researcher": 6,
+		"coder": 16, "tester": 8, "reviewer": 8,
+	}
+	for id, maxTurns := range want {
+		spec, ok := catalog.Resolve(id)
+		if !ok {
+			t.Fatalf("built-in agent %q not found", id)
+		}
+		if spec.MaxTurns != maxTurns {
+			t.Fatalf("agent %q max turns: got %d want %d", id, spec.MaxTurns, maxTurns)
+		}
+		if spec.MaxToolCalls != wantToolCalls[id] {
+			t.Fatalf("agent %q max tool calls: got %d want %d", id, spec.MaxToolCalls, wantToolCalls[id])
 		}
 	}
 }

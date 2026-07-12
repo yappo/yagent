@@ -62,12 +62,18 @@ type TaskCatalog interface {
 }
 
 type MCPToolDescriptor struct {
-	Name         string
-	Description  string
-	InputSchema  map[string]any
-	Annotations  map[string]any
-	ReadOnly     bool
-	ParallelSafe bool
+	Name                   string
+	Description            string
+	InputSchema            map[string]any
+	Annotations            map[string]any
+	ReadOnly               bool
+	ParallelSafe           bool
+	SupportsDurableFencing bool
+}
+
+type MCPToolCallResult struct {
+	Output   string
+	Metadata map[string]any
 }
 
 type MCPPromptDescriptor struct {
@@ -86,7 +92,7 @@ type MCPResourceDescriptor struct {
 type MCPConnectionManager interface {
 	Bind(context.Context, TaskDefinition) ([]MCPToolDescriptor, error)
 	BoundTools() []BoundMCPTool
-	CallTool(context.Context, string, string, map[string]any) (string, error)
+	CallTool(context.Context, string, string, map[string]any, map[string]any) (MCPToolCallResult, error)
 }
 
 type MCPSessionFactory interface {
@@ -94,24 +100,25 @@ type MCPSessionFactory interface {
 }
 
 type BoundMCPTool struct {
-	TaskID         string
-	ToolName       string
-	QualifiedName  string
-	Description    string
-	InputSchema    map[string]any
-	ReadOnly       bool
-	ParallelSafe   bool
-	ServerToolName string
-	Risk           string
-	AllowNetwork   bool
-	Roots          []string
-	TrustBoundary  string
-	SafetySource   string
+	TaskID                 string
+	ToolName               string
+	QualifiedName          string
+	Description            string
+	InputSchema            map[string]any
+	ReadOnly               bool
+	ParallelSafe           bool
+	ServerToolName         string
+	Risk                   string
+	AllowNetwork           bool
+	Roots                  []string
+	TrustBoundary          string
+	SafetySource           string
+	SupportsDurableFencing bool
 }
 
 type MCPSession interface {
 	Initialize(context.Context) error
 	ListTools(context.Context) ([]MCPToolDescriptor, error)
-	CallTool(context.Context, string, map[string]any) (string, error)
+	CallTool(context.Context, string, map[string]any, map[string]any) (MCPToolCallResult, error)
 	Close() error
 }

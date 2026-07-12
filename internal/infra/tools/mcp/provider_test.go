@@ -12,6 +12,7 @@ import (
 
 type stubBindings struct {
 	tools []domain.BoundMCPTool
+	call  func(string, string, map[string]any, map[string]any) (domain.MCPToolCallResult, error)
 }
 
 func (s stubBindings) Bind(context.Context, domain.TaskDefinition) ([]domain.MCPToolDescriptor, error) {
@@ -22,8 +23,11 @@ func (s stubBindings) BoundTools() []domain.BoundMCPTool {
 	return append([]domain.BoundMCPTool(nil), s.tools...)
 }
 
-func (s stubBindings) CallTool(context.Context, string, string, map[string]any) (string, error) {
-	return "ok", nil
+func (s stubBindings) CallTool(_ context.Context, taskID string, toolName string, arguments map[string]any, metadata map[string]any) (domain.MCPToolCallResult, error) {
+	if s.call != nil {
+		return s.call(taskID, toolName, arguments, metadata)
+	}
+	return domain.MCPToolCallResult{Output: "ok"}, nil
 }
 
 type stubApprover struct {
@@ -56,6 +60,64 @@ func TestProviderDefinitionsExposeMCPTrustMetadata(t *testing.T) {
 	}
 	if defs[0].Metadata["trust_boundary"] != "trusted" || defs[0].Metadata["safety_source"] != "trusted_mcp_annotations" {
 		t.Fatalf("expected trust metadata, got %+v", defs[0].Metadata)
+	}
+}
+
+func TestProviderForwardsDurableActionContextAsMCPMetadata(t *testing.T) {
+	var gotArguments map[string]any
+	var gotMetadata map[string]any
+	provider := NewProvider(stubBindings{
+		tools: []domain.BoundMCPTool{{TaskID: "docs", ServerToolName: "write_doc", QualifiedName: "mcp__docs__write_doc__docs", SupportsDurableFencing: true}},
+		call: func(_, _ string, arguments, metadata map[string]any) (domain.MCPToolCallResult, error) {
+			gotArguments, gotMetadata = arguments, metadata
+			return domain.MCPToolCallResult{Output: "ok", Metadata: map[string]any{"dev.yagent/durable-action": map[string]any{
+				"action_id": "action-1", "workflow_id": "workflow-1", "work_unit_id": "unit-1", "idempotency_key": "idem-1", "lease_token": "lease-1", "fencing_token": float64(3),
+			}}}, nil
+		},
+	}, nil, nil)
+	arguments := map[string]any{"path": "README.md"}
+	ctx := domain.WithDurableActionExecutionContext(context.Background(), domain.DurableActionExecutionContext{
+		ActionID: "action-1", WorkflowID: "workflow-1", WorkUnitID: "unit-1", Attempt: 2,
+		IdempotencyKey: "idem-1", LeaseToken: "lease-1", FencingToken: 3,
+	})
+
+	result, ok := provider.Execute(ctx, domain.AgentSpec{}, domain.ToolCall{ID: "call-1", Name: "mcp__docs__write_doc__docs", Arguments: arguments})
+	if !ok || !result.Success || gotArguments["path"] != "README.md" {
+		t.Fatalf("provider result=%+v ok=%t arguments=%+v", result, ok, gotArguments)
+	}
+	durable, ok := gotMetadata["dev.yagent/durable-action"].(map[string]any)
+	if !ok || durable["action_id"] != domain.ActionID("action-1") || durable["idempotency_key"] != "idem-1" || durable["lease_token"] != domain.LeaseToken("lease-1") || durable["fencing_token"] != uint64(3) {
+		t.Fatalf("durable MCP metadata = %+v", gotMetadata)
+	}
+}
+
+func TestProviderRejectsMutatingMCPToolWithoutDurableFencing(t *testing.T) {
+	calls := 0
+	provider := NewProvider(stubBindings{
+		tools: []domain.BoundMCPTool{{TaskID: "docs", ServerToolName: "write_doc", QualifiedName: "mcp__docs__write_doc__docs"}},
+		call: func(_, _ string, _, _ map[string]any) (domain.MCPToolCallResult, error) {
+			calls++
+			return domain.MCPToolCallResult{Output: "unexpected"}, nil
+		},
+	}, nil, nil)
+	ctx := domain.WithDurableActionExecutionContext(context.Background(), domain.DurableActionExecutionContext{ActionID: "action-1", WorkflowID: "workflow-1", WorkUnitID: "unit-1", Attempt: 1, IdempotencyKey: "idem-1", LeaseToken: "lease-1", FencingToken: 1})
+	result, ok := provider.Execute(ctx, domain.AgentSpec{}, domain.ToolCall{ID: "call-1", Name: "mcp__docs__write_doc__docs"})
+	if !ok || result.Success || calls != 0 || !strings.Contains(result.Output, "fencing extension") {
+		t.Fatalf("expected unsupported durable fence rejection, result=%+v calls=%d", result, calls)
+	}
+}
+
+func TestProviderRejectsMismatchedDurableFencingAcknowledgement(t *testing.T) {
+	provider := NewProvider(stubBindings{
+		tools: []domain.BoundMCPTool{{TaskID: "docs", ServerToolName: "write_doc", QualifiedName: "mcp__docs__write_doc__docs", SupportsDurableFencing: true}},
+		call: func(_, _ string, _, _ map[string]any) (domain.MCPToolCallResult, error) {
+			return domain.MCPToolCallResult{Output: "effect may have happened", Metadata: map[string]any{"dev.yagent/durable-action": map[string]any{"action_id": "wrong"}}}, nil
+		},
+	}, nil, nil)
+	ctx := domain.WithDurableActionExecutionContext(context.Background(), domain.DurableActionExecutionContext{ActionID: "action-1", WorkflowID: "workflow-1", WorkUnitID: "unit-1", Attempt: 1, IdempotencyKey: "idem-1", LeaseToken: "lease-1", FencingToken: 1})
+	result, ok := provider.Execute(ctx, domain.AgentSpec{}, domain.ToolCall{ID: "call-1", Name: "mcp__docs__write_doc__docs"})
+	if !ok || result.Success || !strings.Contains(result.Output, "does not match") {
+		t.Fatalf("expected fencing acknowledgement rejection, got %+v", result)
 	}
 }
 

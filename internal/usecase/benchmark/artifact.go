@@ -36,6 +36,13 @@ func BuildArtifactRun(report Report) (*domain.RunState, domain.RunArtifact, erro
 			passed++
 		}
 	}
+	preflightDoctor := false
+	for _, result := range report.Results {
+		if result.Preflight != nil && result.Preflight.Doctor != nil {
+			preflightDoctor = true
+			break
+		}
+	}
 	runs := report.Runs
 	if runs < 1 {
 		runs = 1
@@ -48,7 +55,7 @@ func BuildArtifactRun(report Report) (*domain.RunState, domain.RunArtifact, erro
 		RecordCount:      len(records),
 		EvaluationPasses: passed,
 		EvaluationFailed: len(records) - passed,
-		PreflightDoctor:  report.Preflight != nil && report.Preflight.Doctor != nil,
+		PreflightDoctor:  preflightDoctor,
 		Report:           reportJSON,
 		Records:          recordsJSON,
 	}

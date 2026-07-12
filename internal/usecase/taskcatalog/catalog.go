@@ -25,6 +25,11 @@ type Catalog struct {
 	order []string
 }
 
+type LoadOptions struct {
+	IncludeUserTasks bool
+	ConfineToWorkDir bool
+}
+
 type tasksFile struct {
 	Tasks      []taskEntry      `toml:"tasks"`
 	MCPServers []mcpServerEntry `toml:"mcpservers"`
@@ -67,37 +72,107 @@ type mcpServerEntry struct {
 }
 
 func New(workDir string) (*Catalog, error) {
+	return NewWithOptions(workDir, LoadOptions{IncludeUserTasks: true})
+}
+
+func NewWithOptions(workDir string, options LoadOptions) (*Catalog, error) {
 	merged := map[string]domain.TaskDefinition{}
 	order := []string{}
 
-	addAll := func(items []domain.TaskDefinition) {
+	addAll := func(items []domain.TaskDefinition) error {
 		for _, item := range items {
 			if item.ID == "" {
 				continue
+			}
+			if options.ConfineToWorkDir {
+				if err := validateTaskWithinWorkDir(workDir, item); err != nil {
+					return err
+				}
 			}
 			if _, ok := merged[item.ID]; !ok {
 				order = append(order, item.ID)
 			}
 			merged[item.ID] = item
 		}
+		return nil
 	}
 
-	addAll(autoTasks(workDir))
-	if userPath, ok := defaultUserTasksPath(); ok {
-		items, err := loadFile(userPath, workDir)
-		if err != nil {
-			return nil, err
+	if err := addAll(autoTasks(workDir)); err != nil {
+		return nil, err
+	}
+	if options.IncludeUserTasks {
+		if userPath, ok := defaultUserTasksPath(); ok {
+			items, err := loadFile(userPath, workDir)
+			if err != nil {
+				return nil, err
+			}
+			if err := addAll(items); err != nil {
+				return nil, err
+			}
 		}
-		addAll(items)
 	}
 	items, err := loadFile(filepath.Join(workDir, repoTasksPath), workDir)
 	if err != nil {
 		return nil, err
 	}
-	addAll(items)
+	if err := addAll(items); err != nil {
+		return nil, err
+	}
 	slices.Sort(order)
 
 	return &Catalog{tasks: merged, order: order}, nil
+}
+
+func validateTaskWithinWorkDir(workDir string, item domain.TaskDefinition) error {
+	check := func(label, path string) error {
+		if path == "" {
+			return nil
+		}
+		if !pathWithinWorkDir(workDir, path) {
+			return fmt.Errorf("isolated workspace rejects task %q %s outside %s: %s", item.ID, label, workDir, path)
+		}
+		return nil
+	}
+	if item.Command != nil {
+		if err := check("cwd", item.Command.Cwd); err != nil {
+			return err
+		}
+		for _, path := range append(append([]string(nil), item.Command.ReadPaths...), item.Command.WritePaths...) {
+			if err := check("declared path", path); err != nil {
+				return err
+			}
+		}
+	}
+	if item.MCPServer != nil {
+		if err := check("cwd", item.MCPServer.Cwd); err != nil {
+			return err
+		}
+		for _, path := range item.MCPServer.Roots {
+			if err := check("root", path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func pathWithinWorkDir(workDir, path string) bool {
+	root, err := filepath.Abs(workDir)
+	if err != nil {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	candidate, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+		candidate = resolved
+	}
+	rel, err := filepath.Rel(root, candidate)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (c *Catalog) List(_ context.Context) []domain.TaskDefinition {
